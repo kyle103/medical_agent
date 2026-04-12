@@ -1,5 +1,10 @@
 from __future__ import annotations
 
+import json
+import os
+import time
+from datetime import datetime
+
 from app.core.compliance.compliance_service import ComplianceService
 from app.core.memory.memory_service import MemoryService
 from app.core.memory.long_memory_service import LongMemoryService
@@ -7,6 +12,65 @@ from app.core.llm.llm_service import LLMService
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.lab_report_tool import LabReportTool
+
+# 确保日志目录存在
+def ensure_log_directory():
+    log_dir = os.path.join(os.getcwd(), 'logs')
+    os.makedirs(log_dir, exist_ok=True)
+    return log_dir
+
+# 记录向量检索日志
+def log_vector_retrieval(user_id, session_id, query, results, retrieval_time, error=None):
+    log_dir = ensure_log_directory()
+    log_file = os.path.join(log_dir, 'vector_retrieval.log')
+    
+    log_record = {
+        'timestamp': datetime.now().isoformat(),
+        'level': 'ERROR' if error else 'INFO',
+        'message': 'Vector retrieval completed' if not error else f'Vector retrieval failed: {error}',
+        'extra': {
+            'user_id': user_id,
+            'session_id': session_id,
+            'query': query,
+            'retrieval_time': round(retrieval_time, 4),
+            'result_count': len(results),
+            'results': results
+        }
+    }
+    
+    # 写入日志文件
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(log_record) + '\n')
+
+# 记录向量库写入日志
+def log_vector_store_write(user_id, session_id, items, write_time, error=None):
+    log_dir = ensure_log_directory()
+    log_file = os.path.join(log_dir, 'vector_retrieval.log')
+    
+    log_record = {
+        'timestamp': datetime.now().isoformat(),
+        'level': 'ERROR' if error else 'INFO',
+        'message': 'Vector store write completed' if not error else f'Vector store write failed: {error}',
+        'extra': {
+            'user_id': user_id,
+            'session_id': session_id,
+            'write_time': round(write_time, 4),
+            'item_count': len(items),
+            'items': [
+                {
+                    'memory_id': item.memory_id,
+                    'text': item.text,
+                    'memory_type': item.memory_type,
+                    'confidence': item.confidence
+                }
+                for item in items
+            ]
+        }
+    }
+    
+    # 写入日志文件
+    with open(log_file, 'a', encoding='utf-8') as f:
+        f.write(json.dumps(log_record) + '\n')
 
 
 INTENTS = {
@@ -100,9 +164,11 @@ async def memory_load(state: dict) -> dict:
     state["long_memory_items"] = []
     state["long_memory_text"] = ""
     try:
+        start_time = time.time()
         svc = LongMemoryService()
+        query = state.get("user_input", "")
         if svc.is_enabled():
-            items = svc.recall(user_id=user_id, query=state.get("user_input", ""), top_k=3)
+            items = svc.recall(user_id=user_id, query=query, top_k=3)
             state["long_memory_items"] = [
                 {
                     "memory_id": it.memory_id,
@@ -118,13 +184,41 @@ async def memory_load(state: dict) -> dict:
                 uniq = []
                 seen = set()
                 for it in items:
-                    t = (it.text or "").strip()
-                    if not t or t in seen:
-                        continue
-                    seen.add(t)
-                    uniq.append(f"- {t}")
-                state["long_memory_text"] = "\n".join(uniq)
-    except Exception:
+                    if it.memory_id not in seen:
+                        seen.add(it.memory_id)
+                        uniq.append(it)
+                state["long_memory_text"] = "\n".join([f"- {it.text}" for it in uniq])
+            
+            # 记录向量检索日志
+            retrieval_time = time.time() - start_time
+            log_vector_retrieval(
+                user_id=user_id,
+                session_id=session_id,
+                query=query,
+                results=[
+                    {
+                        "memory_id": it.memory_id,
+                        "text": it.text,
+                        "memory_type": it.memory_type,
+                        "source": it.source,
+                        "session_id": it.session_id,
+                        "created_at": str(it.created_at)
+                    }
+                    for it in items
+                ],
+                retrieval_time=retrieval_time
+            )
+    except Exception as e:
+        # 记录错误日志
+        log_vector_retrieval(
+            user_id=user_id,
+            session_id=session_id,
+            query=state.get("user_input", ""),
+            results=[],
+            retrieval_time=0.0,
+            error=str(e)
+        )
+        print(f"长期记忆召回失败: {e}")
         pass
 
     return state
@@ -326,14 +420,32 @@ async def memory_update(state: dict) -> dict:
     await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
     await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
 
-    # 写入长期记忆（向量库）：规则抽取 + add；失败不影响主流程
+    # 写入长期记忆（向量库）：LLM抽取 + add；失败不影响主流程
     try:
+        start_time = time.time()
         svc = LongMemoryService()
         if svc.is_enabled():
-            items = svc.extract_candidates(user_input=state.get("user_input", ""))
+            items = await svc.extract_candidates(user_input=state.get("user_input", ""))
             if items:
                 svc.add_items(user_id=state["user_id"], session_id=state["session_id"], items=items)
-    except Exception:
+                # 记录向量库写入日志
+                write_time = time.time() - start_time
+                log_vector_store_write(
+                    user_id=state["user_id"],
+                    session_id=state["session_id"],
+                    items=items,
+                    write_time=write_time
+                )
+    except Exception as e:
+        # 记录错误日志
+        write_time = time.time() - start_time
+        log_vector_store_write(
+            user_id=state.get("user_id", "unknown"),
+            session_id=state.get("session_id", "unknown"),
+            items=[],
+            write_time=write_time,
+            error=str(e)
+        )
         pass
 
     return state
