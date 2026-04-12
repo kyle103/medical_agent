@@ -1,0 +1,297 @@
+from __future__ import annotations
+
+import json
+from datetime import datetime
+
+from app.core.compliance.compliance_service import ComplianceService
+from app.core.memory.memory_service import MemoryService
+from app.core.tools.drug_interaction_tool import DrugInteractionTool
+from app.core.tools.lab_report_tool import LabReportTool
+from app.core.tools.archive_query_tool import ArchiveQueryTool
+
+
+INTENTS = {
+    "archive": "档案管理",
+    "drug": "药物冲突查询",
+    "lab": "化验单解读",
+    "general": "通用科普",
+}
+
+
+async def input_check(state: dict) -> dict:
+    ok, msg = ComplianceService().input_compliance_check(state.get("user_input", ""))
+    if not ok:
+        state["error_msg"] = msg
+    return state
+
+
+async def intent_recognition(state: dict) -> dict:
+    """意图识别节点（应用级）。
+
+    - 优先使用规则分类，稳定可控
+    - 如用户已配置 LLM，则用 LLM 做可选增强（并具备失败回退）
+    - 只做意图分类，不做任何医疗结论生成
+    """
+
+    from app.core.agent.intent_classifier import IntentClassifier
+
+    text = state.get("user_input", "")
+    stream = bool(state.get("stream", False))
+
+    clf = IntentClassifier()
+    res = await clf.predict(text=text, stream=stream)
+
+    state["intent"] = res.intent
+    state["intent_confidence"] = res.confidence
+    state["intent_reason"] = res.reason
+    return state
+
+
+async def entity_extraction(state: dict) -> dict:
+    # MVP：基于简单规则提取（LLM 可扩展）
+    intent = state.get("intent")
+    text = state.get("user_input", "")
+
+    entities: dict = {}
+    if intent == "drug":
+        # 简单分隔
+        parts = [p.strip() for p in text.replace("、", ",").split(",") if p.strip()]
+        entities["drug_name_list"] = parts[:10]
+    elif intent == "lab":
+        entities["raw"] = text
+    else:
+        entities["query"] = text
+
+    state["extract_entities"] = entities
+    return state
+
+
+async def tool_route(state: dict) -> dict:
+    intent = state.get("intent")
+    if intent == "drug":
+        state["tool_name"] = "drug_interaction"
+    elif intent == "lab":
+        state["tool_name"] = "lab_report"
+    elif intent == "archive":
+        state["tool_name"] = "archive"
+    else:
+        state["tool_name"] = "general"
+    return state
+
+
+async def tool_execute(state: dict) -> dict:
+    user_id = state.get("user_id")
+    intent = state.get("intent")
+    entities = state.get("extract_entities") or {}
+
+    if intent == "drug":
+        tool = DrugInteractionTool()
+        state["tool_result"] = await tool.check_interactions(
+            user_id=user_id,
+            drug_name_list=entities.get("drug_name_list") or [],
+            sync_to_archive=False,
+        )
+    elif intent == "lab":
+        tool = LabReportTool()
+        lab_items = []
+        lines = [l.strip() for l in state.get("user_input", "").splitlines() if l.strip()]
+        for l in lines:
+            if ":" in l:
+                n, v = l.split(":", 1)
+                lab_items.append({"item_name": n.strip(), "test_value": v.strip(), "unit": None})
+        state["tool_result"] = await tool.interpret(
+            user_id=user_id,
+            lab_item_list=lab_items or [{"item_name": "血糖", "test_value": "0", "unit": "mmol/L"}],
+            sync_to_archive=False,
+        )
+    from __future__ import annotations
+
+import json
+from datetime import datetime
+
+from app.core.compliance.compliance_service import ComplianceService
+from app.core.llm.llm_service import LLMService
+from app.core.memory.memory_service import MemoryService
+from app.core.tools.drug_interaction_tool import DrugInteractionTool
+from app.core.tools.lab_report_tool import LabReportTool
+
+
+INTENTS = {
+    "archive": "妗ｆ绠＄悊",
+    "drug": "鑽墿鍐茬獊鏌ヨ",
+    "lab": "鍖栭獙鍗曡В璇?,
+    "general": "閫氱敤绉戞櫘",
+}
+
+
+async def input_check(state: dict) -> dict:
+    ok, msg = ComplianceService().input_compliance_check(state.get("user_input", ""))
+    if not ok:
+        state["error_msg"] = msg
+    return state
+
+
+async def intent_recognition(state: dict) -> dict:
+    # 杞婚噺瑙勫垯浼樺厛锛孡LM 浣滀负鍙€夊寮猴紙閬垮厤鏈厤缃椂涓嶅彲鐢級
+    text = state.get("user_input", "")
+    intent = "general"
+    if any(k in text for k in ["鑽?, "鐩镐簰浣滅敤", "涓€璧峰悆"]):
+        intent = "drug"
+    if any(k in text for k in ["鍖栭獙", "妫€楠?, "鎸囨爣", "琛€绯?]):
+        intent = "lab"
+    if any(k in text for k in ["妗ｆ", "璁板綍", "灏辫瘖", "鐢ㄨ嵂璁板綍", "鍖栭獙鍗?]):
+        intent = "archive"
+
+    state["intent"] = intent
+    return state
+
+
+async def entity_extraction(state: dict) -> dict:
+    # MVP锛氬熀浜庣畝鍗曡鍒欐彁鍙栵紙LLM 鍙墿灞曪級
+    intent = state.get("intent")
+    text = state.get("user_input", "")
+
+    entities: dict = {}
+    if intent == "drug":
+        # 绠€鍗曞垎闅?
+        parts = [p.strip() for p in text.replace("銆?, ",").split(",") if p.strip()]
+        entities["drug_name_list"] = parts[:10]
+    elif intent == "lab":
+        entities["raw"] = text
+    else:
+        entities["query"] = text
+
+    state["extract_entities"] = entities
+    return state
+
+
+async def tool_route(state: dict) -> dict:
+    intent = state.get("intent")
+    if intent == "drug":
+        state["tool_name"] = "drug_interaction"
+    elif intent == "lab":
+        state["tool_name"] = "lab_report"
+    else:
+        state["tool_name"] = "general"
+    return state
+
+
+async def tool_execute(state: dict) -> dict:
+    user_id = state.get("user_id")
+    intent = state.get("intent")
+    entities = state.get("extract_entities") or {}
+
+    if intent == "drug":
+        tool = DrugInteractionTool()
+        state["tool_result"] = await tool.check_interactions(
+            user_id=user_id,
+            drug_name_list=entities.get("drug_name_list") or [],
+            sync_to_archive=False,
+        )
+    elif intent == "lab":
+        # 浠呯ず渚嬶細鍏佽鐢ㄦ埛鐩存帴杈撳叆缁撴瀯鍖?item_name/test_value/unit
+        tool = LabReportTool()
+        # 灏濊瘯浠庢枃鏈腑鎶藉彇鈥滈」鐩?鏁板€尖€濆锛堟瀬绠€锛?
+        lab_items = []
+        lines = [l.strip() for l in state.get("user_input", "").splitlines() if l.strip()]
+        for l in lines:
+            if ":" in l:
+                n, v = l.split(":", 1)
+                lab_items.append({"item_name": n.strip(), "test_value": v.strip(), "unit": None})
+        state["tool_result"] = await tool.interpret(
+            user_id=user_id,
+            lab_item_list=lab_items or [{"item_name": "琛€绯?, "test_value": "0", "unit": "mmol/L"}],
+            sync_to_archive=False,
+        )
+    else:
+        state["tool_result"] = {
+            "final_desc": "鎴戝彲浠ユ彁渚涢€氱敤鍋ュ悍绉戞櫘涓庡氨鍖绘寚寮曠被淇℃伅锛屼篃鍙互甯綘鍋氳嵂鐗╃浉浜掍綔鐢ㄧ鏅煡璇㈡垨鍖栭獙鎸囨爣閫氱敤瑙ｈ銆傝鎻忚堪浣犵殑闂鎴栨彁渚涜嵂鍝?鎸囨爣鍚嶇О銆?
+        }
+
+    return state
+
+
+async def llm_generate(state: dict) -> dict:
+    # MVP锛氫笉寮轰緷璧?LLM锛岀洿鎺ヤ娇鐢ㄥ伐鍏风粨鏋滐紱濡傜敤鎴峰～鍏呬簡 LLM 閰嶇疆鍙寮烘鼎鑹?
+    content = (state.get("tool_result") or {}).get("final_desc")
+    if not content:
+        content = "褰撳墠鏈幏鍙栧埌鏈夋晥宸ュ叿缁撴灉銆?
+
+    state["llm_output"] = content
+    return state
+
+
+async def output_check_and_disclaimer(state: dict) -> dict:
+    compliance = ComplianceService()
+
+    ok, msg = compliance.output_compliance_check(state.get("llm_output", ""))
+    if not ok:
+        state["error_msg"] = msg
+        return state
+
+    state["final_response"] = compliance.add_disclaimer(state.get("llm_output", ""))
+    return state
+
+
+async def memory_update(state: dict) -> dict:
+    if state.get("error_msg"):
+        return state
+
+    mem = MemoryService()
+    await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
+    await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
+    return state
+
+
+async def error_finalize(state: dict) -> dict:
+    if state.get("error_msg"):
+        # 閿欒涔熻繑鍥炲厤璐ｅ０鏄庯紙閬垮厤杈撳嚭涓鸿瘖鐤楀缓璁級
+        state["final_response"] = ComplianceService().add_disclaimer(state["error_msg"])
+    return state
+    else:
+        state["tool_result"] = {
+            "final_desc": "我可以提供通用健康科普与就医指引类信息，也可以帮你做药物相互作用科普查询或化验指标通用解读。请描述你的问题或提供药品/指标名称。"
+        }
+
+    return state
+
+
+async def llm_generate(state: dict) -> dict:
+    # MVP：不强依赖 LLM，直接使用工具结果；如用户填充了 LLM 配置可增强润色
+    content = (state.get("tool_result") or {}).get("final_desc")
+    if not content:
+        content = "当前未获取到有效工具结果。"
+
+    state["llm_output"] = content
+    return state
+
+
+async def output_check_and_disclaimer(state: dict) -> dict:
+    compliance = ComplianceService()
+
+    ok, msg = compliance.output_compliance_check(state.get("llm_output", ""))
+    if not ok:
+        state["error_msg"] = msg
+        return state
+
+    state["final_response"] = compliance.add_disclaimer(state.get("llm_output", ""))
+    return state
+
+
+async def memory_update(state: dict) -> dict:
+    if state.get("error_msg"):
+        return state
+
+    mem = MemoryService()
+    await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
+    await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
+    return state
+
+
+async def error_finalize(state: dict) -> dict:
+    if state.get("error_msg"):
+        state["final_response"] = ComplianceService().add_disclaimer(state["error_msg"])
+    return state
+
+
+

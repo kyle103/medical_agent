@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyd
+*.pyo
+*.so
+
+# Virtualenv
+.venv/
+venv/
+ENV/
+
+# Env files (never commit secrets)
+.env.local
+.env.prod
+.env
+
+# Logs & runtime data
+/data/logs/
+*.log
+
+# SQLite DB
+/data/sqlite/*.db
+
+# Chroma persistence
+/data/chroma/
+
+# Pytest
+.pytest_cache/
+
+# IDE
+.vscode/
