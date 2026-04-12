@@ -23,6 +23,11 @@ class UserInfo(Base):
     __tablename__ = "user_info"
 
     user_id: Mapped[str] = mapped_column(String(64), primary_key=True)
+    # 新增：用于长期身份识别（登录名）
+    phone: Mapped[str | None] = mapped_column(String(32), nullable=True)
+    # 新增：密码哈希（不保存明文）
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
+
     user_nickname: Mapped[str] = mapped_column(String(32), default="匿名用户")
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(

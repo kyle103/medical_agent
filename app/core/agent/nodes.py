@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from app.core.compliance.compliance_service import ComplianceService
 from app.core.memory.memory_service import MemoryService
+from app.core.memory.long_memory_service import LongMemoryService
 from app.core.llm.llm_service import LLMService
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
@@ -14,6 +15,7 @@ INTENTS = {
     "lab": "化验单解读",
     "general": "通用科普",
 }
+
 
 def _need_contextual_memory(user_input: str) -> bool:
     """无需显式提示词的上下文需求判定（轻量规则）。"""
@@ -84,6 +86,8 @@ async def memory_load(state: dict) -> dict:
         state["history"] = []
         state["history_text"] = ""
         state["memory_summary"] = ""
+        state["long_memory_items"] = []
+        state["long_memory_text"] = ""
         return state
 
     mem = MemoryService()
@@ -91,6 +95,38 @@ async def memory_load(state: dict) -> dict:
     state["history"] = history
     state["history_text"] = _format_history(history, max_chars=1400)
     state["memory_summary"] = await mem.get_memory_summary(user_id=user_id, session_id=session_id)
+
+    # 长期记忆召回（向量库）：不影响主流程，失败则忽略
+    state["long_memory_items"] = []
+    state["long_memory_text"] = ""
+    try:
+        svc = LongMemoryService()
+        if svc.is_enabled():
+            items = svc.recall(user_id=user_id, query=state.get("user_input", ""), top_k=3)
+            state["long_memory_items"] = [
+                {
+                    "memory_id": it.memory_id,
+                    "text": it.text,
+                    "memory_type": it.memory_type,
+                    "source": it.source,
+                    "session_id": it.session_id,
+                    "created_at": it.created_at,
+                }
+                for it in items
+            ]
+            if items:
+                uniq = []
+                seen = set()
+                for it in items:
+                    t = (it.text or "").strip()
+                    if not t or t in seen:
+                        continue
+                    seen.add(t)
+                    uniq.append(f"- {t}")
+                state["long_memory_text"] = "\n".join(uniq)
+    except Exception:
+        pass
+
     return state
 
 
@@ -199,7 +235,7 @@ async def response_plan(state: dict) -> dict:
         mode = "llm_format"
 
     need_mem = _need_contextual_memory(user_input)
-    if not (state.get("history") or state.get("memory_summary")):
+    if not (state.get("history") or state.get("memory_summary") or state.get("long_memory_text")):
         need_mem = False
 
     state["response_mode"] = mode
@@ -221,6 +257,8 @@ async def llm_generate(state: dict) -> dict:
     if not mem_summary and inject_memory:
         mem_summary = _short_window_history(state.get("history") or [], max_turns=4)
 
+    long_mem = (state.get("long_memory_text") or "").strip()
+
     if mode == "llm_format":
         system_prompt = (
             "你是医疗问答助手，任务是把\"工具/数据库查询结果\"用清晰、自然、结构化的中文表达出来。\n"
@@ -229,21 +267,22 @@ async def llm_generate(state: dict) -> dict:
             "2) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
             "3) 禁止给出诊断结论或处方/调整用药建议。\n"
         )
-        user_prompt = (
-            f"用户问题：{state.get('user_input','')}\n\n"
-            f"工具结果：\n{content}\n"
-        )
+        user_prompt = (f"用户问题：{state.get('user_input','')}\n\n" f"工具结果：\n{content}\n")
+        if long_mem:
+            user_prompt = f"长期记忆（用户历史偏好/事实，供参考，可能与本轮有关）：\n{long_mem}\n\n" + user_prompt
         if inject_memory and mem_summary:
             user_prompt = f"会话记忆（可能与本轮有关）：\n{mem_summary}\n\n" + user_prompt
     else:
         system_prompt = (
             "你是医疗问答助手，需要用自然的对话方式回答用户。\n"
             "原则：\n"
-            "1) 如提供了会话记忆或工具结果，你必须优先使用它们来保持上下文一致。\n"
+            "1) 如提供了会话记忆/长期记忆或工具结果，你必须优先使用它们来保持上下文一致。\n"
             "2) 不得编造不存在的个人信息/检查结果/用药记录。\n"
             "3) 禁止诊断与处方/调整用药建议；可以给出通用科普与就医指引。\n"
         )
         parts = []
+        if long_mem:
+            parts.append("长期记忆（用户历史偏好/事实）：\n" + long_mem)
         if inject_memory and mem_summary:
             parts.append("会话记忆：\n" + mem_summary)
         if content:
@@ -286,6 +325,17 @@ async def memory_update(state: dict) -> dict:
     mem = MemoryService()
     await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
     await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
+
+    # 写入长期记忆（向量库）：规则抽取 + add；失败不影响主流程
+    try:
+        svc = LongMemoryService()
+        if svc.is_enabled():
+            items = svc.extract_candidates(user_input=state.get("user_input", ""))
+            if items:
+                svc.add_items(user_id=state["user_id"], session_id=state["session_id"], items=items)
+    except Exception:
+        pass
+
     return state
 
 

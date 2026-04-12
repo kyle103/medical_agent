@@ -1,7 +1,7 @@
 from __future__ import annotations
 
-from typing import TypedDict
 from typing import Literal
+from typing import TypedDict
 
 
 class AgentState(TypedDict, total=False):
@@ -14,11 +14,15 @@ class AgentState(TypedDict, total=False):
     history_text: str
     recall_mode: bool
 
+    # 长期记忆（向量库召回，按 user_id 隔离）
+    long_memory_items: list[dict]  # [{memory_id,text,memory_type,source,session_id,created_at}]
+    long_memory_text: str
+
     # 记忆摘要（用于注入LLM，优先摘要；必要时再加短窗口原文）
     memory_summary: str
 
     # 响应规划：决定是否调用LLM、是否注入记忆、使用何种提示词
-    response_mode: Literal['llm_chat', 'llm_format', 'template_only']
+    response_mode: Literal["llm_chat", "llm_format", "template_only"]
     inject_memory: bool
 
     # 可观测性

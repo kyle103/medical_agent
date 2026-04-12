@@ -26,6 +26,10 @@ def init_chroma_collection(*, collection_name: str):
     if settings.VECTOR_STORE_TYPE not in ("chroma_file", "{{chroma_file/chroma_server/qdrant}}"):
         raise ServiceUnavailableException("当前 VECTOR_STORE_TYPE 未启用 chroma_file")
 
+    # 关闭 Chroma 的遥测（避免本地开发环境报 posthog capture 参数不兼容的噪音日志）
+    # 需在 chromadb import/初始化前设置。
+    os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+
     try:
         import chromadb
 
