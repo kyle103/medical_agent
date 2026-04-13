@@ -89,16 +89,24 @@ def _need_contextual_memory(user_input: str) -> bool:
 
     # 短追问/承接
     if len(t) <= 12:
-        return True
+        # 排除简单的陈述性语句
+        simple_statements = ["我有", "我是", "我在", "我要", "我想"]
+        if not any(statement in t for statement in simple_statements):
+            return True
 
     # 指代/省略
     pronouns = ["那个", "它", "这", "这样", "上面", "刚才", "之前", "继续", "然后", "还要", "还用", "还需要"]
     if any(p in t for p in pronouns):
         return True
 
-    # 复盘/总结类
-    recall = ["总结", "回顾", "复盘", "你还记得", "你记得", "还记得"]
+    # 回忆/核对类
+    recall = ["总结", "回顾", "复盘", "你还记得", "你记得", "还记得", "之前", "刚才", "上次", "昨天", "今天", "最近", "记得", "回顾", "总结"]
     if any(k in t for k in recall):
+        return True
+
+    # 用药追问类
+    drug_queries = ["吃过什么药", "吃了什么药", "服用过什么", "用过什么药", "今天吃了什么药", "昨天吃了什么药"]
+    if any(q in t for q in drug_queries):
         return True
 
     return False
@@ -168,7 +176,34 @@ async def memory_load(state: dict) -> dict:
         svc = LongMemoryService()
         query = state.get("user_input", "")
         if svc.is_enabled():
-            items = svc.recall(user_id=user_id, query=query, top_k=3)
+            # 增大召回top_k到6，获取更多候选结果
+            items = svc.recall(user_id=user_id, query=query, top_k=6)
+            
+            # 二次筛选：优先保留包含药物名称的记忆，然后保留其他记忆
+            drug_keywords = ["药", "药物", "服用", "吃了", "吃过", "布洛芬", "阿司匹林", "抗生素", "降压药", "降糖药"]
+            drug_related_items = []
+            other_items = []
+            
+            seen = set()
+            for it in items:
+                if it.memory_id in seen:
+                    continue
+                seen.add(it.memory_id)
+                
+                # 检查是否包含药物相关关键词（对中文不做lower处理）
+                text = it.text
+                is_drug_related = any(keyword in text for keyword in drug_keywords)
+                
+                if is_drug_related:
+                    drug_related_items.append(it)
+                else:
+                    other_items.append(it)
+            
+            # 合并结果，药物相关记忆优先
+            filtered_items = drug_related_items + other_items
+            # 最终保留最多5个记忆项
+            filtered_items = filtered_items[:5]
+            
             state["long_memory_items"] = [
                 {
                     "memory_id": it.memory_id,
@@ -178,16 +213,11 @@ async def memory_load(state: dict) -> dict:
                     "session_id": it.session_id,
                     "created_at": it.created_at,
                 }
-                for it in items
+                for it in filtered_items
             ]
-            if items:
-                uniq = []
-                seen = set()
-                for it in items:
-                    if it.memory_id not in seen:
-                        seen.add(it.memory_id)
-                        uniq.append(it)
-                state["long_memory_text"] = "\n".join([f"- {it.text}" for it in uniq])
+            
+            if filtered_items:
+                state["long_memory_text"] = "\n".join([f"- {it.text}" for it in filtered_items])
             
             # 记录向量检索日志
             retrieval_time = time.time() - start_time
@@ -204,7 +234,7 @@ async def memory_load(state: dict) -> dict:
                         "session_id": it.session_id,
                         "created_at": str(it.created_at)
                     }
-                    for it in items
+                    for it in filtered_items
                 ],
                 retrieval_time=retrieval_time
             )
@@ -328,8 +358,10 @@ async def response_plan(state: dict) -> dict:
     if intent in ("archive", "drug", "lab") or tool_name in ("archive", "drug_interaction", "lab_report"):
         mode = "llm_format"
 
-    need_mem = _need_contextual_memory(user_input)
-    if not (state.get("history") or state.get("memory_summary") or state.get("long_memory_text")):
+    # 当long_memory_text非空时，无条件注入长期记忆
+    long_mem = (state.get("long_memory_text") or "").strip()
+    need_mem = _need_contextual_memory(user_input) or bool(long_mem)
+    if not (state.get("history") or state.get("memory_summary") or long_mem):
         need_mem = False
 
     state["response_mode"] = mode
@@ -408,7 +440,8 @@ async def output_check_and_disclaimer(state: dict) -> dict:
         state["error_msg"] = msg
         return state
 
-    state["final_response"] = compliance.add_disclaimer(state.get("llm_output", ""))
+    # 移除免责声明，直接使用LLM输出
+    state["final_response"] = state.get("llm_output", "")
     return state
 
 

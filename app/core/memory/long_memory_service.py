@@ -75,6 +75,7 @@ class LongMemoryService:
         - 使用LLM提取记忆，提高准确性和覆盖面
         - 增加置信度评估，过滤低质量记忆
         - 控制提取数量，避免过多噪声
+        - 必要时进行结构化处理，提高记忆质量
         """
 
         text = (user_input or "").strip()
@@ -101,14 +102,20 @@ class LongMemoryService:
 你是一个医疗记忆提取助手，负责从用户的对话中提取有价值的医疗相关信息，用于长期记忆存储。
 
 请从以下用户输入中提取可能需要长期记忆的信息，包括但不限于：
-1. 过敏史
-2. 用药情况
-3. 健康偏好
-4. 病史/慢病信息
+1. 过敏史（如：对青霉素过敏）
+2. 用药情况（如：今天吃了布洛芬）
+3. 健康偏好（如：不喜欢吃辣）
+4. 病史/慢病信息（如：有高血压病史）
 5. 其他重要的健康相关事实
 
+提取规则：
+- 每条提取的信息必须是一个完整的事实陈述
+- 信息要简洁明了，去除冗余内容
+- 优先提取具体的医疗相关信息，如药物名称、症状、病史等
+- 对于药物相关信息，尽量包含药物名称和使用情况
+
 对于每条提取的信息，请提供：
-- 记忆内容（简洁明了的陈述句）
+- 记忆内容（简洁明了的陈述句，如：用户对青霉素过敏）
 - 记忆类型（fact/preference/profile）
 - 置信度（0-1之间，反映该信息的可靠性）
 
@@ -134,10 +141,14 @@ class LongMemoryService:
             if isinstance(items_data, list):
                 for data in items_data:
                     if isinstance(data, dict) and 'text' in data:
+                        # 结构化处理：确保文本格式统一，以"用户"开头
+                        text = data['text']
+                        if not text.startswith('用户'):
+                            text = f"用户{text}"
                         items.append(
                             LongMemoryItem(
                                 memory_id=uuid.uuid4().hex,
-                                text=data['text'],
+                                text=text,
                                 memory_type=data.get('memory_type', 'fact'),
                                 confidence=data.get('confidence', 1.0),
                                 created_at=int(time.time())
@@ -159,28 +170,62 @@ class LongMemoryService:
         items: list[LongMemoryItem] = []
         now = int(time.time())
 
+        # 增强的规则模式，覆盖更多医疗相关场景
         patterns: list[tuple[str, str]] = [
-            (r"(我|本人).{0,4}(对|存在).{0,4}(过敏)", "fact"),
-            (r"(我|本人).{0,6}(不吃|不喝|不喜欢|讨厌|不能吃|不能喝)", "preference"),
-            (r"(我|本人).{0,6}(既往史|病史|慢病|高血压|糖尿病|冠心病|哮喘)", "profile"),
-            (r"(我|本人).{0,8}(正在|目前|长期).{0,6}(用药|吃|服用)", "fact"),
+            # 过敏史
+            (r"(我|本人).{0,4}(对|存在).{0,10}(过敏|过敏原)", "fact"),
+            # 用药情况
+            (r"(我|本人).{0,8}(吃|服用|用了|用).{0,10}(药|药物|胶囊|片|丸)", "fact"),
+            (r"(我|本人).{0,8}(今天|昨天|最近).{0,10}(吃|服用|用了|用).{0,10}(药|药物)", "fact"),
+            # 健康偏好
+            (r"(我|本人).{0,6}(不吃|不喝|不喜欢|讨厌|不能吃|不能喝|避免)", "preference"),
+            # 病史/慢病信息
+            (r"(我|本人).{0,6}(有|患|得了).{0,10}(病|症|高血压|糖尿病|冠心病|哮喘|胃炎|肝炎)", "profile"),
+            (r"(我|本人).{0,6}(既往史|病史|慢病|长期病)", "profile"),
+            # 症状信息
+            (r"(我|本人).{0,6}(感到|感觉|出现|有).{0,10}(头痛|头晕|发烧|咳嗽|腹痛|恶心|呕吐)", "fact"),
         ]
 
         for pat, mtype in patterns:
             if re.search(pat, lowered):
+                # 结构化处理：提取关键信息，生成更规范的记忆文本
+                structured_text = self._structure_memory_text(text, mtype)
                 items.append(
                     LongMemoryItem(
                         memory_id=uuid.uuid4().hex,
-                        text=text,
+                        text=structured_text,
                         memory_type=mtype,
                         confidence=0.8,  # 规则提取的默认置信度
                         created_at=now,
                     )
                 )
-                break
+                # 不break，允许提取多个记忆项
 
         # 控制数量
-        return items[:2]
+        return items[:3]
+
+    def _structure_memory_text(self, text: str, memory_type: str) -> str:
+        """对提取的记忆文本进行结构化处理，生成更规范的记忆内容。"""
+        
+        # 替换第一人称
+        text = text.replace("我", "用户").replace("本人", "用户")
+        
+        # 根据记忆类型进行不同的结构化处理
+        if memory_type == "fact":
+            # 确保事实类记忆是完整的陈述句
+            if not text.endswith('。'):
+                text = f"{text}。"
+        elif memory_type == "preference":
+            # 确保偏好类记忆清晰表达
+            if "不喜欢" in text or "讨厌" in text:
+                text = text.replace("不喜欢", "不喜欢")
+                text = text.replace("讨厌", "不喜欢")
+        elif memory_type == "profile":
+            # 确保病史类记忆准确表达
+            if "有" in text and "病" in text:
+                pass  # 保持原样
+        
+        return text
 
     def add_items(self, *, user_id: str, session_id: str, items: list[LongMemoryItem]) -> int:
         if not user_id:
@@ -248,7 +293,7 @@ class LongMemoryService:
             # 搜索相似记忆
             res = col.query(
                 query_texts=[text],
-                n_results=3,
+                n_results=5,
                 where={"user_id": user_id}
             )
             
@@ -262,17 +307,43 @@ class LongMemoryService:
             if not isinstance(first_docs, list):
                 return False
             
-            # 简单文本相似度判断，实际项目中可使用更复杂的相似度算法
+            # 改进的文本相似度判断
             for doc in first_docs:
                 if isinstance(doc, str):
+                    # 完全相同
                     if text == doc:
                         return True
                     # 检查文本是否高度相似（例如，一个是另一个的子集）
                     if text in doc or doc in text:
                         return True
+                    # 检查是否包含相同的关键信息（如药物名称）
+                    if self._has_same_key_information(text, doc):
+                        return True
         except Exception:
             # 出错时默认返回False，避免阻塞主流程
             pass
+        
+        return False
+    
+    def _has_same_key_information(self, text1: str, text2: str) -> bool:
+        """检查两个文本是否包含相同的关键信息（如药物名称）。"""
+        
+        # 药物关键词列表
+        drug_names = ["布洛芬", "阿司匹林", "青霉素", "抗生素", "降压药", "降糖药", "感冒药", "止痛药"]
+        
+        # 检查两个文本是否包含相同的药物名称
+        text1_lower = text1.lower()
+        text2_lower = text2.lower()
+        
+        for drug in drug_names:
+            if drug in text1_lower and drug in text2_lower:
+                return True
+        
+        # 检查是否包含相同的健康状况关键词
+        health_keywords = ["高血压", "糖尿病", "冠心病", "哮喘", "过敏", "头痛", "头晕", "发烧"]
+        for keyword in health_keywords:
+            if keyword in text1 and keyword in text2:
+                return True
         
         return False
 
