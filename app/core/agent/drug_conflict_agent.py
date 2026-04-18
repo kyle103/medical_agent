@@ -8,6 +8,7 @@ import json
 
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
+from app.core.prompts import Prompts
 
 
 class DrugConflictAgent(BaseAgent):
@@ -23,7 +24,7 @@ class DrugConflictAgent(BaseAgent):
         user_input = state.get("user_input", "")
         
         # 提取药品名称
-        drug_names = self._extract_drug_names(user_input)
+        drug_names = await self._extract_drug_names(user_input)
         
         if not drug_names:
             state["final_response"] = self._add_disclaimer(
@@ -79,53 +80,58 @@ class DrugConflictAgent(BaseAgent):
         
         return state
     
-    def _extract_drug_names(self, user_input: str) -> list:
+    async def _extract_drug_names(self, user_input: str) -> list:
         """从用户输入中提取药品名称"""
-        # 简单的关键词提取，实际项目中可以使用更复杂的NLP方法
-        drug_keywords = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
-                        "抗生素", "止痛药", "感冒药", "消炎药"]
-        
-        found_drugs = []
-        for drug in drug_keywords:
-            if drug in user_input:
-                found_drugs.append(drug)
-        
-        # 如果没有找到已知药品，返回用户输入中的关键词
-        if not found_drugs:
-            # 简单的分割提取
-            words = user_input.replace("、", ",").replace("和", ",").split(",")
-            found_drugs = [word.strip() for word in words if len(word.strip()) > 1]
+        # 使用DrugKnowledgeService匹配药品名称
+        try:
+            from app.core.rag.drug_knowledge_service import DrugKnowledgeService
             
-            # 限制返回数量
-            found_drugs = found_drugs[:5]
+            # 提取可能的药品名称
+            import re
+            drug_patterns = [
+                r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})',
+                r'([^，。！？\s]{1,30})(?:片|粒|胶囊|支|瓶|袋|贴)',
+                r'(?:药名|药品|药物)\s*[:：]\s*([^，。！？\s]{1,30})'
+            ]
+            
+            candidate_names = []
+            for pattern in drug_patterns:
+                matches = re.findall(pattern, user_input)
+                candidate_names.extend(matches)
+            
+            # 处理"和"、"与"、"或"等连接词
+            if not candidate_names:
+                # 简单的分割提取
+                words = user_input.replace("、", ",").replace("和", ",").replace("与", ",").split(",")
+                candidate_names = [word.strip() for word in words if len(word.strip()) > 1]
+            
+            # 使用药品知识库进行匹配
+            if candidate_names:
+                svc = DrugKnowledgeService()
+                matched_drugs = await svc.match_drugs(candidate_names)
+                
+                # 收集匹配成功的药品名
+                found_drugs = []
+                for result in matched_drugs:
+                    if result.get("match"):
+                        found_drugs.append(result["match"]["drug_name"])
+                
+                # 如果没有匹配到，使用候选名称
+                if not found_drugs:
+                    found_drugs = candidate_names[:5]  # 限制返回数量
+            else:
+                found_drugs = []
+        except Exception as e:
+            # 如果DrugKnowledgeService失败，使用简单的关键词提取
+            drug_keywords = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
+                            "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
+            
+            found_drugs = []
+            for drug in drug_keywords:
+                if drug in user_input:
+                    found_drugs.append(drug)
         
         return found_drugs
     
     def get_system_prompt(self) -> str:
-        return """
-你是专业的药物冲突查询助手，专门处理药物相互作用和配伍禁忌查询。
-
-你的职责：
-1. 基于药品知识库提供准确的药物冲突信息
-2. 生成专业、易懂的药物相互作用科普解读
-3. 严格遵守医疗合规要求，不提供用药建议
-
-核心原则：
-1. 所有药物冲突信息必须基于权威药品知识库
-2. 不得生成任何无来源的药物相互作用结论
-3. 不得提供具体的用药剂量、用药时间等指导性建议
-4. 所有输出必须包含标准免责声明
-
-输出要求：
-1. 清晰说明药物之间的相互作用类型（如：增强药效、增加副作用风险等）
-2. 提供通用的安全用药科普知识
-3. 语言通俗易懂，适合普通用户理解
-4. 强调咨询执业药师或医生的必要性
-
-示例输出格式：
-根据药品知识库信息，[药品A]和[药品B]之间存在[相互作用类型]。
-
-通用安全提示：[通用科普内容]
-
-重要提醒：具体用药请咨询执业医师或药师，遵医嘱用药。
-"""
+        return Prompts.get_prompt("DRUG_CONFLICT_AGENT")

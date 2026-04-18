@@ -1,10 +1,11 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 from dataclasses import dataclass
 
 from app.core.llm.llm_service import LLMService
 from app.config.settings import settings
+from app.core.prompts import Prompts
 
 
 @dataclass
@@ -114,16 +115,9 @@ class IntentClassifier:
             return rule
 
         # 2) LLM 增强：尝试输出结构化 JSON
-        system_prompt = (
-            "你是一个医疗问答系统的意图分类器，只能在以下意图中选择一个："
-            "archive(档案管理)、drug(药物相互作用科普查询)、lab(化验单通用解读)、general(通用健康科普)。\n"
-            "你必须只输出 JSON，对象字段为 intent/confidence/reason。\n"
-            "严格禁止输出诊断、处方、用药调整建议。"
-        )
-        user_prompt = (
-            "用户输入：" + (text or "") + "\n"
-            "请返回 JSON，例如：{\"intent\":\"general\",\"confidence\":0.6,\"reason\":\"...\"}"
-        )
+        system_prompt = Prompts.get_prompt("INTENT_CLASSIFIER")
+        user_prompt = ("用户输入：" + (text or "") + "\n" +
+                     "请返回 JSON，例如：{\"intent\":\"general\",\"confidence\":0.6,\"reason\":\"...\"}")
 
         # 说明：意图增强只需要极短输出，强制限制 max_tokens + 超时，避免拖慢主链路
         try:

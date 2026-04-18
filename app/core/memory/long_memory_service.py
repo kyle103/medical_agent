@@ -5,8 +5,10 @@ import time
 import uuid
 from dataclasses import dataclass
 
+from app.core.utils.text_splitter import TextSplitter
 from app.common.exceptions import ServiceUnavailableException
 from app.core.llm.llm_service import LLMService
+from app.core.prompts import Prompts
 from app.db.vector_store import init_chroma_collection
 
 
@@ -98,32 +100,7 @@ class LongMemoryService:
     async def _extract_with_llm(self, *, user_input: str) -> list[LongMemoryItem]:
         """使用LLM提取记忆。"""
         
-        system_prompt = """
-你是一个医疗记忆提取助手，负责从用户的对话中提取有价值的医疗相关信息，用于长期记忆存储。
-
-请从以下用户输入中提取可能需要长期记忆的信息，包括但不限于：
-1. 过敏史（如：对青霉素过敏）
-2. 用药情况（如：今天吃了布洛芬）
-3. 健康偏好（如：不喜欢吃辣）
-4. 病史/慢病信息（如：有高血压病史）
-5. 其他重要的健康相关事实
-6. 用药事件：用户提及的用药行为（如“今天吃了布洛芬”），这类信息需要特别关注，因为它们可能需要进一步确认后写入正式档案
-
-提取规则：
-- 每条提取的信息必须是一个完整的事实陈述
-- 信息要简洁明了，去除冗余内容
-- 优先提取具体的医疗相关信息，如药物名称、症状、病史等
-- 对于药物相关信息，尽量包含药物名称和使用情况
-- 对于用药事件，请特别注意提取药物名称、剂量、时间等信息
-
-对于每条提取的信息，请提供：
-- 记忆内容（简洁明了的陈述句，如：用户对青霉素过敏）
-- 记忆类型（fact/preference/profile/drug_event）
-- 置信度（0-1之间，反映该信息的可靠性）
-
-输出格式为JSON数组，每个元素包含text、memory_type和confidence字段。
-如果没有需要提取的信息，请返回空数组。
-"""
+        system_prompt = Prompts.get_prompt("MEMORY_EXTRACTION")
 
         prompt = f"用户输入：{user_input}"
         
@@ -231,6 +208,17 @@ class LongMemoryService:
                 pass  # 保持原样
         
         return text
+        
+    def _split_text(self, text: str) -> list[str]:
+        """文本切分
+        使用基于标点符号的语义分割，结合固定长度限制和20%的重叠策略
+        """
+        return TextSplitter.split_text(
+            text=text,
+            chunk_size=500,  # 固定长度限制
+            chunk_overlap=100,  # 20%的重叠策略 (500*0.2=100)
+            separators=["\n\n", "\n", "。", "！", "？", "，", "、"]  # 中文标点符号作为分隔符
+        )
 
     async def add_items(self, *, user_id: str, session_id: str, items: list[LongMemoryItem]) -> int:
         if not user_id:
@@ -252,15 +240,33 @@ class LongMemoryService:
 
             for it in unique_items:
                 it.session_id = session_id
-                ids.append(it.memory_id)
-                docs.append(it.text)
-                metas.append(it.to_metadata(user_id=user_id))
+                
+                # 对长文本进行切分
+                if len(it.text) > 500:
+                    chunks = self._split_text(it.text)
+                    for i, chunk in enumerate(chunks):
+                        # 为每个chunk生成唯一ID
+                        chunk_id = f"{it.memory_id}_{i}"
+                        ids.append(chunk_id)
+                        docs.append(chunk)
+                        # 保留原始记忆项的元数据
+                        meta = it.to_metadata(user_id=user_id)
+                        # 添加chunk信息
+                        meta["parent_id"] = it.memory_id
+                        meta["chunk_index"] = i
+                        metas.append(meta)
+                else:
+                    # 短文本直接存储
+                    ids.append(it.memory_id)
+                    docs.append(it.text)
+                    metas.append(it.to_metadata(user_id=user_id))
 
             col.add(ids=ids, documents=docs, metadatas=metas)
             return len(ids) if isinstance(ids, list) else 0
         except Exception as e:
             # 出错时默认返回0，避免阻塞主流程
-            logger.error(f"添加记忆项失败: {e}")
+            import logging
+            logging.error(f"添加记忆项失败: {e}")
             return 0
 
     async def _deduplicate_items(self, *, user_id: str, items: list[LongMemoryItem]) -> list[LongMemoryItem]:

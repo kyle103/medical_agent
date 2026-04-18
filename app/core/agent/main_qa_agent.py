@@ -8,6 +8,7 @@ import json
 
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.archive_query_tool import ArchiveQueryTool
+from app.core.prompts import Prompts
 
 
 class MainQAAgent(BaseAgent):
@@ -93,10 +94,84 @@ class MainQAAgent(BaseAgent):
         user_id = state.get("user_id", "")
         user_input = state.get("user_input", "")
         
-        system_prompt = self.get_system_prompt()
-        
-        # 直接调用LLM进行通用问答
-        response = await self._call_llm(user_input, system_prompt, state)
+        # 处理"还记得我之前吃的药吗？"这类问题
+        if any(phrase in user_input for phrase in ["还记得我之前吃的药吗", "之前吃过什么药", "我吃了哪些药", "我之前吃的药"]):
+            # 优先查询档案中的用药记录
+            try:
+                tool_result = await self.archive_tool.query(
+                    user_id=user_id,
+                    query_type="drug_records",
+                    query_conditions={},
+                )
+                
+                # 检查是否有用药记录
+                drug_records = tool_result.get("items", [])
+                if drug_records:
+                    # 有档案记录，生成响应
+                    system_prompt = self.get_system_prompt()
+                    user_prompt = f"""
+用户询问之前的用药记录：
+用户输入：{user_input}
+查询结果：
+{tool_result}
+
+请基于查询结果生成专业的用药记录展示，要求：
+1. 清晰展示用户的用药记录
+2. 按时间顺序组织
+3. 语言简洁明了，便于用户理解
+4. 不涉及疾病诊断或治疗建议
+"""
+                    response = await self._call_llm(user_prompt, system_prompt, state)
+                else:
+                    # 档案为空，检查对话历史
+                    history = state.get("history", [])
+                    mentioned_drugs = []
+                    
+                    # 从对话历史中提取提到的药品
+                    for message in history:
+                        if message.get("role") == "user":
+                            content = message.get("content", "")
+                            # 简单的药品名称提取
+                            common_drugs = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
+                                           "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
+                            for drug in common_drugs:
+                                if drug in content and drug not in mentioned_drugs:
+                                    mentioned_drugs.append(drug)
+                    
+                    if mentioned_drugs:
+                        # 有对话中提到的药品
+                        response = f"在我们的对话中，您提到过以下药品：{', '.join(mentioned_drugs)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"
+                    else:
+                        # 既没有档案记录，也没有对话中提到的药品
+                        response = "根据目前的档案信息，您尚未录入任何用药记录。如果您需要记录用药信息，请告诉我具体的药品名称、用法用量等详情，我将帮您添加到档案中。"
+            except Exception as e:
+                # 查询失败，检查对话历史
+                history = state.get("history", [])
+                mentioned_drugs = []
+                
+                # 从对话历史中提取提到的药品
+                for message in history:
+                    if message.get("role") == "user":
+                        content = message.get("content", "")
+                        # 简单的药品名称提取
+                        common_drugs = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
+                                       "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
+                        for drug in common_drugs:
+                            if drug in content and drug not in mentioned_drugs:
+                                mentioned_drugs.append(drug)
+                
+                if mentioned_drugs:
+                    # 有对话中提到的药品
+                    response = f"在我们的对话中，您提到过以下药品：{', '.join(mentioned_drugs)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"
+                else:
+                    # 既没有档案记录，也没有对话中提到的药品
+                    response = "根据目前的档案信息，您尚未录入任何用药记录。如果您需要记录用药信息，请告诉我具体的药品名称、用法用量等详情，我将帮您添加到档案中。"
+        else:
+            # 其他通用问答
+            system_prompt = self.get_system_prompt()
+            
+            # 直接调用LLM进行通用问答
+            response = await self._call_llm(user_input, system_prompt, state)
         
         # 合规校验
         ok, msg = self._check_compliance(response)
@@ -154,37 +229,4 @@ class MainQAAgent(BaseAgent):
         return query_type, query_conditions
     
     def get_system_prompt(self) -> str:
-        return """
-你是专业的医疗健康问答助手，主要处理档案查询和通用健康问答。
-
-你的职责：
-1. 提供用户健康档案的查询和展示服务
-2. 回答通用的健康科普和医疗知识问题
-3. 严格遵守医疗合规要求，不提供疾病诊断
-
-档案查询功能：
-1. 可以查询用户的基本信息、就诊记录、用药记录、化验记录等
-2. 按时间顺序清晰展示档案信息
-3. 突出重要的健康指标和变化趋势
-4. 不涉及疾病诊断或治疗建议
-
-通用问答功能：
-1. 回答健康科普、疾病预防、生活方式等通用问题
-2. 提供权威的医疗知识科普
-3. 不提供具体的疾病诊断或治疗建议
-4. 强调咨询执业医师的重要性
-
-核心原则：
-1. 所有回答必须基于权威医学知识
-2. 不得生成任何疾病诊断或治疗建议
-3. 仅提供通用健康科普，不涉及具体病情判断
-4. 所有输出必须包含标准免责声明
-
-输出要求：
-1. 档案查询：清晰展示信息，便于用户理解
-2. 通用问答：语言通俗易懂，科学准确
-3. 避免使用专业术语，必要时进行解释
-4. 强调健康信息需要结合临床实际综合判断
-
-重要提醒：所有健康问题都应咨询执业医师进行专业诊断。
-"""
+        return Prompts.get_prompt("MAIN_QA_AGENT")
