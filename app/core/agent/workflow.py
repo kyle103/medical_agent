@@ -6,6 +6,8 @@ from langgraph.graph import END, StateGraph
 
 from app.common.exceptions import UserAuthException
 from app.core.agent.nodes import (
+    agent_execute,
+    agent_route,
     entity_extraction,
     error_finalize,
     input_check,
@@ -15,8 +17,6 @@ from app.core.agent.nodes import (
     memory_update,
     output_check_and_disclaimer,
     response_plan,
-    tool_execute,
-    tool_route,
 )
 from app.core.agent.state import AgentState
 
@@ -32,8 +32,7 @@ class MedicalAgent:
         g.add_node("mem_load", memory_load)
         g.add_node("intent_node", intent_recognition)
         g.add_node("entities", entity_extraction)
-        g.add_node("route", tool_route)
-        g.add_node("tool", tool_execute)
+        g.add_node("agent_route", agent_route)
         g.add_node("plan", response_plan)
         g.add_node("llm", llm_generate)
         g.add_node("out", output_check_and_disclaimer)
@@ -49,9 +48,8 @@ class MedicalAgent:
 
         g.add_edge("mem_load", "intent_node")
         g.add_edge("intent_node", "entities")
-        g.add_edge("entities", "route")
-        g.add_edge("route", "tool")
-        g.add_edge("tool", "plan")
+        g.add_edge("entities", "agent_route")
+        g.add_edge("agent_route", "plan")
         g.add_edge("plan", "llm")
         g.add_edge("llm", "out")
 

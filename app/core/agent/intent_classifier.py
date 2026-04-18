@@ -63,7 +63,10 @@ class IntentClassifier:
         ]
 
         # drug：相互作用/能否同服/配伍禁忌/两个药
-        drug_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "同时吃"]
+        drug_interaction_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "同时吃"]
+        
+        # drug：用药记录添加/当前用药陈述
+        drug_record_keywords = ["吃了", "服用", "用了", "吃", "服用", "使用", "用", "剂量", "频次", "一天", "一次", "每次"]
 
         # lab：血常规/指标/数值/单位等
         lab_keywords = ["化验", "检验", "指标", "参考范围", "正常值", "血常规", "尿常规", "mmol", "mg/L"]
@@ -71,17 +74,30 @@ class IntentClassifier:
         if any(k in t for k in lab_keywords):
             return IntentResult(intent="lab", confidence=0.8, reason="rule:lab")
 
-        # “我昨天吃的什么药/我之前吃了哪些药” 属于档案查询而不是药物相互作用
-        if any(k in t for k in archive_keywords) and "药" in t and not any(k in t for k in drug_keywords):
+        # "我昨天吃的什么药/我之前吃了哪些药" 属于档案查询而不是药物相互作用
+        if any(k in t for k in archive_keywords) and "药" in t and not any(k in t for k in drug_interaction_keywords):
             return IntentResult(intent="archive", confidence=0.75, reason="rule:archive-drug-history")
 
         if any(k in t for k in archive_keywords):
             return IntentResult(intent="archive", confidence=0.7, reason="rule:archive")
 
-        if any(k in t for k in drug_keywords) or ("药" in t and "一起" in t):
-            return IntentResult(intent="drug", confidence=0.7, reason="rule:drug")
+        # 药物相互作用意图
+        if any(k in t for k in drug_interaction_keywords) or ("药" in t and "一起" in t):
+            return IntentResult(intent="drug", confidence=0.7, reason="rule:drug-interaction")
+        
+        # 用药记录添加意图（当前用药陈述）
+        if any(k in t for k in drug_record_keywords) and "药" in t:
+            # 排除历史用药查询（包含"昨天"、"上次"、"之前"等时间词）
+            time_keywords = ["昨天", "上次", "之前", "以前", "曾经", "过", "哪些", "什么药"]
+            # 区分历史用药查询和当前用药记录
+            if any(time_k in t for time_k in time_keywords):
+                # 历史用药查询属于档案查询
+                return IntentResult(intent="archive", confidence=0.7, reason="rule:archive-drug-history-query")
+            else:
+                # 当前用药记录属于药物记录
+                return IntentResult(intent="drug", confidence=0.8, reason="rule:drug-record-add")
 
-        # “药”单独出现不再强制判 drug，避免把“我昨天吃的什么药”误判
+        # "药"单独出现不再强制判 drug，避免把"我昨天吃的什么药"误判
         if "药" in t:
             return IntentResult(intent="general", confidence=0.55, reason="rule:contains-drug-but-ambiguous")
 

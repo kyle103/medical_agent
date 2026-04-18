@@ -69,7 +69,7 @@ class LongMemoryService:
             return False
 
     async def extract_candidates(self, *, user_input: str) -> list[LongMemoryItem]:
-        """从用户输入中抽取可写入长期记忆的候选条目（LLM版）。
+        """从用户输入中抽取可写入长期记忆的候选条目（LLM版），包括用药事件。
 
         策略：
         - 使用LLM提取记忆，提高准确性和覆盖面
@@ -107,16 +107,18 @@ class LongMemoryService:
 3. 健康偏好（如：不喜欢吃辣）
 4. 病史/慢病信息（如：有高血压病史）
 5. 其他重要的健康相关事实
+6. 用药事件：用户提及的用药行为（如“今天吃了布洛芬”），这类信息需要特别关注，因为它们可能需要进一步确认后写入正式档案
 
 提取规则：
 - 每条提取的信息必须是一个完整的事实陈述
 - 信息要简洁明了，去除冗余内容
 - 优先提取具体的医疗相关信息，如药物名称、症状、病史等
 - 对于药物相关信息，尽量包含药物名称和使用情况
+- 对于用药事件，请特别注意提取药物名称、剂量、时间等信息
 
 对于每条提取的信息，请提供：
 - 记忆内容（简洁明了的陈述句，如：用户对青霉素过敏）
-- 记忆类型（fact/preference/profile）
+- 记忆类型（fact/preference/profile/drug_event）
 - 置信度（0-1之间，反映该信息的可靠性）
 
 输出格式为JSON数组，每个元素包含text、memory_type和confidence字段。
@@ -175,8 +177,11 @@ class LongMemoryService:
             # 过敏史
             (r"(我|本人).{0,4}(对|存在).{0,10}(过敏|过敏原)", "fact"),
             # 用药情况
-            (r"(我|本人).{0,8}(吃|服用|用了|用).{0,10}(药|药物|胶囊|片|丸)", "fact"),
-            (r"(我|本人).{0,8}(今天|昨天|最近).{0,10}(吃|服用|用了|用).{0,10}(药|药物)", "fact"),
+        (r"(我|本人).{0,8}(吃|服用|用了|用).{0,10}(药|药物|胶囊|片|丸)", "fact"),
+        (r"(我|本人).{0,8}(今天|昨天|最近).{0,10}(吃|服用|用了|用).{0,10}(药|药物)", "fact"),
+        # 用药事件
+        (r"(今天|昨天|刚才|现在|早上|中午|晚上|下午).{0,10}(吃|服用|用了|用).{0,10}([^，。！？\s]{1,30})", "drug_event"),
+        (r"([^，。！？\s]{1,30}).{0,10}(片|粒|胶囊|支|瓶|袋|贴).{0,10}(今天|昨天|刚才|现在|早上|中午|晚上|下午)?", "drug_event"),
             # 健康偏好
             (r"(我|本人).{0,6}(不吃|不喝|不喜欢|讨厌|不能吃|不能喝|避免)", "preference"),
             # 病史/慢病信息
@@ -227,7 +232,7 @@ class LongMemoryService:
         
         return text
 
-    def add_items(self, *, user_id: str, session_id: str, items: list[LongMemoryItem]) -> int:
+    async def add_items(self, *, user_id: str, session_id: str, items: list[LongMemoryItem]) -> int:
         if not user_id:
             return 0
         if not items:
@@ -235,7 +240,7 @@ class LongMemoryService:
 
         # 去重处理
         try:
-            unique_items = self._deduplicate_items(user_id=user_id, items=items)
+            unique_items = await self._deduplicate_items(user_id=user_id, items=items)
             if not unique_items:
                 return 0
 
@@ -253,11 +258,12 @@ class LongMemoryService:
 
             col.add(ids=ids, documents=docs, metadatas=metas)
             return len(ids) if isinstance(ids, list) else 0
-        except Exception:
+        except Exception as e:
             # 出错时默认返回0，避免阻塞主流程
+            logger.error(f"添加记忆项失败: {e}")
             return 0
 
-    def _deduplicate_items(self, *, user_id: str, items: list[LongMemoryItem]) -> list[LongMemoryItem]:
+    async def _deduplicate_items(self, *, user_id: str, items: list[LongMemoryItem]) -> list[LongMemoryItem]:
         """去重处理，避免存储重复记忆。"""
         
         try:
@@ -277,15 +283,16 @@ class LongMemoryService:
             final_unique_items = []
             for item in unique_input_items:
                 # 检查是否与已有记忆重复
-                if not self._is_duplicate(user_id=user_id, text=item.text):
+                if not await self._is_duplicate(user_id=user_id, text=item.text):
                     final_unique_items.append(item)
 
             return final_unique_items
-        except Exception:
+        except Exception as e:
             # 出错时默认返回空列表，避免阻塞主流程
+            logger.error(f"记忆去重失败: {e}")
             return []
 
-    def _is_duplicate(self, *, user_id: str, text: str) -> bool:
+    async def _is_duplicate(self, *, user_id: str, text: str) -> bool:
         """检查文本是否与已有记忆重复。"""
         
         try:
@@ -317,29 +324,70 @@ class LongMemoryService:
                     if text in doc or doc in text:
                         return True
                     # 检查是否包含相同的关键信息（如药物名称）
-                    if self._has_same_key_information(text, doc):
+                    if await self._has_same_key_information(text, doc):
                         return True
-        except Exception:
+        except Exception as e:
             # 出错时默认返回False，避免阻塞主流程
+            logger.error(f"检查重复记忆失败: {e}")
             pass
         
         return False
     
-    def _has_same_key_information(self, text1: str, text2: str) -> bool:
-        """检查两个文本是否包含相同的关键信息（如药物名称）。"""
+    async def _has_same_key_information(self, text1: str, text2: str) -> bool:
+        """检查两个文本是否包含相同的关键信息（基于药品知识库识别）。"""
         
-        # 药物关键词列表
-        drug_names = ["布洛芬", "阿司匹林", "青霉素", "抗生素", "降压药", "降糖药", "感冒药", "止痛药"]
+        from app.core.rag.drug_knowledge_service import DrugKnowledgeService
         
-        # 检查两个文本是否包含相同的药物名称
-        text1_lower = text1.lower()
-        text2_lower = text2.lower()
+        # 从文本中提取可能的药品名称
+        def extract_drug_names(text):
+            import re
+            patterns = [
+                r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})',
+                r'([^，。！？\s]{1,30})(?:片|粒|胶囊|支|瓶|袋|贴)',
+                r'(?:药名|药品|药物)\s*[:：]\s*([^，。！？\s]{1,30})'
+            ]
+            
+            candidate_names = []
+            for pattern in patterns:
+                matches = re.findall(pattern, text)
+                candidate_names.extend(matches)
+            
+            return list(set(candidate_names))
         
-        for drug in drug_names:
-            if drug in text1_lower and drug in text2_lower:
-                return True
+        # 提取两个文本中的药品名称
+        drugs1 = extract_drug_names(text1)
+        drugs2 = extract_drug_names(text2)
         
-        # 检查是否包含相同的健康状况关键词
+        # 如果两个文本都包含药品名称，使用药品知识库进行匹配
+        if drugs1 and drugs2:
+            try:
+                # 异步调用药品知识库服务
+                svc = DrugKnowledgeService()
+                matched_drugs1 = await svc.match_drugs(drugs1)
+                matched_drugs2 = await svc.match_drugs(drugs2)
+                
+                # 检查是否有相同的匹配药品
+                matched_names1 = set()
+                matched_names2 = set()
+                
+                for result in matched_drugs1:
+                    if result.get("match"):
+                        matched_names1.add(result["match"]["drug_name"])
+                
+                for result in matched_drugs2:
+                    if result.get("match"):
+                        matched_names2.add(result["match"]["drug_name"])
+                
+                # 如果有相同的匹配药品名，返回True
+                if matched_names1 & matched_names2:
+                    return True
+                    
+            except Exception as e:
+                # 如果药品知识库调用失败，回退到简单的关键词匹配
+                logger.error(f"药品知识库调用失败: {e}")
+                pass
+        
+        # 回退方案：检查是否包含相同的健康状况关键词
         health_keywords = ["高血压", "糖尿病", "冠心病", "哮喘", "过敏", "头痛", "头晕", "发烧"]
         for keyword in health_keywords:
             if keyword in text1 and keyword in text2:

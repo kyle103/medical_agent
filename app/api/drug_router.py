@@ -1,6 +1,5 @@
 from fastapi import APIRouter, Request
 
-from app.core.compliance.compliance_service import ComplianceService
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.schema.base import APIResponse
 from app.schema.drug_schema import DrugInteractionCheckRequest, DrugInteractionCheckResponse
@@ -19,8 +18,8 @@ async def interaction_check(req: DrugInteractionCheckRequest, request: Request):
         sync_to_archive=req.sync_to_archive,
     )
 
-    compliance = ComplianceService()
-    final_desc = compliance.add_disclaimer(result["final_desc"])
+    # 合规检查已禁用，不再添加免责声明
+    final_desc = result["final_desc"]
 
     return APIResponse(
         data=DrugInteractionCheckResponse(**{**result, "final_desc": final_desc}),

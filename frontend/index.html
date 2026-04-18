@@ -1,0 +1,635 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>医疗智能助手 - 前端Demo</title>
+    <style>
+        * {
+            margin: 0;
+            padding: 0;
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            min-height: 100vh;
+            padding: 20px;
+        }
+
+        .container {
+            max-width: 1200px;
+            margin: 0 auto;
+            background: white;
+            border-radius: 15px;
+            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
+            overflow: hidden;
+        }
+
+        .header {
+            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
+            color: white;
+            padding: 30px;
+            text-align: center;
+        }
+
+        .header h1 {
+            font-size: 2.5rem;
+            margin-bottom: 10px;
+        }
+
+        .header p {
+            font-size: 1.1rem;
+            opacity: 0.9;
+        }
+
+        .main-content {
+            display: grid;
+            grid-template-columns: 1fr 400px;
+            gap: 20px;
+            padding: 20px;
+        }
+
+        .chat-section {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+        }
+
+        .chat-messages {
+            height: 400px;
+            overflow-y: auto;
+            border: 1px solid #e9ecef;
+            border-radius: 10px;
+            padding: 15px;
+            background: white;
+            margin-bottom: 15px;
+        }
+
+        .message {
+            margin-bottom: 15px;
+            padding: 10px 15px;
+            border-radius: 10px;
+            max-width: 80%;
+            word-wrap: break-word;
+        }
+
+        .user-message {
+            background: #007bff;
+            color: white;
+            margin-left: auto;
+            text-align: right;
+        }
+
+        .assistant-message {
+            background: #e9ecef;
+            color: #333;
+            margin-right: auto;
+        }
+
+        .input-section {
+            display: flex;
+            gap: 10px;
+        }
+
+        .input-section input {
+            flex: 1;
+            padding: 12px;
+            border: 1px solid #ddd;
+            border-radius: 8px;
+            font-size: 16px;
+        }
+
+        .input-section button {
+            padding: 12px 24px;
+            background: #007bff;
+            color: white;
+            border: none;
+            border-radius: 8px;
+            cursor: pointer;
+            font-size: 16px;
+            transition: background 0.3s;
+        }
+
+        .input-section button:hover {
+            background: #0056b3;
+        }
+
+        .info-section {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 20px;
+        }
+
+        .info-card {
+            background: white;
+            border-radius: 8px;
+            padding: 15px;
+            margin-bottom: 15px;
+            border-left: 4px solid #007bff;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+        }
+
+        .info-card h3 {
+            color: #007bff;
+            margin-bottom: 10px;
+        }
+
+        .auth-section {
+            background: #f8f9fa;
+            border-radius: 10px;
+            padding: 15px;
+            margin-bottom: 15px;
+        }
+
+        .auth-form {
+            display: flex;
+            gap: 10px;
+            margin-bottom: 10px;
+        }
+
+        .auth-form input {
+            flex: 1;
+            padding: 8px;
+            border: 1px solid #ddd;
+            border-radius: 5px;
+        }
+
+        .auth-form button {
+            padding: 8px 15px;
+            background: #28a745;
+            color: white;
+            border: none;
+            border-radius: 5px;
+            cursor: pointer;
+        }
+
+        .auth-info {
+            background: #28a745;
+            color: white;
+            padding: 10px;
+            border-radius: 5px;
+            font-size: 14px;
+            margin-bottom: 10px;
+        }
+
+        .intent-badge {
+            display: inline-block;
+            padding: 4px 8px;
+            border-radius: 12px;
+            font-size: 12px;
+            margin-right: 5px;
+            margin-bottom: 5px;
+        }
+
+        .intent-drug { background: #dc3545; color: white; }
+        .intent-lab { background: #fd7e14; color: white; }
+        .intent-archive { background: #6f42c1; color: white; }
+        .intent-general { background: #20c997; color: white; }
+
+        .confirmation {
+            background: #fff3cd;
+            border: 1px solid #ffeaa7;
+            border-radius: 8px;
+            padding: 15px;
+            margin: 10px 0;
+        }
+
+        .loading {
+            text-align: center;
+            color: #6c757d;
+            font-style: italic;
+        }
+
+        @media (max-width: 768px) {
+            .main-content {
+                grid-template-columns: 1fr;
+            }
+            
+            .header h1 {
+                font-size: 2rem;
+            }
+        }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <div class="header">
+            <h1>🏥 医疗智能助手</h1>
+            <p>智能对话 | 药物管理 | 化验单解读 | 档案查询</p>
+        </div>
+        
+        <div class="main-content">
+            <div class="chat-section">
+                <!-- 认证区域 -->
+                <div class="auth-section" id="authSection">
+                    <div class="auth-form">
+                        <input type="text" id="phone" placeholder="手机号" value="13800000000">
+                        <input type="password" id="password" placeholder="密码" value="demo123">
+                        <button onclick="login()">登录</button>
+                        <button onclick="register()">注册</button>
+                    </div>
+                    <div id="authInfo" style="display: none;" class="auth-info">
+                        用户: <span id="userName"></span> | 令牌: <span id="tokenPreview"></span>
+                        <button onclick="logout()" style="margin-left: 10px; padding: 4px 8px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">退出登录</button>
+                    </div>
+                </div>
+                
+                <!-- 会话信息 -->
+                <div class="auth-info" id="sessionInfo" style="display: none;">
+                    会话ID: <span id="sessionId">正在创建...</span>
+                </div>
+                
+                <!-- 聊天区域 -->
+                <div class="chat-messages" id="chatMessages" style="display: none;">
+                    <div class="message assistant-message">
+                        <strong>助手：</strong>您好！我是医疗智能助手，可以帮您进行健康咨询、药物管理、化验单解读等。请问有什么可以帮您的？
+                    </div>
+                </div>
+                
+                <div class="input-section">
+                    <input type="text" id="userInput" placeholder="请输入您的问题..." autocomplete="off">
+                    <button onclick="sendMessage()">发送</button>
+                </div>
+                
+                <div style="margin-top: 15px; text-align: center;">
+                    <small>提示：您可以尝试"记录用药"、"检查药物冲突"、"解读化验单"等功能</small>
+                </div>
+            </div>
+            
+            <div class="info-section">
+                <div class="info-card">
+                    <h3>📊 系统信息</h3>
+                    <div id="systemInfo">等待用户输入...</div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>🎯 意图分析</h3>
+                    <div id="intentAnalysis">-</div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>🤖 目标Agent</h3>
+                    <div id="targetAgent">-</div>
+                </div>
+                
+                <div class="info-card">
+                    <h3>💡 测试用例</h3>
+                    <div style="display: flex; flex-direction: column; gap: 5px;">
+                        <button onclick="setExample('我想记录阿司匹林，每天一次，每次100mg')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">💊 记录用药</button>
+                        <button onclick="setExample('阿司匹林和布洛芬一起吃有冲突吗？')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">⚠️ 药物冲突检查</button>
+                        <button onclick="setExample('帮我解读一下血常规化验单')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">🔬 化验单解读</button>
+                        <button onclick="setExample('还记得我之前吃的药吗？')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">📋 记忆查询</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        let sessionId = null;
+        let conversationHistory = [];
+        let accessToken = localStorage.getItem('accessToken');
+        let currentUser = localStorage.getItem('currentUser');
+        
+        // 检查登录状态并更新界面
+        function checkLoginStatus() {
+            // 重新从localStorage读取最新的登录状态
+            const latestAccessToken = localStorage.getItem('accessToken');
+            const latestCurrentUser = localStorage.getItem('currentUser');
+            
+            // 检查是否有有效的登录信息
+            if (latestAccessToken && latestCurrentUser && latestAccessToken.length > 10) {
+                // 更新全局变量
+                accessToken = latestAccessToken;
+                currentUser = latestCurrentUser;
+                
+                // 已登录，显示聊天界面
+                document.getElementById('authSection').style.display = 'none';
+                document.getElementById('authInfo').style.display = 'block';
+                document.getElementById('sessionInfo').style.display = 'block';
+                document.getElementById('chatMessages').style.display = 'block';
+                
+                document.getElementById('userName').textContent = currentUser;
+                document.getElementById('tokenPreview').textContent = accessToken.substring(0, 10) + '...';
+                
+                // 初始化会话
+                initializeSession();
+            } else {
+                // 清除无效的登录信息
+                localStorage.removeItem('accessToken');
+                localStorage.removeItem('currentUser');
+                accessToken = null;
+                currentUser = null;
+                
+                // 未登录，显示登录界面
+                document.getElementById('authSection').style.display = 'block';
+                document.getElementById('authInfo').style.display = 'none';
+                document.getElementById('sessionInfo').style.display = 'none';
+                document.getElementById('chatMessages').style.display = 'none';
+            }
+        }
+
+        // 退出登录
+        function logout() {
+            // 清除登录信息
+            localStorage.removeItem('accessToken');
+            localStorage.removeItem('currentUser');
+            accessToken = null;
+            currentUser = null;
+            sessionId = null;
+            
+            // 更新界面
+            checkLoginStatus();
+            
+            alert('已退出登录');
+        }
+
+        // 用户注册
+        async function register() {
+            const phone = document.getElementById('phone').value;
+            const password = document.getElementById('password').value;
+            
+            if (!phone || !password) {
+                alert('请输入手机号和密码');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/v1/user/register', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        phone: phone,
+                        password: password,
+                        user_nickname: `用户${phone}`
+                    })
+                });
+                
+                if (response.ok) {
+                    const responseData = await response.json();
+                    
+                    // 修复API响应数据结构解析错误
+                    if (!responseData.data || !responseData.data.user_id) {
+                        console.error('注册API响应格式错误:', responseData);
+                        alert('注册失败：服务器响应格式错误');
+                        return;
+                    }
+                    
+                    alert('注册成功！');
+                    // 自动登录
+                    await login();
+                } else {
+                    const errorData = await response.json();
+                    console.error('注册失败:', errorData);
+                    alert(`注册失败: ${errorData.detail || '请检查输入信息'}`);
+                }
+            } catch (error) {
+                console.error('注册错误:', error);
+                alert('注册失败，请检查网络连接');
+            }
+        }
+
+        // 用户登录
+        async function login() {
+            const phone = document.getElementById('phone').value;
+            const password = document.getElementById('password').value;
+            
+            if (!phone || !password) {
+                alert('请输入手机号和密码');
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/v1/user/login', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                    },
+                    body: JSON.stringify({
+                        phone: phone,
+                        password: password
+                    })
+                });
+                
+                if (response.ok) {
+                    const responseData = await response.json();
+                    
+                    // 修复API响应数据结构解析错误
+                    if (!responseData.data || !responseData.data.access_token) {
+                        console.error('API响应格式错误:', responseData);
+                        alert('登录失败：服务器响应格式错误');
+                        return;
+                    }
+                    
+                    // 正确解析API响应结构
+                    const userData = responseData.data;
+                    accessToken = userData.access_token;
+                    currentUser = userData.user_id;  // 使用user_id而不是phone
+                    
+                    // 保存到localStorage
+                    localStorage.setItem('accessToken', accessToken);
+                    localStorage.setItem('currentUser', currentUser);
+                    
+                    console.log('登录成功，保存到localStorage:', {accessToken, currentUser});
+                    
+                    // 更新界面
+                    checkLoginStatus();
+                    
+                    // 添加延迟确保界面更新完成
+                    setTimeout(() => {
+                        alert('登录成功！界面已更新');
+                    }, 100);
+                    
+                } else {
+                    const errorData = await response.json();
+                    console.error('登录失败:', errorData);
+                    alert(`登录失败: ${errorData.detail || '请检查用户名或密码'}`);
+                }
+                
+            } catch (error) {
+                console.error('登录失败:', error);
+                alert('登录失败，请检查网络连接');
+            }
+        }
+
+        // 初始化会话
+        async function initializeSession() {
+            if (!accessToken || !currentUser) {
+                console.log('未登录，跳过会话初始化');
+                document.getElementById('sessionId').textContent = '请先登录';
+                return;
+            }
+            
+            try {
+                const response = await fetch('/api/v1/chat/completion', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: JSON.stringify({
+                        user_input: '初始化会话',
+                        session_id: ''  // 传递空字符串，让后端自动生成会话ID
+                        // 不再需要手动传递user_id，后端会从JWT token中解析
+                    })
+                });
+                
+                if (response.ok) {
+                    const responseData = await response.json();
+                    const data = responseData.data;
+                    sessionId = data.session_id;
+                    document.getElementById('sessionId').textContent = sessionId;
+                    
+                    // 更新系统信息
+                    updateSystemInfo(data);
+                } else {
+                    console.error('会话初始化失败:', response.status);
+                    document.getElementById('sessionId').textContent = '创建失败';
+                }
+                
+            } catch (error) {
+                console.error('初始化会话失败:', error);
+                document.getElementById('sessionId').textContent = '创建失败';
+            }
+        }
+
+        // 发送消息
+        async function sendMessage() {
+            if (!accessToken || !currentUser) {
+                alert('请先登录');
+                return;
+            }
+            
+            const input = document.getElementById('userInput');
+            const message = input.value.trim();
+            
+            if (!message) return;
+            
+            // 添加用户消息到聊天界面
+            addMessage('user', message);
+            input.value = '';
+            
+            // 显示加载中
+            const loadingDiv = document.createElement('div');
+            loadingDiv.className = 'message assistant-message loading';
+            loadingDiv.innerHTML = '<strong>助手：</strong>思考中...';
+            document.getElementById('chatMessages').appendChild(loadingDiv);
+            
+            try {
+                const response = await fetch('/api/v1/chat/completion', {
+                    method: 'POST',
+                    headers: {
+                        'Content-Type': 'application/json',
+                        'Authorization': `Bearer ${accessToken}`
+                    },
+                    body: JSON.stringify({
+                        user_input: message,
+                        session_id: sessionId
+                        // 不再需要手动传递user_id，后端会从JWT token中解析
+                    })
+                });
+                
+                if (response.ok) {
+                    const responseData = await response.json();
+                    const data = responseData.data;
+                    
+                    // 移除加载中消息
+                    document.getElementById('chatMessages').removeChild(loadingDiv);
+                    
+                    // 添加助手回复
+                    if (data.assistant_output) {
+                        addMessage('assistant', data.assistant_output);
+                    } else if (data.confirmation_message) {
+                        addMessage('assistant', data.confirmation_message);
+                    }
+                    
+                    // 更新系统信息
+                    updateSystemInfo(data);
+                    
+                    // 滚动到底部
+                    scrollToBottom();
+                } else {
+                    // 移除加载中消息
+                    document.getElementById('chatMessages').removeChild(loadingDiv);
+                    
+                    const error = await response.json();
+                    addMessage('assistant', `抱歉，系统错误: ${error.detail || '未知错误'}`);
+                }
+                
+            } catch (error) {
+                console.error('发送消息失败:', error);
+                
+                // 移除加载中消息
+                document.getElementById('chatMessages').removeChild(loadingDiv);
+                
+                // 显示错误消息
+                addMessage('assistant', '抱歉，系统暂时无法响应，请稍后再试。');
+            }
+        }
+
+        // 添加消息到聊天界面
+        function addMessage(role, content) {
+            const messagesDiv = document.getElementById('chatMessages');
+            const messageDiv = document.createElement('div');
+            messageDiv.className = `message ${role === 'user' ? 'user-message' : 'assistant-message'}`;
+            
+            const roleText = role === 'user' ? '您：' : '助手：';
+            messageDiv.innerHTML = `<strong>${roleText}</strong>${content}`;
+            
+            messagesDiv.appendChild(messageDiv);
+            scrollToBottom();
+        }
+
+        // 滚动到底部
+        function scrollToBottom() {
+            const messagesDiv = document.getElementById('chatMessages');
+            messagesDiv.scrollTop = messagesDiv.scrollHeight;
+        }
+
+        // 更新系统信息
+        function updateSystemInfo(data) {
+            // 系统信息
+            let systemInfo = `对话轮次: ${data.conversation_history ? data.conversation_history.length : 0}<br>`;
+            systemInfo += `是否需要确认: ${data.needs_confirmation ? '是' : '否'}<br>`;
+            if (data.error_msg) {
+                systemInfo += `错误信息: ${data.error_msg}`;
+            }
+            document.getElementById('systemInfo').innerHTML = systemInfo;
+            
+            // 意图分析
+            if (data.intent_analysis) {
+                const intent = data.intent_analysis;
+                let intentHtml = `<span class="intent-badge intent-${intent.intent_type}">${intent.intent_type}</span><br>`;
+                intentHtml += `置信度: ${(intent.confidence * 100).toFixed(1)}%<br>`;
+                intentHtml += `原因: ${intent.reason}`;
+                document.getElementById('intentAnalysis').innerHTML = intentHtml;
+            }
+            
+            // 目标Agent
+            if (data.target_agent) {
+                document.getElementById('targetAgent').textContent = data.target_agent;
+            }
+        }
+
+        // 设置测试用例
+        function setExample(text) {
+            document.getElementById('userInput').value = text;
+            document.getElementById('userInput').focus();
+        }
+
+        // 回车发送消息
+        document.getElementById('userInput').addEventListener('keypress', function(e) {
+            if (e.key === 'Enter') {
+                sendMessage();
+            }
+        });
+
+        // 初始化
+        checkLoginStatus();
+    </script>
+</body>
+</html>

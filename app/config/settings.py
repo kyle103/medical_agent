@@ -73,9 +73,9 @@ class Settings(BaseSettings):
     ALLOWED_HOSTS: str = Field(default="{{允许的跨域域名列表}}")
 
     # Compliance
-    FORCE_DISCLAIMER: bool = True
-    ENABLE_INPUT_CHECK: bool = True
-    ENABLE_OUTPUT_CHECK: bool = True
+    FORCE_DISCLAIMER: bool = False
+    ENABLE_INPUT_CHECK: bool = False
+    ENABLE_OUTPUT_CHECK: bool = False
 
     # Misc
     APP_ENV: str = Field(default="local")

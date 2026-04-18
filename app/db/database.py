@@ -6,14 +6,14 @@ from collections.abc import AsyncGenerator
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
-    async_sessionmaker,
     create_async_engine,
 )
+from sqlalchemy.orm import sessionmaker
 
 from app.config.settings import settings
 
 _engine: AsyncEngine | None = None
-_sessionmaker: async_sessionmaker[AsyncSession] | None = None
+_sessionmaker: sessionmaker[AsyncSession] | None = None
 
 
 def _sqlite_url() -> str:
@@ -44,11 +44,11 @@ def get_engine() -> AsyncEngine:
     return _engine
 
 
-def get_sessionmaker() -> async_sessionmaker[AsyncSession]:
+def get_sessionmaker() -> sessionmaker[AsyncSession]:
     global _sessionmaker
     if _sessionmaker is not None:
         return _sessionmaker
-    _sessionmaker = async_sessionmaker(get_engine(), expire_on_commit=False)
+    _sessionmaker = sessionmaker(get_engine(), expire_on_commit=False, class_=AsyncSession)
     return _sessionmaker
 
 
