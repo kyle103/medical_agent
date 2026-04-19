@@ -230,10 +230,12 @@
                         <button onclick="login()">登录</button>
                         <button onclick="register()">注册</button>
                     </div>
-                    <div id="authInfo" style="display: none;" class="auth-info">
-                        用户: <span id="userName"></span> | 令牌: <span id="tokenPreview"></span>
-                        <button onclick="logout()" style="margin-left: 10px; padding: 4px 8px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">退出登录</button>
-                    </div>
+                </div>
+                
+                <!-- 登录信息 -->
+                <div id="authInfo" style="display: none;" class="auth-info">
+                    用户: <span id="userName"></span> | 令牌: <span id="tokenPreview"></span>
+                    <button onclick="logout()" style="margin-left: 10px; padding: 4px 8px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">退出登录</button>
                 </div>
                 
                 <!-- 会话信息 -->
@@ -248,7 +250,7 @@
                     </div>
                 </div>
                 
-                <div class="input-section">
+                <div class="input-section" style="display: none;">
                     <input type="text" id="userInput" placeholder="请输入您的问题..." autocomplete="off">
                     <button onclick="sendMessage()">发送</button>
                 </div>
@@ -258,7 +260,7 @@
                 </div>
             </div>
             
-            <div class="info-section">
+            <div class="info-section" style="display: none;">
                 <div class="info-card">
                     <h3>📊 系统信息</h3>
                     <div id="systemInfo">等待用户输入...</div>
@@ -294,41 +296,76 @@
         let currentUser = localStorage.getItem('currentUser');
         
         // 检查登录状态并更新界面
-        function checkLoginStatus() {
+        async function checkLoginStatus() {
             // 重新从localStorage读取最新的登录状态
             const latestAccessToken = localStorage.getItem('accessToken');
             const latestCurrentUser = localStorage.getItem('currentUser');
             
+            console.log('检查登录状态，从localStorage获取:', {latestAccessToken, latestCurrentUser});
+            
             // 检查是否有有效的登录信息
             if (latestAccessToken && latestCurrentUser && latestAccessToken.length > 10) {
-                // 更新全局变量
-                accessToken = latestAccessToken;
-                currentUser = latestCurrentUser;
-                
-                // 已登录，显示聊天界面
-                document.getElementById('authSection').style.display = 'none';
-                document.getElementById('authInfo').style.display = 'block';
-                document.getElementById('sessionInfo').style.display = 'block';
-                document.getElementById('chatMessages').style.display = 'block';
-                
-                document.getElementById('userName').textContent = currentUser;
-                document.getElementById('tokenPreview').textContent = accessToken.substring(0, 10) + '...';
-                
-                // 初始化会话
-                initializeSession();
-            } else {
-                // 清除无效的登录信息
-                localStorage.removeItem('accessToken');
-                localStorage.removeItem('currentUser');
-                accessToken = null;
-                currentUser = null;
-                
-                // 未登录，显示登录界面
-                document.getElementById('authSection').style.display = 'block';
-                document.getElementById('authInfo').style.display = 'none';
-                document.getElementById('sessionInfo').style.display = 'none';
-                document.getElementById('chatMessages').style.display = 'none';
+                // 验证token是否有效
+                try {
+                    const response = await fetch('http://localhost:8000/api/v1/user/me', {
+                        method: 'GET',
+                        headers: {
+                            'Authorization': `Bearer ${latestAccessToken}`
+                        }
+                    });
+                    
+                    if (response.ok) {
+                        console.log('登录状态验证成功');
+                        // token有效，更新全局变量
+                        accessToken = latestAccessToken;
+                        currentUser = latestCurrentUser;
+                        
+                        // 已登录，显示聊天界面
+                        document.getElementById('authSection').style.display = 'none';
+                        document.getElementById('authInfo').style.display = 'block';
+                        document.getElementById('sessionInfo').style.display = 'block';
+                        document.getElementById('chatMessages').style.display = 'block';
+                        document.querySelector('.input-section').style.display = 'flex';
+                        document.querySelector('.info-section').style.display = 'block';
+                        
+                        document.getElementById('userName').textContent = currentUser;
+                        document.getElementById('tokenPreview').textContent = accessToken.substring(0, 10) + '...';
+                        
+                        // 初始化会话
+                        initializeSession();
+                        return;
+                    } else if (response.status === 401) {
+                        // 未授权，清除登录信息
+                        console.error('登录已过期');
+                    }
+                } catch (error) {
+                    console.error('验证登录状态失败:', error);
+                    // 网络错误，保留登录信息，不清除
+                    // 显示登录界面，但不清除localStorage
+                    document.getElementById('authSection').style.display = 'block';
+                    document.getElementById('authInfo').style.display = 'none';
+                    document.getElementById('sessionInfo').style.display = 'none';
+                    document.getElementById('chatMessages').style.display = 'none';
+                    document.querySelector('.input-section').style.display = 'none';
+                    document.querySelector('.info-section').style.display = 'none';
+                    return;
+                }
             }
+            
+            // 清除无效的登录信息
+            localStorage.removeItem('accessToken');
+            localStorage.removeItem('currentUser');
+            accessToken = null;
+            currentUser = null;
+            
+            console.log('未登录或token无效，显示登录界面');
+            // 未登录，显示登录界面
+            document.getElementById('authSection').style.display = 'block';
+            document.getElementById('authInfo').style.display = 'none';
+            document.getElementById('sessionInfo').style.display = 'none';
+            document.getElementById('chatMessages').style.display = 'none';
+            document.querySelector('.input-section').style.display = 'none';
+            document.querySelector('.info-section').style.display = 'none';
         }
 
         // 退出登录
@@ -357,7 +394,7 @@
             }
             
             try {
-                const response = await fetch('/api/v1/user/register', {
+                const response = await fetch('http://localhost:8000/api/v1/user/register', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -404,7 +441,7 @@
             }
             
             try {
-                const response = await fetch('/api/v1/user/login', {
+                const response = await fetch('http://localhost:8000/api/v1/user/login', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -465,7 +502,7 @@
             }
             
             try {
-                const response = await fetch('/api/v1/chat/completion', {
+                const response = await fetch('http://localhost:8000/api/v1/chat/completion', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -488,7 +525,15 @@
                     updateSystemInfo(data);
                 } else {
                     console.error('会话初始化失败:', response.status);
-                    document.getElementById('sessionId').textContent = '创建失败';
+                    if (response.status === 401) {
+                        // 未授权，跳转到登录界面
+                        alert('登录已过期，请重新登录');
+                        localStorage.removeItem('accessToken');
+                        localStorage.removeItem('currentUser');
+                        await checkLoginStatus();
+                    } else {
+                        document.getElementById('sessionId').textContent = '创建失败';
+                    }
                 }
                 
             } catch (error) {
@@ -520,7 +565,7 @@
             document.getElementById('chatMessages').appendChild(loadingDiv);
             
             try {
-                const response = await fetch('/api/v1/chat/completion', {
+                const response = await fetch('http://localhost:8000/api/v1/chat/completion', {
                     method: 'POST',
                     headers: {
                         'Content-Type': 'application/json',
@@ -556,8 +601,16 @@
                     // 移除加载中消息
                     document.getElementById('chatMessages').removeChild(loadingDiv);
                     
-                    const error = await response.json();
-                    addMessage('assistant', `抱歉，系统错误: ${error.detail || '未知错误'}`);
+                    if (response.status === 401) {
+                        // 未授权，跳转到登录界面
+                        alert('登录已过期，请重新登录');
+                        localStorage.removeItem('accessToken');
+                        localStorage.removeItem('currentUser');
+                        await checkLoginStatus();
+                    } else {
+                        const error = await response.json();
+                        addMessage('assistant', `抱歉，系统错误: ${error.detail || '未知错误'}`);
+                    }
                 }
                 
             } catch (error) {
@@ -629,7 +682,9 @@
         });
 
         // 初始化
-        checkLoginStatus();
+        (async function() {
+            await checkLoginStatus();
+        })();
     </script>
 </body>
 </html>

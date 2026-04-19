@@ -19,8 +19,8 @@ class FrontendHandler(SimpleHTTPRequestHandler):
     def do_GET(self):
         # 处理前端路由，所有路径都返回index.html
         if self.path.startswith('/api/'):
-            # API请求转发到后端服务器
-            self.proxy_to_backend('GET')
+            # API请求直接返回404，让前端直接请求后端
+            self.send_error(404, "API endpoint not found")
         else:
             # 静态文件服务
             if self.path == '/' or not os.path.exists(os.path.join(self.directory, self.path[1:])):
@@ -28,9 +28,9 @@ class FrontendHandler(SimpleHTTPRequestHandler):
             super().do_GET()
     
     def do_POST(self):
-        """处理POST请求，转发到后端API"""
+        """处理POST请求，直接返回404，让前端直接请求后端"""
         if self.path.startswith('/api/'):
-            self.proxy_to_backend('POST')
+            self.send_error(404, "API endpoint not found")
         else:
             self.send_error(404, "File not found")
     
@@ -59,22 +59,47 @@ class FrontendHandler(SimpleHTTPRequestHandler):
                     req.add_header(header, value)
             
             # 发送请求
-            with urllib.request.urlopen(req) as response:
-                self.send_response(response.getcode())
-                
-                # 复制响应头
-                for header, value in response.headers.items():
-                    if header.lower() not in ['content-length', 'transfer-encoding']:
-                        self.send_header(header, value)
-                
-                self.end_headers()
-                
-                # 复制响应体，直接写入原始数据
-                response_data = response.read()
-                self.wfile.write(response_data)
+            try:
+                with urllib.request.urlopen(req) as response:
+                    self.send_response(response.getcode())
+                    
+                    # 复制响应头
+                    for header, value in response.headers.items():
+                        if header.lower() not in ['content-length', 'transfer-encoding', 'connection']:
+                            self.send_header(header, value)
+                    
+                    self.end_headers()
+                    
+                    # 复制响应体，直接写入原始数据
+                    response_data = response.read()
+                    self.wfile.write(response_data)
+            except urllib.error.HTTPError as e:
+                # 处理HTTP错误，包括401
+                try:
+                    self.send_response(e.code)
+                    
+                    # 复制响应头
+                    for header, value in e.headers.items():
+                        if header.lower() not in ['content-length', 'transfer-encoding', 'connection']:
+                            self.send_header(header, value)
+                    
+                    self.end_headers()
+                    
+                    # 复制响应体
+                    response_data = e.read()
+                    self.wfile.write(response_data)
+                except Exception as inner_e:
+                    # 处理内部错误，确保至少返回正确的状态码
+                    self.send_response(e.code)
+                    self.send_header('Content-Type', 'application/json')
+                    self.end_headers()
+                    error_data = json.dumps({"detail": "未授权"}).encode('utf-8')
+                    self.wfile.write(error_data)
                 
         except Exception as e:
-            self.send_error(502, f"后端服务不可用: {str(e)}")
+            # 处理Unicode编码问题
+            error_message = "后端服务不可用"
+            self.send_error(502, error_message)
     
     def log_message(self, format, *args):
         """自定义日志格式"""

@@ -65,3 +65,25 @@ async def login(req: UserLoginRequest, request: Request):
         ),
         request_id=getattr(request.state, "request_id", ""),
     )
+
+
+@router.get("/me", response_model=APIResponse[dict])
+async def get_current_user(request: Request):
+    """获取当前登录用户信息"""
+    user_id = getattr(request.state, "user_id", None)
+    if not user_id:
+        raise HTTPException(status_code=401, detail="未授权")
+
+    crud = UserCRUD()
+    user = await crud.get_user(user_id=user_id)
+    if not user:
+        raise HTTPException(status_code=404, detail="用户不存在")
+
+    return APIResponse(
+        data={
+            "user_id": user.user_id,
+            "user_nickname": user.user_nickname,
+            "phone": user.phone,
+        },
+        request_id=getattr(request.state, "request_id", ""),
+    )
