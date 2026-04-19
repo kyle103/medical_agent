@@ -1,4 +1,4 @@
-"""
+﻿"""
 用药记录Agent
 专门处理用药记录的增删改查和用药历史查询
 """
@@ -24,7 +24,7 @@ class DrugRecordAgent(BaseAgent):
         user_input = state.get("user_input", "")
         
         # 解析用药记录操作类型
-        operation_type = self._parse_operation_type(user_input)
+        operation_type = await self._parse_operation_type(user_input, state)
         
         if operation_type == "add":
             result = await self._handle_add_operation(user_id, user_input, state)
@@ -42,31 +42,28 @@ class DrugRecordAgent(BaseAgent):
         
         return state
     
-    def _parse_operation_type(self, user_input: str) -> str:
-        """解析操作类型"""
-        user_input_lower = user_input.lower()
-        
-        # 查询操作关键词
-        query_keywords = ["查看", "查询", "检查", "有哪些", "有什么", "最近", "历史", "用药记录", "档案"]
-        if any(keyword in user_input_lower for keyword in query_keywords):
-            return "query"
-        
-        # 添加操作关键词
-        add_keywords = ["添加", "录入", "新增", "创建", "我吃了", "我服用了", "我要用", "我需要", "我想", "吃了", "服用", "用了", "需要记录", "需要添加"]
-        if any(keyword in user_input_lower for keyword in add_keywords):
-            return "add"
-        
-        # 删除操作关键词
-        delete_keywords = ["删除", "移除", "取消", "清除", "不要了"]
-        if any(keyword in user_input_lower for keyword in delete_keywords):
-            return "delete"
-        
-        return "general"
-    
+    async def _parse_operation_type(self, user_input: str, state: dict) -> str:
+        system_prompt = "你是一个专门负责判断用户在用药记录方面意图的助手。你需要根据用户的最新输入以及上下文，判断用户是要：1. 'add'：记录、添加、补充自己吃了什么药（即使只是补充某个时间、频率、剂量等细节，也是 'add'）。2. 'query'：查询、产看自己的用药历史记录。3. 'delete'：删除自己的用药记录。4. 'general'：其他情况。请只输出一个字符串：'add', 'query', 'delete' 或者是 'general'，不要有多余字符。"
+        memory_messages = state.get('history', [])
+        ctx_msgs = memory_messages[-6:] if len(memory_messages) > 6 else memory_messages
+        user_prompt = f"上下文记录：{ctx_msgs}\n\n当前用户输入：{user_input}\n请输出判断结果："
+        try:
+            response = await self._call_llm(user_prompt, system_prompt, state)
+            op = response.strip().lower()
+            if 'add' in op:
+                return 'add'
+            elif 'query' in op:
+                return 'query'
+            elif 'delete' in op:
+                return 'delete'
+            return 'general'
+        except Exception:
+            return 'general'
+
     async def _handle_add_operation(self, user_id: str, user_input: str, state: Dict[str, Any]) -> str:
         """处理添加用药记录操作"""
         # 解析用药信息
-        drug_info = await self._parse_drug_info(user_input)
+        drug_info = await self._parse_drug_info(user_input, state)
         
         if not drug_info["drug_name"]:
             return "请提供药品名称，例如：我吃了布洛芬"
@@ -169,87 +166,30 @@ class DrugRecordAgent(BaseAgent):
         response = await self._call_llm(user_prompt, system_prompt, state)
         return response
     
-    async def _parse_drug_info(self, user_input: str) -> dict:
-        """解析用药信息"""
-        drug_info = {
-            "drug_name": "",
-            "dosage": "",
-            "frequency": "",
-            "time": datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        }
-        
-        # 简单的关键词匹配
-        user_input_lower = user_input.lower()
-        
-        # 使用DrugKnowledgeService匹配药品名称
+    async def _parse_drug_info(self, user_input: str, state: dict) -> dict:
+        memory_messages = state.get('history', [])
+        ctx_msgs = memory_messages[-6:] if len(memory_messages) > 6 else memory_messages
+        system_prompt = "你是一个医疗信息抽取助手。请从用户的最新回复和上下文中，提取用药记录信息。以JSON格式返回，包含以下字段：1. drug_name 药品名称，如果是补充信息且未提及药名，请从上下文中找到药名并填入。如果仍然找不到，填空字符串。 2. dosage 剂量，如'100mg'，'1片'。3. frequency 频率，如'每天一次'，'早晚各一次'。4. time 用药时间，如'昨天晚上八点'、'今天中午'，不要用现在的系统时间。如果字段没有提及并没有在上下文中，请填空字符串。必须且只输出合法的 JSON，不要输出 Markdown 标记，也不要有任何其他解释内容。"
+        user_prompt = f"对话上下文：\n{ctx_msgs}\n\n用户最新输入：{user_input}"
         try:
-            from app.core.rag.drug_knowledge_service import DrugKnowledgeService
-            
-            # 提取可能的药品名称
-            import re
-            drug_patterns = [
-                r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})',
-                r'([^，。！？\s]{1,30})(?:片|粒|胶囊|支|瓶|袋|贴)',
-                r'(?:药名|药品|药物)\s*[:：]\s*([^，。！？\s]{1,30})'
-            ]
-            
-            candidate_names = []
-            for pattern in drug_patterns:
-                matches = re.findall(pattern, user_input)
-                candidate_names.extend(matches)
-            
-            # 使用药品知识库进行匹配
-            if candidate_names:
-                svc = DrugKnowledgeService()
-                matched_drugs = await svc.match_drugs(candidate_names)
-                
-                # 优先返回匹配成功的药品名
-                for result in matched_drugs:
-                    if result.get("match"):
-                        drug_info["drug_name"] = result["match"]["drug_name"]
-                        break
-                
-                # 如果没有匹配到，使用第一个候选名称
-                if not drug_info["drug_name"] and candidate_names:
-                    drug_info["drug_name"] = candidate_names[0]
-        except Exception as e:
-            # 如果DrugKnowledgeService失败，使用常见药品列表
-            common_drugs = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
-                           "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
-            
-            for drug in common_drugs:
-                if drug in user_input:
-                    drug_info["drug_name"] = drug
-                    break
-        
-        # 剂量信息
-        dosage_patterns = [
-            r'(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)',
-            r'(一次|每次)\s*(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)',
-            r'(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)\s*(一次|每次)'
-        ]
-        
-        for pattern in dosage_patterns:
-            match = re.search(pattern, user_input)
-            if match:
-                drug_info["dosage"] = match.group(0)
-                break
-        
-        # 用药频率
-        frequency_patterns = [
-            r'(一天|每日)\s*(\d+)\s*次',
-            r'(\d+)\s*次\s*(一天|每日)',
-            r'(早晚|早中晚|早中晚各一次|早晚各一次|早中晚各一次)',
-            r'(需要时|必要时|疼痛时|不适时)'
-        ]
-        
-        for pattern in frequency_patterns:
-            match = re.search(pattern, user_input)
-            if match:
-                drug_info["frequency"] = match.group(0)
-                break
-        
-        return drug_info
-    
+            import json, re
+            from datetime import datetime
+            response = await self._call_llm(user_prompt, system_prompt, state)
+            match = re.search(r'\{.*\}', response, re.DOTALL)
+            json_str = match.group(0) if match else response
+            data = json.loads(json_str)
+            drug_info = {
+                'drug_name': data.get('drug_name', ''),
+                'dosage': data.get('dosage', ''),
+                'frequency': data.get('frequency', ''),
+                'time': data.get('time', '')
+            }
+            if not drug_info['time']:
+                 drug_info['time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+            return drug_info
+        except Exception:
+            from datetime import datetime
+            return {'drug_name': '', 'dosage': '', 'frequency': '', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("DRUG_RECORD_AGENT")
