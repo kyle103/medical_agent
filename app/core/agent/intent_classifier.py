@@ -75,6 +75,12 @@ class IntentClassifier:
         if any(k in t for k in lab_keywords):
             return IntentResult(intent="lab", confidence=0.8, reason="rule:lab")
 
+        # 首先检查是否是删除用药记录操作
+        delete_keywords = ["删除", "移除", "清空"]
+        is_delete = any(k in t for k in delete_keywords)
+        if is_delete and "药" in t:
+            return IntentResult(intent="drug", confidence=0.8, reason="rule:drug-record-delete")
+
         # "我昨天吃的什么药/我之前吃了哪些药" 属于档案查询而不是药物相互作用
         if any(k in t for k in archive_keywords) and "药" in t and not any(k in t for k in drug_interaction_keywords):
             return IntentResult(intent="archive", confidence=0.75, reason="rule:archive-drug-history")

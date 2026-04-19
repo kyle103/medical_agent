@@ -11,6 +11,7 @@ from app.core.agent.intent_classifier import IntentClassifier
         ("血糖 6.1 mmol/L 正常吗", "lab"),
         ("我昨天吃的什么药", "archive"),
         ("如何缓解失眠", "general"),
+        ("删除我的关于阿司匹林的用药记录", "drug"),
     ],
 )
 async def test_intent_rule_predict(text: str, expected: str):

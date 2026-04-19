@@ -52,6 +52,22 @@ class UserChatRecord(Base):
     )
 
 
+class AgentSessionState(Base):
+    __tablename__ = "agent_session_state"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), ForeignKey("user_info.user_id"))
+    session_id: Mapped[str] = mapped_column(String(64))
+    state_json: Mapped[str] = mapped_column(Text, default="{}")
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    is_deleted: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (Index("idx_agent_session", "user_id", "session_id"),)
+
+
 class DrugKnowledgeBase(Base):
     __tablename__ = "drug_knowledge_base"
 

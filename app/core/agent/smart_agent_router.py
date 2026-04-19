@@ -8,6 +8,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import time
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
@@ -15,7 +16,10 @@ from app.core.agent.drug_conflict_agent import DrugConflictAgent
 from app.core.agent.drug_record_agent import DrugRecordAgent
 from app.core.agent.lab_report_agent import LabReportAgent
 from app.core.agent.main_qa_agent import MainQAAgent
+from app.core.agent.orchestrator import QueryOrchestrator
 from app.core.llm.llm_service import LLMService
+from app.core.session.agent_state_store import AgentStateStore
+from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 logger = logging.getLogger(__name__)
 
 
@@ -71,49 +75,48 @@ class SmartAgentRouter:
         self.llm = LLMService()
 
     @staticmethod
-    def _extract_drug_candidates(text: str) -> List[str]:
+    def _is_affirmative(text: str) -> bool:
+        t = (text or "").strip().lower()
+        return any(k in t for k in ["是", "是的", "确认", "确定", "好的", "可以", "同意", "yes", "y", "ok"])
+
+    @staticmethod
+    def _is_negative(text: str) -> bool:
+        t = (text or "").strip().lower()
+        return any(k in t for k in ["不", "取消", "不要", "不用", "否", "no", "n"])
+
+    @staticmethod
+    def _split_user_queries(text: str) -> List[str]:
+        """将一段包含多个问题/指令的输入拆成子查询。"""
         raw = (text or "").strip()
         if not raw:
             return []
 
-        normalized = (
-            raw.replace("？", " ")
-            .replace("?", " ")
-            .replace("。", " ")
-            .replace("，", ",")
-            .replace("、", ",")
-            .replace("；", ",")
-            .replace(";", ",")
-        )
-        # 去掉典型问句噪音，避免把“有冲突吗”当成药名
-        for noise in [
-            "一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"
-        ]:
-            normalized = normalized.replace(noise, " ")
+        # 先按中文/英文句末符号切分
+        parts = re.split(r"[。！？!?；;]+", raw)
+        parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
 
-        parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
-        stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "还有", "是否", "能", "不能"}
-
+        # 如果用户没写句号，但使用了明显的并列动作词，再次细分
         out: List[str] = []
         for p in parts:
-            cand = (p or "").strip()
-            if len(cand) < 2 or len(cand) > 24:
-                continue
-            if cand in stop_words:
-                continue
-            if re.search(r"[0-9]", cand):
-                continue
-            out.append(cand)
+            sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
+            for s in sub:
+                s = s.strip(" ，,")
+                if s:
+                    out.append(s)
 
-        # 保留顺序去重
+        # 保序去重，防止重复切分造成重复执行
         dedup: List[str] = []
         seen = set()
-        for x in out:
-            if x in seen:
+        for q in out:
+            if q in seen:
                 continue
-            seen.add(x)
-            dedup.append(x)
+            seen.add(q)
+            dedup.append(q)
         return dedup
+
+    @staticmethod
+    def _extract_drug_candidates(text: str) -> List[str]:
+        return DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
 
     def _route_from_state_intent(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         intent = (state.get("intent") or "").strip().lower()
@@ -151,12 +154,14 @@ class SmartAgentRouter:
         if intent == "drug":
             conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
             record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次"]
+            delete_keywords = ["删除", "移除", "清空"]
 
             is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
             is_record = any(k in text for k in record_keywords)
+            is_delete = any(k in text for k in delete_keywords)
 
             # 优先把“两个药能不能一起”这类问句路由到冲突 Agent
-            if is_conflict and not is_record:
+            if is_conflict and not is_record and not is_delete:
                 return {
                     "target_agent": "drug_conflict_agent",
                     "confidence": float(state.get("intent_confidence") or 0.7),
@@ -165,7 +170,7 @@ class SmartAgentRouter:
                     "needs_confirmation": False,
                 }
 
-            if is_record and not is_conflict:
+            if (is_record or is_delete) and not is_conflict:
                 return {
                     "target_agent": "drug_record_agent",
                     "confidence": float(state.get("intent_confidence") or 0.7),
@@ -195,6 +200,85 @@ class SmartAgentRouter:
             }
 
         return None
+
+    async def _route_and_execute_single(self, state: Dict[str, Any]) -> Dict[str, Any]:
+        user_input = state.get("user_input", "")
+        conversation_history = state.get("history", [])
+
+        # 1) 优先复用上游 intent_classifier 结果，稳定主链路路由
+        intent_result = self._route_from_state_intent(state)
+
+        # 2) 仅在上游结果缺失/不确定时才调用 LLM 做辅助路由
+        if not intent_result:
+            intent_result = await self.analyze_intent_with_llm(user_input, conversation_history)
+        elif float(intent_result.get("confidence", 0.0)) < 0.6:
+            llm_intent = await self.analyze_intent_with_llm(user_input, conversation_history)
+            if float(llm_intent.get("confidence", 0.0)) >= float(intent_result.get("confidence", 0.0)):
+                intent_result = llm_intent
+
+        # 记录意图分析结果
+        state["intent_analysis"] = intent_result
+        state["target_agent"] = intent_result["target_agent"]
+        state["intent_type"] = intent_result["intent_type"]
+
+        logger.info(f"意图分析结果: {intent_result}")
+
+        # 3. 验证目标Agent是否存在
+        target_agent = intent_result["target_agent"]
+        if target_agent not in self.agents:
+            logger.warning(f"未知的Agent: {target_agent}，回退到main_qa_agent")
+            target_agent = "main_qa_agent"
+            state["target_agent"] = target_agent
+
+        # 4. 如果需要确认，先返回确认信息
+        if intent_result.get("needs_confirmation", False):
+            state["needs_confirmation"] = True
+            state["confirmation_message"] = self._build_confirmation_message(intent_result, user_input)
+            state["pending_confirmation"] = {
+                "type": "agent_confirmation",
+                "payload": {
+                    "target_agent": state.get("target_agent"),
+                    "original_query": user_input,
+                    "intent_type": intent_result.get("intent_type", "general"),
+                },
+                "expires_at": int(time.time()) + 15 * 60,
+            }
+            return state
+
+        # 5. 调用目标Agent处理
+        try:
+            agent = self.agents[target_agent]
+            result_state = await agent.process(state)
+            state.update(result_state)
+        except Exception as e:
+            logger.error(f"Agent执行失败: {e}")
+            state["error_msg"] = f"处理请求时出现错误: {str(e)}"
+
+            # 尝试回退到主问答Agent
+            if target_agent != "main_qa_agent":
+                try:
+                    fallback_agent = self.agents["main_qa_agent"]
+                    fallback_result = await fallback_agent.process(state)
+                    state.update(fallback_result)
+                    state["fallback_used"] = True
+                except Exception as fallback_e:
+                    state["error_msg"] = f"主Agent也执行失败: {str(fallback_e)}"
+
+        return state
+
+    async def _predict_intent_for_query(self, query: str) -> dict | None:
+        try:
+            from app.core.agent.intent_classifier import IntentClassifier
+
+            clf = IntentClassifier()
+            sub_intent = await clf.predict(text=query, stream=False)
+            return {
+                "intent": sub_intent.intent,
+                "confidence": sub_intent.confidence,
+                "reason": sub_intent.reason,
+            }
+        except Exception:
+            return None
     
     async def analyze_intent_with_llm(self, user_input: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
         """使用LLM进行意图分析，返回详细的意图识别结果"""
@@ -377,64 +461,53 @@ needs_confirmation: 当意图不明确或需要用户确认时设为true
     
     async def route_and_execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """智能路由并执行请求"""
-        
         user_input = state.get("user_input", "")
-        conversation_history = state.get("history", [])
+        user_id = state.get("user_id")
+        session_id = state.get("session_id")
 
-        # 1) 优先复用上游 intent_classifier 结果，稳定主链路路由
-        intent_result = self._route_from_state_intent(state)
+        # 1) 处理持久化确认态：允许跨轮/重启恢复确认任务
+        pending = state.get("pending_confirmation")
+        if not pending and user_id and session_id:
+            try:
+                rt = await AgentStateStore().get_state(user_id=user_id, session_id=session_id)
+                pending = rt.get("pending_confirmation") if isinstance(rt, dict) else None
+            except Exception:
+                pending = None
 
-        # 2) 仅在上游结果缺失/不确定时才调用 LLM 做辅助路由
-        if not intent_result:
-            intent_result = await self.analyze_intent_with_llm(user_input, conversation_history)
-        elif float(intent_result.get("confidence", 0.0)) < 0.6:
-            llm_intent = await self.analyze_intent_with_llm(user_input, conversation_history)
-            if float(llm_intent.get("confidence", 0.0)) >= float(intent_result.get("confidence", 0.0)):
-                intent_result = llm_intent
-        
-        # 记录意图分析结果
-        state["intent_analysis"] = intent_result
-        state["target_agent"] = intent_result["target_agent"]
-        state["intent_type"] = intent_result["intent_type"]
-        
-        logger.info(f"意图分析结果: {intent_result}")
-        
-        # 3. 验证目标Agent是否存在
-        target_agent = intent_result["target_agent"]
-        if target_agent not in self.agents:
-            logger.warning(f"未知的Agent: {target_agent}，回退到main_qa_agent")
-            target_agent = "main_qa_agent"
-            state["target_agent"] = target_agent
-        
-        # 4. 如果需要确认，先返回确认信息
-        if intent_result.get("needs_confirmation", False):
-            state["needs_confirmation"] = True
-            state["confirmation_message"] = self._build_confirmation_message(intent_result, user_input)
-            return state
-        
-        # 5. 调用目标Agent处理
-        try:
-            agent = self.agents[target_agent]
-            result_state = await agent.process(state)
-            
-            # 合并结果
-            state.update(result_state)
-            
-        except Exception as e:
-            logger.error(f"Agent执行失败: {e}")
-            state["error_msg"] = f"处理请求时出现错误: {str(e)}"
-            
-            # 尝试回退到主问答Agent
-            if target_agent != "main_qa_agent":
-                try:
-                    fallback_agent = self.agents["main_qa_agent"]
-                    fallback_result = await fallback_agent.process(state)
-                    state.update(fallback_result)
-                    state["fallback_used"] = True
-                except Exception as fallback_e:
-                    state["error_msg"] = f"主Agent也执行失败: {str(fallback_e)}"
-        
-        return state
+        if isinstance(pending, dict) and pending:
+            expires_at = int(pending.get("expires_at") or 0)
+            if expires_at and int(time.time()) > expires_at:
+                state["pending_confirmation"] = {}
+                pending = None
+
+        if isinstance(pending, dict) and pending:
+            payload = pending.get("payload") if isinstance(pending.get("payload"), dict) else pending
+            if self._is_affirmative(user_input):
+                target = payload.get("target_agent") or "main_qa_agent"
+                original_query = payload.get("original_query") or user_input
+                resumed = dict(state)
+                resumed["user_input"] = original_query
+                resumed["target_agent"] = target
+                resumed["needs_confirmation"] = False
+                resumed.pop("pending_confirmation", None)
+                out = await self._route_and_execute_single(resumed)
+                out.pop("pending_confirmation", None)
+                state["pending_confirmation"] = {}
+                return out
+            if self._is_negative(user_input):
+                state["pending_confirmation"] = {}
+                state["final_response"] = "好的，已取消这次待确认操作。"
+                state["intent"] = "cancelled"
+                state["intent_type"] = "cancelled"
+                return state
+
+        # 2) 统一走中心编排器
+        orchestrator = QueryOrchestrator(
+            split_fn=self._split_user_queries,
+            run_single=self._route_and_execute_single,
+            predict_intent=self._predict_intent_for_query,
+        )
+        return await orchestrator.execute(state)
     
     def _build_confirmation_message(self, intent_result: Dict[str, Any], user_input: str) -> str:
         """构建确认消息"""

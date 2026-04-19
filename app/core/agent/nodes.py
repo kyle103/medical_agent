@@ -8,8 +8,10 @@ from datetime import datetime
 
 from app.core.memory.memory_service import MemoryService
 from app.core.memory.long_memory_service import LongMemoryService
+from app.core.session.agent_state_store import AgentStateStore
 from app.core.llm.llm_service import LLMService
 from app.core.tools.archive_query_tool import ArchiveQueryTool
+from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.lab_report_tool import LabReportTool
 
@@ -187,6 +189,16 @@ async def memory_load(state: dict) -> dict:
     state["history_text"] = _format_history(history, max_chars=1400)
     state["memory_summary"] = await mem.get_memory_summary(user_id=user_id, session_id=session_id)
 
+    # 读取会话级运行状态（例如：待确认任务）
+    try:
+        rt_state = await AgentStateStore().get_state(user_id=user_id, session_id=session_id)
+        state["session_runtime_state"] = rt_state
+        pending = rt_state.get("pending_confirmation") if isinstance(rt_state, dict) else None
+        if isinstance(pending, dict):
+            state["pending_confirmation"] = pending
+    except Exception:
+        state["session_runtime_state"] = {}
+
     # 长期记忆召回（向量库）：不影响主流程，失败则忽略
     state["long_memory_items"] = []
     state["long_memory_text"] = ""
@@ -310,43 +322,7 @@ async def entity_extraction(state: dict) -> dict:
 
     entities: dict = {}
     if intent == "drug":
-        import re
-
-        normalized = (
-            (text or "")
-            .replace("？", " ")
-            .replace("?", " ")
-            .replace("。", " ")
-            .replace("，", ",")
-            .replace("、", ",")
-            .replace("；", ",")
-            .replace(";", ",")
-        )
-        for noise in ["一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"]:
-            normalized = normalized.replace(noise, " ")
-
-        parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
-        stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "是否", "能", "不能"}
-        drug_name_list = []
-        for part in parts:
-            cand = (part or "").strip()
-            if len(cand) < 2 or len(cand) > 24:
-                continue
-            if cand in stop_words:
-                continue
-            if re.search(r"[0-9]", cand):
-                continue
-            drug_name_list.append(cand)
-
-        # 保序去重
-        dedup = []
-        seen = set()
-        for d in drug_name_list:
-            if d in seen:
-                continue
-            seen.add(d)
-            dedup.append(d)
-        entities["drug_name_list"] = dedup[:10]
+        entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
     elif intent == "lab":
         entities["raw"] = text
     else:
@@ -928,6 +904,26 @@ async def memory_update(state: dict) -> dict:
             write_time=write_time,
             error=str(e)
         )
+        pass
+
+    # 持久化会话级运行状态（最小化：仅保存待确认信息）
+    try:
+        user_id = state.get("user_id")
+        session_id = state.get("session_id")
+        runtime_state = state.get("session_runtime_state")
+        if not isinstance(runtime_state, dict):
+            runtime_state = {}
+        pending = state.get("pending_confirmation")
+        if isinstance(pending, dict) and pending:
+            runtime_state["pending_confirmation"] = pending
+        else:
+            runtime_state.pop("pending_confirmation", None)
+        await AgentStateStore().upsert_state(
+            user_id=user_id,
+            session_id=session_id,
+            state=runtime_state,
+        )
+    except Exception:
         pass
 
     return state

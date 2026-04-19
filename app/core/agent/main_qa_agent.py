@@ -193,7 +193,7 @@ class MainQAAgent(BaseAgent):
         """判断是否为档案查询"""
         archive_keywords = [
             "档案", "病历", "就诊记录", "用药记录", "健康档案", 
-            "我的信息", "个人信息", "历史记录", "过往病史", "还记得我之前吃的药吗"
+            "我的信息", "个人信息", "历史记录", "过往病史", "病史", "高血压病史", "还记得我之前吃的药吗"
         ]
         
         return any(keyword in user_input for keyword in archive_keywords)

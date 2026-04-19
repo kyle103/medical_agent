@@ -5,10 +5,10 @@
 
 from typing import Dict, Any
 import json
-import re
 
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
+from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.prompts import Prompts
 
 
@@ -91,31 +91,7 @@ class DrugConflictAgent(BaseAgent):
         try:
             from app.core.rag.drug_knowledge_service import DrugKnowledgeService
 
-            normalized = (
-                (user_input or "")
-                .replace("？", " ")
-                .replace("?", " ")
-                .replace("。", " ")
-                .replace("，", ",")
-                .replace("、", ",")
-                .replace("；", ",")
-                .replace(";", ",")
-            )
-            for noise in ["一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"]:
-                normalized = normalized.replace(noise, " ")
-
-            parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
-            stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "是否", "能", "不能"}
-            candidate_names = []
-            for p in parts:
-                cand = (p or "").strip()
-                if len(cand) < 2 or len(cand) > 24:
-                    continue
-                if cand in stop_words:
-                    continue
-                if re.search(r"[0-9]", cand):
-                    continue
-                candidate_names.append(cand)
+            candidate_names = DrugEntityExtractor.extract_drug_candidates(user_input, max_items=10)
             
             # 使用药品知识库进行匹配
             if candidate_names:

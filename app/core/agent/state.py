@@ -37,3 +37,7 @@ class AgentState(TypedDict, total=False):
     compliance_check_result: bool
     final_response: str
     error_msg: str
+
+    # 会话级运行状态（持久化）
+    session_runtime_state: dict
+    pending_confirmation: dict
