@@ -29,6 +29,29 @@ class SessionManager:
         }
         
         return session_id
+
+    def get_or_create_session(self, user_id: Optional[str] = None) -> str:
+        """获取用户最近活跃会话；若不存在则创建新会话。"""
+        uid = user_id or "anonymous"
+
+        # 优先复用同一用户最近活跃且未过期的会话，降低前端丢 session_id 时的上下文丢失概率
+        latest_session_id: Optional[str] = None
+        latest_accessed = None
+        for sid, sess in self.sessions.items():
+            if sess.get("user_id") != uid:
+                continue
+            if self._is_session_expired(sess):
+                continue
+            last_accessed = sess.get("last_accessed")
+            if latest_accessed is None or (last_accessed and last_accessed > latest_accessed):
+                latest_accessed = last_accessed
+                latest_session_id = sid
+
+        if latest_session_id:
+            self.sessions[latest_session_id]["last_accessed"] = datetime.now()
+            return latest_session_id
+
+        return self.create_session(user_id=uid)
     
     def get_session(self, session_id: str) -> Optional[Dict[str, Any]]:
         """获取会话信息"""

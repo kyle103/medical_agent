@@ -5,6 +5,7 @@
 
 from typing import Dict, Any
 import json
+import re
 
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
@@ -23,8 +24,12 @@ class DrugConflictAgent(BaseAgent):
         user_id = state.get("user_id", "")
         user_input = state.get("user_input", "")
         
-        # 提取药品名称
-        drug_names = await self._extract_drug_names(user_input)
+        # 优先复用上游实体抽取结果
+        entities = state.get("extract_entities") or {}
+        from_entities = entities.get("drug_name_list") if isinstance(entities, dict) else []
+        drug_names = [d for d in (from_entities or []) if isinstance(d, str) and d.strip()]
+        if len(drug_names) < 2:
+            drug_names = await self._extract_drug_names(user_input)
         
         if not drug_names:
             state["final_response"] = self._add_disclaimer(
@@ -85,25 +90,32 @@ class DrugConflictAgent(BaseAgent):
         # 使用DrugKnowledgeService匹配药品名称
         try:
             from app.core.rag.drug_knowledge_service import DrugKnowledgeService
-            
-            # 提取可能的药品名称
-            import re
-            drug_patterns = [
-                r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})',
-                r'([^，。！？\s]{1,30})(?:片|粒|胶囊|支|瓶|袋|贴)',
-                r'(?:药名|药品|药物)\s*[:：]\s*([^，。！？\s]{1,30})'
-            ]
-            
+
+            normalized = (
+                (user_input or "")
+                .replace("？", " ")
+                .replace("?", " ")
+                .replace("。", " ")
+                .replace("，", ",")
+                .replace("、", ",")
+                .replace("；", ",")
+                .replace(";", ",")
+            )
+            for noise in ["一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"]:
+                normalized = normalized.replace(noise, " ")
+
+            parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
+            stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "是否", "能", "不能"}
             candidate_names = []
-            for pattern in drug_patterns:
-                matches = re.findall(pattern, user_input)
-                candidate_names.extend(matches)
-            
-            # 处理"和"、"与"、"或"等连接词
-            if not candidate_names:
-                # 简单的分割提取
-                words = user_input.replace("、", ",").replace("和", ",").replace("与", ",").split(",")
-                candidate_names = [word.strip() for word in words if len(word.strip()) > 1]
+            for p in parts:
+                cand = (p or "").strip()
+                if len(cand) < 2 or len(cand) > 24:
+                    continue
+                if cand in stop_words:
+                    continue
+                if re.search(r"[0-9]", cand):
+                    continue
+                candidate_names.append(cand)
             
             # 使用药品知识库进行匹配
             if candidate_names:
@@ -118,7 +130,7 @@ class DrugConflictAgent(BaseAgent):
                 
                 # 如果没有匹配到，使用候选名称
                 if not found_drugs:
-                    found_drugs = candidate_names[:5]  # 限制返回数量
+                    found_drugs = candidate_names[:5]
             else:
                 found_drugs = []
         except Exception as e:
@@ -130,7 +142,18 @@ class DrugConflictAgent(BaseAgent):
             for drug in drug_keywords:
                 if drug in user_input:
                     found_drugs.append(drug)
-        
+
+        # 保序去重
+        dedup = []
+        seen = set()
+        for dn in found_drugs:
+            key = (dn or "").strip()
+            if not key or key in seen:
+                continue
+            seen.add(key)
+            dedup.append(key)
+
+        found_drugs = dedup
         return found_drugs
     
     def get_system_prompt(self) -> str:

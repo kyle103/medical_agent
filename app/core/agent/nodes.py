@@ -310,21 +310,43 @@ async def entity_extraction(state: dict) -> dict:
 
     entities: dict = {}
     if intent == "drug":
-        # 支持多种分隔符提取药物名称
-        separators = ["，", "、", "和", "与", "以及", "还有"]
-        # 先将所有分隔符统一为逗号
-        normalized_text = text
-        for sep in separators:
-            normalized_text = normalized_text.replace(sep, "，")
-        # 分割并过滤
-        parts = [p.strip() for p in normalized_text.split("，") if p.strip()]
-        # 进一步过滤掉非药物名称的部分
+        import re
+
+        normalized = (
+            (text or "")
+            .replace("？", " ")
+            .replace("?", " ")
+            .replace("。", " ")
+            .replace("，", ",")
+            .replace("、", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        for noise in ["一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"]:
+            normalized = normalized.replace(noise, " ")
+
+        parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
+        stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "是否", "能", "不能"}
         drug_name_list = []
         for part in parts:
-            # 过滤掉包含冲突、一起吃等关键词的部分
-            if not any(keyword in part for keyword in ["冲突", "一起吃", "同服", "相互作用", "配伍", "禁忌", "能不能", "可以", "吗"]):
-                drug_name_list.append(part)
-        entities["drug_name_list"] = drug_name_list[:10]
+            cand = (part or "").strip()
+            if len(cand) < 2 or len(cand) > 24:
+                continue
+            if cand in stop_words:
+                continue
+            if re.search(r"[0-9]", cand):
+                continue
+            drug_name_list.append(cand)
+
+        # 保序去重
+        dedup = []
+        seen = set()
+        for d in drug_name_list:
+            if d in seen:
+                continue
+            seen.add(d)
+            dedup.append(d)
+        entities["drug_name_list"] = dedup[:10]
     elif intent == "lab":
         entities["raw"] = text
     else:

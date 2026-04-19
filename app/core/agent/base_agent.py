@@ -63,6 +63,10 @@ class BaseAgent(ABC):
         # 如果有长期记忆，总是注入
         if long_memory_text and len(long_memory_text.strip()) > 0:
             return True
+
+        # 有会话历史时，对短中长度输入默认注入，提升多轮对话连贯性
+        if history_text and len(history_text.strip()) > 0 and len((user_input or "").strip()) <= 80:
+            return True
         
         # 检查用户输入是否需要上下文
         if not user_input:

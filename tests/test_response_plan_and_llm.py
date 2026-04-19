@@ -16,7 +16,14 @@ async def test_response_plan_injects_memory_without_keywords():
 
     client = TestClient(app)
 
-    r = client.post("/api/v1/user/register", json={"user_nickname": f"t_{uuid.uuid4().hex[:8]}"})
+    r = client.post(
+        "/api/v1/user/register",
+        json={
+            "user_nickname": f"t_{uuid.uuid4().hex[:8]}",
+            "phone": f"u_{uuid.uuid4().hex[:12]}",
+            "password": "test123456",
+        },
+    )
     assert r.status_code == 200
     data = r.json()["data"]
     token = data.get("access_token") or data.get("token") or data.get("jwt")

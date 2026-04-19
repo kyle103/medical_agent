@@ -1,18 +1,3 @@
-from fastapi import APIRouter, Request
-
-from app.common.logger import get_logger
-from app.core.agent.workflow import MedicalAgent
-from app.core.session.session_manager import SessionManager
-from app.schema.base import APIResponse
-from app.schema.chat_schema import ChatCompletionRequest, ChatCompletionResponse
-
-import time
-
-router = APIRouter()
-logger = get_logger(__name__)
-session_manager = SessionManager()
-
-
 from fastapi import APIRouter, Request, HTTPException
 
 from app.common.exceptions import UserAuthException
@@ -33,11 +18,11 @@ session_manager = SessionManager()
 async def completion(req: ChatCompletionRequest, request: Request):
     user_id = getattr(request.state, "user_id", None)
     
-    # 如果session_id为空，生成新的会话ID
+    # 如果session_id为空，优先复用当前用户最近活跃会话，减少上下文丢失
     session_id = req.session_id
     if not session_id or session_id.strip() == "":
-        session_id = session_manager.create_session(user_id=user_id)
-        logger.info(f"Created new session for user {user_id}: {session_id}")
+        session_id = session_manager.get_or_create_session(user_id=user_id)
+        logger.info("Resolved active session for user %s: %s", user_id, session_id)
 
     try:
         t0 = time.perf_counter()

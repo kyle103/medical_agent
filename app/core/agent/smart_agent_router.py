@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import json
 import logging
+import re
 from typing import Dict, Any, List, Optional
 from dataclasses import dataclass
 
@@ -15,8 +16,6 @@ from app.core.agent.drug_record_agent import DrugRecordAgent
 from app.core.agent.lab_report_agent import LabReportAgent
 from app.core.agent.main_qa_agent import MainQAAgent
 from app.core.llm.llm_service import LLMService
-from app.config.settings import settings
-
 logger = logging.getLogger(__name__)
 
 
@@ -70,6 +69,132 @@ class SmartAgentRouter:
         ]
         
         self.llm = LLMService()
+
+    @staticmethod
+    def _extract_drug_candidates(text: str) -> List[str]:
+        raw = (text or "").strip()
+        if not raw:
+            return []
+
+        normalized = (
+            raw.replace("？", " ")
+            .replace("?", " ")
+            .replace("。", " ")
+            .replace("，", ",")
+            .replace("、", ",")
+            .replace("；", ",")
+            .replace(";", ",")
+        )
+        # 去掉典型问句噪音，避免把“有冲突吗”当成药名
+        for noise in [
+            "一起吃", "同服", "相互作用", "有冲突", "冲突", "禁忌", "配伍", "能不能", "可不可以", "可以", "吗", "么", "呢"
+        ]:
+            normalized = normalized.replace(noise, " ")
+
+        parts = re.split(r"[,\s]|和|与|及|加上|配合", normalized)
+        stop_words = {"我", "你", "他", "她", "它", "请问", "一下", "这个", "那个", "还有", "是否", "能", "不能"}
+
+        out: List[str] = []
+        for p in parts:
+            cand = (p or "").strip()
+            if len(cand) < 2 or len(cand) > 24:
+                continue
+            if cand in stop_words:
+                continue
+            if re.search(r"[0-9]", cand):
+                continue
+            out.append(cand)
+
+        # 保留顺序去重
+        dedup: List[str] = []
+        seen = set()
+        for x in out:
+            if x in seen:
+                continue
+            seen.add(x)
+            dedup.append(x)
+        return dedup
+
+    def _route_from_state_intent(self, state: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+        intent = (state.get("intent") or "").strip().lower()
+        text = (state.get("user_input") or "").strip()
+        if not intent:
+            return None
+
+        if intent == "lab":
+            return {
+                "target_agent": "lab_report_agent",
+                "confidence": float(state.get("intent_confidence") or 0.6),
+                "reason": "follow intent_classifier: lab",
+                "intent_type": "lab_report",
+                "needs_confirmation": False,
+            }
+
+        if intent == "archive":
+            return {
+                "target_agent": "main_qa_agent",
+                "confidence": float(state.get("intent_confidence") or 0.6),
+                "reason": "follow intent_classifier: archive",
+                "intent_type": "archive",
+                "needs_confirmation": False,
+            }
+
+        if intent == "general":
+            return {
+                "target_agent": "main_qa_agent",
+                "confidence": float(state.get("intent_confidence") or 0.6),
+                "reason": "follow intent_classifier: general",
+                "intent_type": "general",
+                "needs_confirmation": False,
+            }
+
+        if intent == "drug":
+            conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
+            record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次"]
+
+            is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
+            is_record = any(k in text for k in record_keywords)
+
+            # 优先把“两个药能不能一起”这类问句路由到冲突 Agent
+            if is_conflict and not is_record:
+                return {
+                    "target_agent": "drug_conflict_agent",
+                    "confidence": float(state.get("intent_confidence") or 0.7),
+                    "reason": "drug sub-intent: interaction check",
+                    "intent_type": "drug_conflict",
+                    "needs_confirmation": False,
+                }
+
+            if is_record and not is_conflict:
+                return {
+                    "target_agent": "drug_record_agent",
+                    "confidence": float(state.get("intent_confidence") or 0.7),
+                    "reason": "drug sub-intent: record operation",
+                    "intent_type": "drug_record",
+                    "needs_confirmation": False,
+                }
+
+            # 两者都不明显时，用候选药名数量辅助判断
+            candidates = self._extract_drug_candidates(text)
+            if len(candidates) >= 2:
+                state.setdefault("extract_entities", {})["drug_name_list"] = candidates[:6]
+                return {
+                    "target_agent": "drug_conflict_agent",
+                    "confidence": 0.7,
+                    "reason": "drug sub-intent by multi-drug candidates",
+                    "intent_type": "drug_conflict",
+                    "needs_confirmation": False,
+                }
+
+            return {
+                "target_agent": "drug_record_agent",
+                "confidence": 0.65,
+                "reason": "drug sub-intent default to record",
+                "intent_type": "drug_record",
+                "needs_confirmation": False,
+            }
+
+        return None
     
     async def analyze_intent_with_llm(self, user_input: str, conversation_history: List[Dict] = None) -> Dict[str, Any]:
         """使用LLM进行意图分析，返回详细的意图识别结果"""
@@ -255,36 +380,17 @@ needs_confirmation: 当意图不明确或需要用户确认时设为true
         
         user_input = state.get("user_input", "")
         conversation_history = state.get("history", [])
-        
-        # 1. 检查是否为确认响应
-        if self._is_confirmation_response(user_input, state):
-            logger.info("检测到确认响应，执行确认操作")
-            
-            # 获取目标Agent
-            target_agent_name = state.get("target_agent")
-            if target_agent_name:
-                target_agent = self.agents.get(target_agent_name)
-                if target_agent:
-                    # 执行目标Agent
-                    final_response = await target_agent.run(user_input, state)
-                    
-                    # 更新状态
-                    state["needs_confirmation"] = False
-                    state["confirmation_message"] = None
-                    state["final_response"] = final_response
-                    state["error_msg"] = None
-                    
-                    return state
-            
-            # 如果无法执行目标Agent，返回错误
-            state["needs_confirmation"] = False
-            state["confirmation_message"] = None
-            state["final_response"] = "抱歉，确认操作执行失败。请重新描述您的需求。"
-            state["error_msg"] = "确认操作执行失败"
-            return state
-        
-        # 2. 使用LLM分析意图
-        intent_result = await self.analyze_intent_with_llm(user_input, conversation_history)
+
+        # 1) 优先复用上游 intent_classifier 结果，稳定主链路路由
+        intent_result = self._route_from_state_intent(state)
+
+        # 2) 仅在上游结果缺失/不确定时才调用 LLM 做辅助路由
+        if not intent_result:
+            intent_result = await self.analyze_intent_with_llm(user_input, conversation_history)
+        elif float(intent_result.get("confidence", 0.0)) < 0.6:
+            llm_intent = await self.analyze_intent_with_llm(user_input, conversation_history)
+            if float(llm_intent.get("confidence", 0.0)) >= float(intent_result.get("confidence", 0.0)):
+                intent_result = llm_intent
         
         # 记录意图分析结果
         state["intent_analysis"] = intent_result
