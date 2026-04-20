@@ -70,3 +70,16 @@ async def test_single_route_sets_pending_confirmation(monkeypatch):
     assert pending.get("type") == "agent_confirmation"
     assert isinstance(pending.get("payload"), dict)
     assert pending.get("payload", {}).get("target_agent") == "drug_record_agent"
+
+
+def test_normalize_notice_once():
+    text = (
+        "1. 子任务A结果\n"
+        "重要提醒：具体用药请咨询执业医师或药师，遵医嘱用药。\n\n"
+        "2. 子任务B结果\n"
+        "注：以上信息仅供参考，不能替代专业医疗建议。"
+    )
+    out = SmartAgentRouter._normalize_notice_once(text)
+    assert "子任务A结果" in out
+    assert "子任务B结果" in out
+    assert out.count("重要提醒：") == 1

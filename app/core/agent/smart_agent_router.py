@@ -34,6 +34,23 @@ class AgentCapability:
 
 class SmartAgentRouter:
     """智能Agent路由器，基于LLM的意图识别和动态路由"""
+
+    STANDARD_NOTICE = "重要提醒：以上内容仅供健康科普信息参考，不构成诊断或具体用药方案；如需用药或治疗决策，请咨询执业医师或药师。"
+    NOTICE_KEYWORDS = [
+        "重要提醒",
+        "仅供参考",
+        "仅供健康科普",
+        "不构成",
+        "请咨询执业医师",
+        "请咨询执业药师",
+        "咨询执业医师",
+        "咨询执业药师",
+        "咨询医生",
+        "咨询药师",
+        "遵医嘱",
+        "不能替代",
+        "注：以上信息仅供参考",
+    ]
     
     def __init__(self):
         # 初始化各个Agent实例
@@ -83,6 +100,43 @@ class SmartAgentRouter:
     def _is_negative(text: str) -> bool:
         t = (text or "").strip().lower()
         return any(k in t for k in ["不", "取消", "不要", "不用", "否", "no", "n"])
+
+    @classmethod
+    def _normalize_notice_once(cls, text: str) -> str:
+        """收敛重复的警示/免责声明：正文去重后仅在末尾保留一次标准提醒。"""
+        raw = (text or "").strip()
+        if not raw:
+            return raw
+
+        lines = [ln.rstrip() for ln in raw.splitlines()]
+        cleaned_lines: List[str] = []
+        notice_found = False
+
+        for line in lines:
+            if not line.strip():
+                cleaned_lines.append("")
+                continue
+            if any(kw in line for kw in cls.NOTICE_KEYWORDS):
+                notice_found = True
+                continue
+            cleaned_lines.append(line)
+
+        # 压缩连续空行
+        compact: List[str] = []
+        prev_blank = False
+        for line in cleaned_lines:
+            is_blank = not line.strip()
+            if is_blank and prev_blank:
+                continue
+            compact.append(line)
+            prev_blank = is_blank
+
+        body = "\n".join(compact).strip()
+        if not notice_found:
+            return body
+        if not body:
+            return cls.STANDARD_NOTICE
+        return f"{body}\n\n{cls.STANDARD_NOTICE}"
 
     @staticmethod
     def _split_user_queries(text: str) -> List[str]:
@@ -263,6 +317,10 @@ class SmartAgentRouter:
                     state["fallback_used"] = True
                 except Exception as fallback_e:
                     state["error_msg"] = f"主Agent也执行失败: {str(fallback_e)}"
+
+        # 单任务输出也做一次免责声明收敛
+        if state.get("final_response"):
+            state["final_response"] = self._normalize_notice_once(str(state.get("final_response")))
 
         return state
 
@@ -507,7 +565,10 @@ needs_confirmation: 当意图不明确或需要用户确认时设为true
             run_single=self._route_and_execute_single,
             predict_intent=self._predict_intent_for_query,
         )
-        return await orchestrator.execute(state)
+        out = await orchestrator.execute(state)
+        if out.get("final_response"):
+            out["final_response"] = self._normalize_notice_once(str(out.get("final_response")))
+        return out
     
     def _build_confirmation_message(self, intent_result: Dict[str, Any], user_input: str) -> str:
         """构建确认消息"""
