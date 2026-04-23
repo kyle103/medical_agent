@@ -6,7 +6,9 @@
 from typing import Dict, Any
 import json
 
+from app.core.agent.agent_card import AgentCard
 from app.core.agent.base_agent import BaseAgent
+from app.core.skills.medication_recall_skill import MedicationRecallSkill
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.prompts import Prompts
 
@@ -17,6 +19,7 @@ class MainQAAgent(BaseAgent):
     def __init__(self):
         super().__init__("main_qa_agent")
         self.archive_tool = ArchiveQueryTool()
+        self.medication_recall_skill = MedicationRecallSkill()
     
     async def process(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """处理档案查询和通用问答请求"""
@@ -96,24 +99,17 @@ class MainQAAgent(BaseAgent):
         
         # 处理"还记得我之前吃的药吗？"这类问题
         if any(phrase in user_input for phrase in ["还记得我之前吃的药吗", "之前吃过什么药", "我吃了哪些药", "我之前吃的药"]):
-            # 优先查询档案中的用药记录
-            try:
-                tool_result = await self.archive_tool.query(
-                    user_id=user_id,
-                    query_type="drug_records",
-                    query_conditions={},
-                )
-                
-                # 检查是否有用药记录
-                drug_records = tool_result.get("items", [])
-                if drug_records:
-                    # 有档案记录，生成响应
-                    system_prompt = self.get_system_prompt()
-                    user_prompt = f"""
+            recall = await self.medication_recall_skill.recall_recent_drugs(
+                user_id=user_id,
+                history=state.get("history", []),
+            )
+            if recall.get("source") == "archive":
+                system_prompt = self.get_system_prompt()
+                user_prompt = f"""
 用户询问之前的用药记录：
 用户输入：{user_input}
 查询结果：
-{tool_result}
+{recall.get("records", [])}
 
 请基于查询结果生成专业的用药记录展示，要求：
 1. 清晰展示用户的用药记录
@@ -121,51 +117,12 @@ class MainQAAgent(BaseAgent):
 3. 语言简洁明了，便于用户理解
 4. 不涉及疾病诊断或治疗建议
 """
-                    response = await self._call_llm(user_prompt, system_prompt, state)
-                else:
-                    # 档案为空，检查对话历史
-                    history = state.get("history", [])
-                    mentioned_drugs = []
-                    
-                    # 从对话历史中提取提到的药品
-                    for message in history:
-                        if message.get("role") == "user":
-                            content = message.get("content", "")
-                            # 简单的药品名称提取
-                            common_drugs = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
-                                           "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
-                            for drug in common_drugs:
-                                if drug in content and drug not in mentioned_drugs:
-                                    mentioned_drugs.append(drug)
-                    
-                    if mentioned_drugs:
-                        # 有对话中提到的药品
-                        response = f"在我们的对话中，您提到过以下药品：{', '.join(mentioned_drugs)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"
-                    else:
-                        # 既没有档案记录，也没有对话中提到的药品
-                        response = "根据目前的档案信息，您尚未录入任何用药记录。如果您需要记录用药信息，请告诉我具体的药品名称、用法用量等详情，我将帮您添加到档案中。"
-            except Exception as e:
-                # 查询失败，检查对话历史
-                history = state.get("history", [])
-                mentioned_drugs = []
-                
-                # 从对话历史中提取提到的药品
-                for message in history:
-                    if message.get("role") == "user":
-                        content = message.get("content", "")
-                        # 简单的药品名称提取
-                        common_drugs = ["布洛芬", "阿司匹林", "青霉素", "头孢", "降压药", "降糖药", 
-                                       "抗生素", "止痛药", "感冒药", "消炎药", "消食片"]
-                        for drug in common_drugs:
-                            if drug in content and drug not in mentioned_drugs:
-                                mentioned_drugs.append(drug)
-                
-                if mentioned_drugs:
-                    # 有对话中提到的药品
-                    response = f"在我们的对话中，您提到过以下药品：{', '.join(mentioned_drugs)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"
-                else:
-                    # 既没有档案记录，也没有对话中提到的药品
-                    response = "根据目前的档案信息，您尚未录入任何用药记录。如果您需要记录用药信息，请告诉我具体的药品名称、用法用量等详情，我将帮您添加到档案中。"
+                response = await self._call_llm(user_prompt, system_prompt, state)
+            elif recall.get("source") == "history":
+                names = [it.get("drug_name", "") for it in recall.get("records", []) if it.get("drug_name")]
+                response = f"在我们的对话中，您提到过以下药品：{', '.join(names)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"
+            else:
+                response = "根据目前的档案信息，您尚未录入任何用药记录。如果您需要记录用药信息，请告诉我具体的药品名称、用法用量等详情，我将帮您添加到档案中。"
         else:
             # 其他通用问答
             system_prompt = self.get_system_prompt()
@@ -230,3 +187,13 @@ class MainQAAgent(BaseAgent):
     
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("MAIN_QA_AGENT")
+
+    def get_agent_card(self) -> AgentCard:
+        return AgentCard(
+            name=self.agent_name,
+            description="通用医疗问答与用户档案查询",
+            capabilities=["general_qa", "archive_query", "medication_recall"],
+            keywords=["档案", "病历", "历史记录", "科普", "回忆用药"],
+            visible_state_keys=["memory_summary", "history_text", "shared_facts", "retrieved_knowledge"],
+            priority=1,
+        )

@@ -1,7 +1,7 @@
 """Seed small test knowledge bases into Chroma collections.
 
 Creates/updates collections:
-- kb_general
+- kb_general (public knowledge base, merged with kb_public_med)
 - kb_drug
 - kb_lab
 

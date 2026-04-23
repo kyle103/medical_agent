@@ -6,6 +6,7 @@
 from typing import Dict, Any
 import json
 
+from app.core.agent.agent_card import AgentCard
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
@@ -134,3 +135,13 @@ class DrugConflictAgent(BaseAgent):
     
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("DRUG_CONFLICT_AGENT")
+
+    def get_agent_card(self) -> AgentCard:
+        return AgentCard(
+            name=self.agent_name,
+            description="药物相互作用检查与风险科普",
+            capabilities=["drug_interaction_check"],
+            keywords=["相互作用", "同服", "冲突", "禁忌"],
+            visible_state_keys=["shared_facts", "retrieved_knowledge", "history_text"],
+            priority=3,
+        )

@@ -5,9 +5,10 @@ import logging
 from openai import AsyncOpenAI
 
 from app.common.exceptions import ServiceUnavailableException
+from app.common.logger import get_logger
 from app.config.settings import settings
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 
 class EmbeddingService:
@@ -40,11 +41,16 @@ class EmbeddingService:
 
         assert self.client is not None
         try:
-            resp = await self.client.embeddings.create(
-                model=settings.EMBEDDING_MODEL_NAME,
-                input=texts,
-            )
-            return [d.embedding for d in resp.data]
+            max_batch = int(getattr(settings, "EMBEDDING_API_MAX_BATCH", 10))
+            vectors: list[list[float]] = []
+            for i in range(0, len(texts), max_batch):
+                batch = texts[i : i + max_batch]
+                resp = await self.client.embeddings.create(
+                    model=settings.EMBEDDING_MODEL_NAME,
+                    input=batch,
+                )
+                vectors.extend([d.embedding for d in resp.data])
+            return vectors
         except Exception as e:
             logger.error("Embedding API调用失败: %s", str(e))
             raise ServiceUnavailableException("Embedding服务暂不可用") from e

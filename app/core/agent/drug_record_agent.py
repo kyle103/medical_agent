@@ -5,6 +5,7 @@
 
 from typing import Dict, Any
 
+from app.core.agent.agent_card import AgentCard
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_record_tool import DrugRecordTool
@@ -172,3 +173,13 @@ class DrugRecordAgent(BaseAgent):
 
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("DRUG_RECORD_AGENT")
+
+    def get_agent_card(self) -> AgentCard:
+        return AgentCard(
+            name=self.agent_name,
+            description="用药记录增删查能力",
+            capabilities=["drug_record_add", "drug_record_query", "drug_record_delete"],
+            keywords=["用药记录", "添加用药", "删除记录", "服用"],
+            visible_state_keys=["memory_summary", "history_text", "shared_facts", "long_memory_items"],
+            priority=2,
+        )

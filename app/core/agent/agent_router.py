@@ -5,34 +5,25 @@ Agent路由器
 
 from typing import Dict, Any
 
-from app.core.agent.drug_conflict_agent import DrugConflictAgent
-from app.core.agent.drug_record_agent import DrugRecordAgent
-from app.core.agent.lab_report_agent import LabReportAgent
-from app.core.agent.main_qa_agent import MainQAAgent
+from app.core.agent.registry import build_agent_registry
 
 
 class AgentRouter:
     """Agent路由器，负责管理各个专业Agent的调用"""
     
     def __init__(self):
-        # 初始化各个Agent实例
-        self.agents = {
-            "drug_conflict_agent": DrugConflictAgent(),
-            "drug_record_agent": DrugRecordAgent(),
-            "lab_report_agent": LabReportAgent(),
-            "main_qa_agent": MainQAAgent(),
-        }
+        self.agents = build_agent_registry()
     
     async def route_and_execute(self, state: Dict[str, Any]) -> Dict[str, Any]:
         """路由请求到对应的Agent并执行"""
         target_agent = state.get("target_agent")
         
         if not target_agent:
-            state["error_msg"] = "无法确定处理请求的Agent"
+            state["error_msg"] = "路由异常：target_agent 为空"
             return state
         
         if target_agent not in self.agents:
-            state["error_msg"] = f"未知的Agent: {target_agent}"
+            state["error_msg"] = f"路由异常：未知的target_agent={target_agent}"
             return state
         
         # 获取对应的Agent实例
@@ -53,3 +44,20 @@ class AgentRouter:
     def list_agents(self):
         """列出所有可用的Agent"""
         return list(self.agents.keys())
+
+    def list_agent_cards(self) -> list[dict]:
+        """列出所有 Agent Card。"""
+        out: list[dict] = []
+        for agent in self.agents.values():
+            card = agent.get_agent_card()
+            out.append(
+                {
+                    "name": card.name,
+                    "description": card.description,
+                    "capabilities": card.capabilities,
+                    "keywords": card.keywords,
+                    "visible_state_keys": card.visible_state_keys,
+                    "priority": card.priority,
+                }
+            )
+        return out

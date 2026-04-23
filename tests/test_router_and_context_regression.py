@@ -1,4 +1,5 @@
 from app.core.agent.smart_agent_router import SmartAgentRouter
+from app.core.skills.medication_confirmation_skill import MedicationConfirmationSkill
 from app.core.session.session_manager import SessionManager
 import pytest
 
@@ -83,3 +84,23 @@ def test_normalize_notice_once():
     assert "子任务A结果" in out
     assert "子任务B结果" in out
     assert out.count("重要提醒：") == 1
+
+
+def test_agent_cards_exposed_by_router():
+    router = SmartAgentRouter()
+    cards = router.get_agent_capabilities()
+    assert cards
+    names = {c.get("name") for c in cards}
+    assert "main_qa_agent" in names
+    assert "drug_record_agent" in names
+    assert all(isinstance(c.get("capabilities"), list) for c in cards)
+    assert all(isinstance(c.get("visible_state_keys"), list) for c in cards)
+
+
+def test_medication_confirmation_skill_message():
+    skill = MedicationConfirmationSkill()
+    msg = skill.build_confirmation_message(
+        [{"drug_name": "布洛芬", "full_text": "我昨天吃了布洛芬"}]
+    )
+    assert "布洛芬" in msg
+    assert "加入用药档案" in msg

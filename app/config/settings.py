@@ -42,6 +42,7 @@ class Settings(BaseSettings):
     EMBEDDING_API_BASE: str = Field(default="{{Embedding API地址}}")
     EMBEDDING_API_KEY: str = Field(default="{{Embedding API密钥}}")
     EMBEDDING_MODEL_NAME: str = Field(default="{{Embedding模型名称}}")
+    EMBEDDING_API_MAX_BATCH: int = Field(default=10)
 
     # DB
     DB_TYPE: str = Field(default="{{sqlite/mysql}}")
@@ -60,6 +61,14 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = Field(default="{{Qdrant地址}}")
     QDRANT_PORT: int = Field(default=6333)
     QDRANT_API_KEY: str = Field(default="{{Qdrant API密钥}}")
+
+    # Public KB
+    PUBLIC_KB_COLLECTION: str = Field(default="kb_general")
+    PUBLIC_KB_TOP_K: int = Field(default=5)
+    PUBLIC_KB_EXPAND_WINDOW: int = Field(default=1)
+    PUBLIC_KB_BM25_TOP_K: int = Field(default=20)
+    PUBLIC_KB_RRF_K: int = Field(default=60)
+    PUBLIC_KB_BM25_CACHE_DIR: str = Field(default="data/bm25_cache")
 
     # Redis (prod)
     REDIS_HOST: str = Field(default="{{Redis地址}}")

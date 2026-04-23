@@ -8,10 +8,12 @@ from app.common.exceptions import UserAuthException
 from app.core.agent.nodes import (
     agent_execute,
     agent_route,
+    commit_gate,
     entity_extraction,
     error_finalize,
     input_check,
     intent_recognition,
+    knowledge_retrieve,
     llm_generate,
     memory_load,
     memory_update,
@@ -32,10 +34,13 @@ class MedicalAgent:
         g.add_node("mem_load", memory_load)
         g.add_node("intent_node", intent_recognition)
         g.add_node("entities", entity_extraction)
+        g.add_node("knowledge", knowledge_retrieve)
         g.add_node("agent_route", agent_route)
+        g.add_node("agent_exec", agent_execute)
         g.add_node("plan", response_plan)
         g.add_node("llm", llm_generate)
         g.add_node("out", output_check_and_disclaimer)
+        g.add_node("commit", commit_gate)
         g.add_node("mem", memory_update)
         g.add_node("err", error_finalize)
 
@@ -48,15 +53,18 @@ class MedicalAgent:
 
         g.add_edge("mem_load", "intent_node")
         g.add_edge("intent_node", "entities")
-        g.add_edge("entities", "agent_route")
-        g.add_edge("agent_route", "plan")
+        g.add_edge("entities", "knowledge")
+        g.add_edge("knowledge", "agent_route")
+        g.add_edge("agent_route", "agent_exec")
+        g.add_edge("agent_exec", "plan")
         g.add_edge("plan", "llm")
         g.add_edge("llm", "out")
 
         def _need_error2(state: dict) -> str:
-            return "err" if state.get("error_msg") else "mem"
+            return "err" if state.get("error_msg") else "commit"
 
-        g.add_conditional_edges("out", _need_error2, {"err": "err", "mem": "mem"})
+        g.add_conditional_edges("out", _need_error2, {"err": "err", "commit": "commit"})
+        g.add_edge("commit", "mem")
 
         g.add_edge("mem", END)
         g.add_edge("err", END)

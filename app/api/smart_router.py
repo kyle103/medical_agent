@@ -71,6 +71,16 @@ async def test_route(request: IntentAnalysisRequest):
         
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"路由测试失败: {str(e)}")
+
+
+@router.get("/agent-cards")
+async def agent_cards():
+    """返回所有 Agent Card，供调度器/外部系统发现能力。"""
+    try:
+        router = SmartAgentRouter()
+        return {"items": router.get_agent_capabilities()}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"获取 Agent Card 失败: {str(e)}")
     
 def _build_long_memory_text(session: Dict[str, Any]) -> str:
     """构建长期记忆文本"""

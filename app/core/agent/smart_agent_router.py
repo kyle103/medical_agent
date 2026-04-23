@@ -10,26 +10,13 @@ import logging
 import re
 import time
 from typing import Dict, Any, List, Optional
-from dataclasses import dataclass
 
-from app.core.agent.drug_conflict_agent import DrugConflictAgent
-from app.core.agent.drug_record_agent import DrugRecordAgent
-from app.core.agent.lab_report_agent import LabReportAgent
-from app.core.agent.main_qa_agent import MainQAAgent
+from app.core.agent.registry import build_agent_registry
 from app.core.agent.orchestrator import QueryOrchestrator
 from app.core.llm.llm_service import LLMService
 from app.core.session.agent_state_store import AgentStateStore
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 logger = logging.getLogger(__name__)
-
-
-@dataclass
-class AgentCapability:
-    """Agent能力描述"""
-    name: str
-    description: str
-    keywords: List[str]
-    priority: int = 1
 
 
 class SmartAgentRouter:
@@ -53,42 +40,8 @@ class SmartAgentRouter:
     ]
     
     def __init__(self):
-        # 初始化各个Agent实例
-        self.agents = {
-            "drug_conflict_agent": DrugConflictAgent(),
-            "drug_record_agent": DrugRecordAgent(),
-            "lab_report_agent": LabReportAgent(),
-            "main_qa_agent": MainQAAgent(),
-        }
-        
-        # 定义Agent能力描述
-        self.capabilities = [
-            AgentCapability(
-                name="drug_conflict_agent",
-                description="处理药物相互作用查询，检查两种或多种药物能否同时服用",
-                keywords=["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "同时吃"],
-                priority=2
-            ),
-            AgentCapability(
-                name="drug_record_agent",
-                description="处理用药记录操作，包括添加、查询、修改用药记录",
-                keywords=["吃了", "服用", "用了", "用药记录", "添加用药", "记录用药", "当前用药"],
-                priority=2
-            ),
-            AgentCapability(
-                name="lab_report_agent",
-                description="解读化验单指标，提供通用参考范围和健康建议",
-                keywords=["化验", "检验", "指标", "参考范围", "正常值", "血常规", "尿常规", "mmol", "mg/L"],
-                priority=2
-            ),
-            AgentCapability(
-                name="main_qa_agent",
-                description="处理通用健康问答、档案查询、科普知识等",
-                keywords=["档案", "记录", "就诊", "病历", "体检", "报告", "健康", "科普"],
-                priority=1
-            )
-        ]
-        
+        self.agents = build_agent_registry()
+        self.capabilities = [agent.get_agent_card() for agent in self.agents.values()]
         self.llm = LLMService()
 
     @staticmethod
@@ -655,7 +608,9 @@ needs_confirmation: 当意图不明确或需要用户确认时设为true
             {
                 "name": cap.name,
                 "description": cap.description,
+                "capabilities": cap.capabilities,
                 "keywords": cap.keywords,
+                "visible_state_keys": cap.visible_state_keys,
                 "priority": cap.priority
             }
             for cap in self.capabilities

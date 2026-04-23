@@ -24,6 +24,8 @@ ENV/
 
 # Chroma persistence
 /data/chroma/
+# Source data
+/data/source_data/
 
 # Pytest
 .pytest_cache/

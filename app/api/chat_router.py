@@ -1,9 +1,9 @@
 from fastapi import APIRouter, Request, HTTPException
+import uuid
 
 from app.common.exceptions import UserAuthException
 from app.common.logger import get_logger
 from app.core.agent.workflow import MedicalAgent
-from app.core.session.session_manager import SessionManager
 from app.schema.base import APIResponse
 from app.schema.chat_schema import ChatCompletionRequest, ChatCompletionResponse
 
@@ -11,7 +11,6 @@ import time
 
 router = APIRouter()
 logger = get_logger(__name__)
-session_manager = SessionManager()
 
 
 @router.post("/completion", response_model=APIResponse[ChatCompletionResponse])
@@ -21,8 +20,9 @@ async def completion(req: ChatCompletionRequest, request: Request):
     # 如果session_id为空，优先复用当前用户最近活跃会话，减少上下文丢失
     session_id = req.session_id
     if not session_id or session_id.strip() == "":
-        session_id = session_manager.get_or_create_session(user_id=user_id)
-        logger.info("Resolved active session for user %s: %s", user_id, session_id)
+        # 生产链路以DB会话为准，避免内存SessionManager造成双轨上下文
+        session_id = str(uuid.uuid4())
+        logger.info("Generated new session for user %s: %s", user_id, session_id)
 
     try:
         t0 = time.perf_counter()

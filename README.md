@@ -30,6 +30,15 @@ notepad .env.local
 python -m app.db.init_db --env local
 ```
 
+```
+通用知识库构建：
+python -m scripts.ingest_public_kb --source-dir data/Source_data --collection kb_general
+
+ BM25更新：
+ python -m scripts.refresh_bm25_cache --collection kb_general
+```
+
+
 4) 启动服务
 
 ```powershell

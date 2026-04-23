@@ -5,7 +5,7 @@ from pathlib import Path
 
 def setup_logging() -> None:
     log_level = os.getenv("LOG_LEVEL", "INFO").upper()
-    os.makedirs("data/logs", exist_ok=True)
+    os.makedirs("logs", exist_ok=True)
 
     logger = logging.getLogger()
     if logger.handlers:
@@ -18,7 +18,7 @@ def setup_logging() -> None:
     )
 
     file_handler = RotatingFileHandler(
-        filename="data/logs/app.log",
+        filename="logs/app.log",
         maxBytes=10 * 1024 * 1024,
         backupCount=5,
         encoding="utf-8",
@@ -56,9 +56,10 @@ def get_logger(name: str | None = None) -> logging.Logger:
     logger.addHandler(sh)
 
     # 文件输出（如果需要）
-    log_dir = Path("data/logs")
+    log_dir = Path("logs")
     log_dir.mkdir(parents=True, exist_ok=True)
-    fh = logging.FileHandler(log_dir / "app.log", encoding="utf-8")
+    safe_name = logger_name.replace(".", "_")
+    fh = logging.FileHandler(log_dir / f"{safe_name}.log", encoding="utf-8")
     fh.setLevel(level)
     fh.setFormatter(formatter)
     logger.addHandler(fh)

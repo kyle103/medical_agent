@@ -7,6 +7,7 @@ from abc import ABC, abstractmethod
 from typing import Dict, Any
 import json
 
+from app.core.agent.agent_card import AgentCard
 from app.core.llm.llm_service import LLMService
 
 
@@ -26,6 +27,11 @@ class BaseAgent(ABC):
     def get_system_prompt(self) -> str:
         """获取Agent专用系统提示词"""
         pass
+
+    @abstractmethod
+    def get_agent_card(self) -> AgentCard:
+        """返回 Agent Card，供编排器发现能力。"""
+        pass
     
     async def _call_llm(self, prompt: str, system_prompt: str, state: Dict[str, Any] = None) -> str:
         """统一LLM调用方法，支持记忆注入"""
@@ -43,7 +49,7 @@ class BaseAgent(ABC):
                 
                 if need_memory:
                     # 构建包含记忆的prompt
-                    memory_context = self._build_memory_context(history_text, long_memory_text)
+                    memory_context = self._build_memory_context(state)
                     final_prompt = f"""{memory_context}
 
 用户当前查询：{user_input}
@@ -91,16 +97,36 @@ class BaseAgent(ABC):
 
         return False
     
-    def _build_memory_context(self, history_text: str, long_memory_text: str) -> str:
+    def _build_memory_context(self, state: Dict[str, Any]) -> str:
         """构建记忆上下文"""
         memory_parts = []
-        
-        if history_text and len(history_text.strip()) > 0:
+
+        card = self.get_agent_card()
+        visible_keys = set(card.visible_state_keys or [])
+        shared_facts = state.get("shared_facts") or {}
+        memory_summary = (state.get("memory_summary") or "").strip()
+        history_text = (state.get("history_text") or "").strip()
+        long_memory_items = state.get("long_memory_items") or []
+        retrieved_knowledge = state.get("retrieved_knowledge") or {}
+
+        if "memory_summary" in visible_keys and memory_summary:
+            memory_parts.append(f"会话摘要：\n{memory_summary}")
+
+        if "shared_facts" in visible_keys and isinstance(shared_facts, dict) and shared_facts:
+            memory_parts.append(f"共享事实：\n{json.dumps(shared_facts, ensure_ascii=False)}")
+
+        if "retrieved_knowledge" in visible_keys and isinstance(retrieved_knowledge, dict) and retrieved_knowledge:
+            memory_parts.append(f"医疗知识检索结果：\n{json.dumps(retrieved_knowledge, ensure_ascii=False)}")
+
+        if "long_memory_items" in visible_keys and isinstance(long_memory_items, list) and long_memory_items:
+            safe_items = [f"- ({it.get('memory_type','fact')}) {it.get('text','')}" for it in long_memory_items[:4]]
+            memory_parts.append(
+                "召回长期记忆（可能不准确，仅供参考）：\n" + "\n".join(safe_items)
+            )
+
+        if "history_text" in visible_keys and history_text:
             memory_parts.append(f"近期对话历史：\n{history_text}")
-        
-        if long_memory_text and len(long_memory_text.strip()) > 0:
-            memory_parts.append(f"相关长期记忆：\n{long_memory_text}")
-        
+
         if memory_parts:
             return "\n\n".join(memory_parts)
         

@@ -6,6 +6,7 @@
 from typing import Dict, Any
 import json
 
+from app.core.agent.agent_card import AgentCard
 from app.core.agent.base_agent import BaseAgent
 from app.core.tools.lab_report_tool import LabReportTool
 from app.core.prompts import Prompts
@@ -142,3 +143,13 @@ class LabReportAgent(BaseAgent):
     
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("LAB_REPORT_AGENT")
+
+    def get_agent_card(self) -> AgentCard:
+        return AgentCard(
+            name=self.agent_name,
+            description="化验单指标解读与临床意义科普",
+            capabilities=["lab_report_interpret"],
+            keywords=["化验", "检验", "指标", "参考范围"],
+            visible_state_keys=["shared_facts", "retrieved_knowledge", "history_text"],
+            priority=2,
+        )

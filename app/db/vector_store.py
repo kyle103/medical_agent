@@ -29,6 +29,9 @@ def init_chroma_collection(*, collection_name: str):
     # 关闭 Chroma 的遥测（避免本地开发环境报 posthog capture 参数不兼容的噪音日志）
     # 需在 chromadb import/初始化前设置。
     os.environ.setdefault("ANONYMIZED_TELEMETRY", "False")
+    # 新版 chromadb 兼容：显式禁用 product telemetry 实现，避免 posthog 参数不兼容日志
+    os.environ.setdefault("CHROMA_PRODUCT_TELEMETRY_IMPL", "chromadb.telemetry.product.null.NullTelemetry")
+    os.environ.setdefault("CHROMA_TELEMETRY_IMPL", "chromadb.telemetry.product.null.NullTelemetry")
 
     try:
         import chromadb

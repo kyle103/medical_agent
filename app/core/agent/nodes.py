@@ -7,19 +7,23 @@ import logging
 from datetime import datetime
 
 from app.core.memory.memory_service import MemoryService
+from app.common.logger import get_logger
 from app.core.memory.long_memory_service import LongMemoryService
+from app.core.rag.medical_knowledge_service import MedicalKnowledgeService
+from app.core.rag.public_kb_service import PublicKnowledgeService
 from app.core.session.agent_state_store import AgentStateStore
 from app.core.llm.llm_service import LLMService
+from app.core.skills.medication_confirmation_skill import MedicationConfirmationSkill
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.lab_report_tool import LabReportTool
 
-logger = logging.getLogger(__name__)
+logger = get_logger(__name__)
 
 # 确保日志目录存在
 def ensure_log_directory():
-    log_dir = os.path.join(os.getcwd(), 'logs')
+    log_dir = os.path.join(os.getcwd(), "logs")
     os.makedirs(log_dir, exist_ok=True)
     return log_dir
 
@@ -181,6 +185,11 @@ async def memory_load(state: dict) -> dict:
         state["memory_summary"] = ""
         state["long_memory_items"] = []
         state["long_memory_text"] = ""
+        state["shared_facts"] = {}
+        state["private_scratchpads"] = {}
+        state["proposed_updates"] = []
+        state["skill_ctx"] = {}
+        state["retrieved_knowledge"] = {}
         return state
 
     mem = MemoryService()
@@ -188,6 +197,11 @@ async def memory_load(state: dict) -> dict:
     state["history"] = history
     state["history_text"] = _format_history(history, max_chars=1400)
     state["memory_summary"] = await mem.get_memory_summary(user_id=user_id, session_id=session_id)
+    state.setdefault("shared_facts", {})
+    state.setdefault("private_scratchpads", {})
+    state.setdefault("proposed_updates", [])
+    state.setdefault("skill_ctx", {})
+    state.setdefault("retrieved_knowledge", {})
 
     # 读取会话级运行状态（例如：待确认任务）
     try:
@@ -332,73 +346,168 @@ async def entity_extraction(state: dict) -> dict:
     return state
 
 
-async def agent_route(state: dict) -> dict:
-    """Agent路由：使用智能路由器进行意图识别和路由"""
-    from app.core.agent.smart_agent_router import SmartAgentRouter
-    
-    # 使用智能路由器进行意图分析和路由
-    router = SmartAgentRouter()
-    
+async def knowledge_retrieve(state: dict) -> dict:
+    """医疗专业知识检索（与长期记忆隔离）。"""
+    if state.get("error_msg"):
+        return state
+    start_time = time.time()
     try:
-        # 智能路由并执行
-        result_state = await router.route_and_execute(state)
-        
-        # 合并结果
-        state.update(result_state)
-        
-    except Exception as e:
-        logger.error(f"智能路由失败: {e}")
-        # 回退到简单路由
-        state = await _fallback_agent_route(state)
+        svc = MedicalKnowledgeService()
+        state["retrieved_knowledge"] = await svc.retrieve(
+            user_input=state.get("user_input", ""),
+            intent=state.get("intent", "general"),
+        )
+    except Exception:
+        state["retrieved_knowledge"] = {}
+
+    logger.info(
+        "knowledge_retrieve core intent=%s items=%s elapsed=%.3fs",
+        state.get("intent"),
+        len(state.get("retrieved_knowledge") or {}),
+        time.time() - start_time,
+    )
+
+    if state.get("intent") == "general":
+        try:
+            public_kb = PublicKnowledgeService()
+            state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(
+                query=state.get("user_input", ""),
+            )
+        except Exception:
+            state.setdefault("retrieved_knowledge", {})["public_kb"] = []
+        logger.info(
+            "knowledge_retrieve public_kb count=%s",
+            len((state.get("retrieved_knowledge") or {}).get("public_kb") or []),
+        )
+    return state
+
+
+def _route_by_intent_and_text(state: dict) -> dict:
+    """主路由规则：始终返回明确 target_agent。"""
+    intent = (state.get("intent") or "").strip().lower()
+    text = (state.get("user_input") or "").strip()
+    entities = state.get("extract_entities") or {}
+    drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
+
+    # 1) 基于明确意图直接路由
+    if intent == "lab":
+        return {
+            "target_agent": "lab_report_agent",
+            "intent_type": "lab_report",
+            "confidence": float(state.get("intent_confidence") or 0.9),
+            "reason": "route by intent=lab",
+        }
+    if intent == "archive":
+        return {
+            "target_agent": "main_qa_agent",
+            "intent_type": "archive",
+            "confidence": float(state.get("intent_confidence") or 0.9),
+            "reason": "route by intent=archive",
+        }
+    if intent == "general":
+        return {
+            "target_agent": "main_qa_agent",
+            "intent_type": "general",
+            "confidence": float(state.get("intent_confidence") or 0.8),
+            "reason": "route by intent=general",
+        }
+
+    # 2) drug 子意图细分
+    if intent == "drug":
+        conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
+        record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
+        delete_keywords = ["删除", "移除", "清空"]
+
+        is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
+        is_record = any(k in text for k in record_keywords)
+        is_delete = any(k in text for k in delete_keywords)
+
+        if is_conflict and not is_record and not is_delete:
+            return {
+                "target_agent": "drug_conflict_agent",
+                "intent_type": "drug_conflict",
+                "confidence": float(state.get("intent_confidence") or 0.85),
+                "reason": "route by drug conflict keywords",
+            }
+        if (is_record or is_delete) and not is_conflict:
+            return {
+                "target_agent": "drug_record_agent",
+                "intent_type": "drug_record",
+                "confidence": float(state.get("intent_confidence") or 0.85),
+                "reason": "route by drug record keywords",
+            }
+        if isinstance(drug_names, list) and len(drug_names) >= 2:
+            return {
+                "target_agent": "drug_conflict_agent",
+                "intent_type": "drug_conflict",
+                "confidence": float(state.get("intent_confidence") or 0.75),
+                "reason": "route by multi-drug entities",
+            }
+        return {
+            "target_agent": "drug_record_agent",
+            "intent_type": "drug_record",
+            "confidence": float(state.get("intent_confidence") or 0.7),
+            "reason": "route by drug default",
+        }
+
+    # 3) 当 intent 为空或异常时，按文本快速识别（仍属于主路由，不是兜底）
+    if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
+        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
+    if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
+        return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
+    if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):
+        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": 0.7, "reason": "route by text: drug record"}
+    if any(k in text for k in ["档案", "病历", "历史记录", "就诊"]):
+        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": 0.7, "reason": "route by text: archive"}
+    return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": 0.6, "reason": "route by text: default general"}
+
+
+async def agent_route(state: dict) -> dict:
+    """Agent路由：主路径必须写入 target_agent。"""
+    intent_result = _route_by_intent_and_text(state)
+    state["intent_analysis"] = intent_result
+    state["target_agent"] = intent_result["target_agent"]
+    state["intent_type"] = intent_result.get("intent_type", state.get("intent", "general"))
+
+    logger.info(
+        "agent_route selected target_agent=%s intent=%s intent_type=%s reason=%s",
+        state.get("target_agent"),
+        state.get("intent"),
+        state.get("intent_type"),
+        (state.get("intent_analysis") or {}).get("reason"),
+    )
     
     return state
 
 
 async def _fallback_agent_route(state: dict) -> dict:
-    """回退路由：当智能路由失败时使用简单规则"""
-    intent = state.get("intent")
-    user_input = state.get("user_input", "")
-    
-    # 根据意图确定目标Agent
-    if intent == "drug":
-        # 判断是药物冲突查询还是用药记录操作
-        if "添加" in user_input or "记录" in user_input or "吃了" in user_input or "服用" in user_input:
-            state["target_agent"] = "drug_record_agent"
-        else:
-            state["target_agent"] = "drug_conflict_agent"
-    elif intent == "lab":
-        state["target_agent"] = "lab_report_agent"
-    else:
-        # archive和general意图都由主要问答Agent处理
-        state["target_agent"] = "main_qa_agent"
-    
+    """历史兼容函数：统一走主路由规则。"""
+    out = _route_by_intent_and_text(state)
+    state["intent_analysis"] = out
+    state["target_agent"] = out["target_agent"]
+    state["intent_type"] = out.get("intent_type", state.get("intent", "general"))
     return state
 
 
 async def agent_execute(state: dict) -> dict:
     """Agent执行：调用对应的专业Agent处理请求"""
-    from app.core.agent.smart_agent_router import SmartAgentRouter
+    from app.core.agent.agent_router import AgentRouter
     
     target_agent = state.get("target_agent")
     
     if not target_agent:
-        state["error_msg"] = "无法确定处理请求的Agent"
+        state["error_msg"] = (
+            "路由异常：agent_route 未写入 target_agent "
+            f"(intent={state.get('intent')}, intent_type={state.get('intent_type')}, "
+            f"has_intent_analysis={bool(state.get('intent_analysis'))})"
+        )
         return state
     
-    # 使用智能路由器分发请求
-    router = SmartAgentRouter()
+    router = AgentRouter()
     
     try:
-        # 调用对应的Agent处理
         result_state = await router.route_and_execute(state)
-        
-        # 将Agent执行结果合并到state中
-        if "final_response" in result_state:
-            state["final_response"] = result_state["final_response"]
-        if "error_msg" in result_state:
-            state["error_msg"] = result_state["error_msg"]
-        if "tool_result" in result_state:
-            state["tool_result"] = result_state["tool_result"]
+        state.update(result_state)
             
     except Exception as e:
         state["error_msg"] = f"Agent执行失败: {str(e)}"
@@ -424,8 +533,11 @@ async def response_plan(state: dict) -> dict:
 
     # 当long_memory_text非空时，无条件注入长期记忆
     long_mem = (state.get("long_memory_text") or "").strip()
+    knowledge = state.get("retrieved_knowledge") or {}
     need_mem = _need_contextual_memory(user_input) or bool(long_mem)
-    if not (state.get("history") or state.get("memory_summary") or long_mem):
+    if knowledge:
+        need_mem = True
+    if not (state.get("history") or state.get("memory_summary") or long_mem or knowledge):
         need_mem = False
 
     state["response_mode"] = mode
@@ -458,6 +570,17 @@ async def llm_generate(state: dict) -> dict:
         mem_summary = _short_window_history(state.get("history") or [], max_turns=4)
 
     long_mem = (state.get("long_memory_text") or "").strip()
+    retrieved_knowledge = state.get("retrieved_knowledge") or {}
+    if retrieved_knowledge:
+        logger.info("llm_generate inject_knowledge keys=%s", list(retrieved_knowledge.keys()))
+
+    candidate_drug_events = state.get("candidate_drug_events")
+    if candidate_drug_events:
+        skill = MedicationConfirmationSkill()
+        state["llm_output"] = skill.build_confirmation_message(candidate_drug_events)
+        state["skill_ctx"] = state.get("skill_ctx") or {}
+        state["skill_ctx"]["medication_confirmation"] = {"candidate_events": candidate_drug_events}
+        return state
 
     if mode == "llm_format":
         system_prompt = (
@@ -472,6 +595,8 @@ async def llm_generate(state: dict) -> dict:
             user_prompt = f"长期记忆（用户历史偏好/事实，供参考，可能与本轮有关）：\n{long_mem}\n\n" + user_prompt
         if inject_memory and mem_summary:
             user_prompt = f"会话记忆（可能与本轮有关）：\n{mem_summary}\n\n" + user_prompt
+        if retrieved_knowledge:
+            user_prompt = f"医疗知识库检索结果（供参考）：\n{json.dumps(retrieved_knowledge, ensure_ascii=False)}\n\n" + user_prompt
     else:
         system_prompt = (
             "你是医疗问答助手，需要用自然的对话方式回答用户。\n"
@@ -487,28 +612,13 @@ async def llm_generate(state: dict) -> dict:
             parts.append("会话记忆：\n" + mem_summary)
         if content:
             parts.append("工具/检索结果：\n" + content)
+        if retrieved_knowledge:
+            parts.append("医疗知识库检索结果（供参考）：\n" + json.dumps(retrieved_knowledge, ensure_ascii=False))
         parts.append("用户输入：\n" + (state.get("user_input", "") or ""))
         user_prompt = "\n\n".join(parts)
 
     try:
         llm = LLMService()
-        
-        # 如果存在候选用药事件，修改prompt以包含确认请求
-        candidate_drug_events = state.get("candidate_drug_events")
-        if candidate_drug_events:
-            # 构建用药确认提示
-            confirm_prompts = []
-            for event in candidate_drug_events:
-                drug_name = event["drug_name"]
-                full_text = event["full_text"]
-                confirm_prompts.append(f"我已识别到你可能在记录用药：{drug_name}（来自：{full_text}）。是否帮你加入用药档案？（是/否）")
-            
-            # 将确认提示添加到用户输入中
-            confirmation_request = "\n\n".join(confirm_prompts)
-            user_prompt += f"\n\n{confirmation_request}"
-            
-            # 清除state中的候选用药事件，避免重复提示
-            state.pop("candidate_drug_events", None)
         
         raw = await llm.chat_completion(
             prompt=user_prompt,
@@ -803,6 +913,11 @@ async def _process_drug_confirmation(state: dict) -> dict:
     if user_input in ["是", "是的", "确认", "确定", "好", "好的", "y", "yes", "同意", "添加", "保存"]:
         # 获取候选用药事件
         candidate_drug_events = state.get("candidate_drug_events")
+        if not candidate_drug_events:
+            skill_ctx = state.get("skill_ctx") or {}
+            med_ctx = skill_ctx.get("medication_confirmation") if isinstance(skill_ctx, dict) else {}
+            if isinstance(med_ctx, dict):
+                candidate_drug_events = med_ctx.get("candidate_events")
         if candidate_drug_events and user_id:
             # 选择第一个用药事件进行多轮收集
             drug_event = candidate_drug_events[0]
@@ -842,7 +957,43 @@ async def output_check_and_disclaimer(state: dict) -> dict:
     confirmation_msgs = state.get("confirmation_messages", [])
     if confirmation_msgs:
         state["final_response"] += "\n\n" + "\n".join(confirmation_msgs)
+
+    proposed = state.get("proposed_updates") or []
+    proposed.append({"scope": "shared", "key": "latest_response", "value": state.get("final_response", ""), "source": "out"})
+    state["proposed_updates"] = proposed
     
+    return state
+
+
+async def commit_gate(state: dict) -> dict:
+    """提交门禁：仅允许白名单字段进入 shared_facts。"""
+    if state.get("error_msg"):
+        return state
+
+    shared = dict(state.get("shared_facts") or {})
+    allow_keys = {"intent", "target_agent", "extract_entities", "retrieved_knowledge", "latest_response"}
+
+    for item in (state.get("proposed_updates") or []):
+        if not isinstance(item, dict):
+            continue
+        if item.get("scope") != "shared":
+            continue
+        key = item.get("key")
+        if key in allow_keys:
+            shared[key] = item.get("value")
+
+    # 稳定写入高价值事实（即使没有显式提案）
+    if state.get("intent"):
+        shared["intent"] = state.get("intent")
+    if state.get("target_agent"):
+        shared["target_agent"] = state.get("target_agent")
+    if state.get("extract_entities"):
+        shared["extract_entities"] = state.get("extract_entities")
+    if state.get("retrieved_knowledge"):
+        shared["retrieved_knowledge"] = state.get("retrieved_knowledge")
+
+    state["shared_facts"] = shared
+    state["proposed_updates"] = []
     return state
 
 
@@ -894,6 +1045,9 @@ async def memory_update(state: dict) -> dict:
                     
                     if drug_info_list:
                         state["candidate_drug_events"] = drug_info_list
+                        skill_ctx = state.get("skill_ctx") or {}
+                        skill_ctx["medication_confirmation"] = {"candidate_events": drug_info_list}
+                        state["skill_ctx"] = skill_ctx
     except Exception as e:
         # 记录错误日志
         write_time = time.time() - start_time
