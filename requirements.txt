@@ -23,3 +23,4 @@ rank-bm25==0.2.2
 jieba==0.42.1
 pymilvus==2.4.6
 setuptools==75.8.0
+langfuse==2.43.0

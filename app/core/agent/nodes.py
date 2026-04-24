@@ -1,9 +1,6 @@
 from __future__ import annotations
 
-import json
-import os
 import time
-import logging
 from datetime import datetime
 
 from app.core.memory.memory_service import MemoryService
@@ -20,65 +17,6 @@ from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.lab_report_tool import LabReportTool
 
 logger = get_logger(__name__)
-
-# 确保日志目录存在
-def ensure_log_directory():
-    log_dir = os.path.join(os.getcwd(), "logs")
-    os.makedirs(log_dir, exist_ok=True)
-    return log_dir
-
-# 记录向量检索日志
-def log_vector_retrieval(user_id, session_id, query, results, retrieval_time, error=None):
-    log_dir = ensure_log_directory()
-    log_file = os.path.join(log_dir, 'vector_retrieval.log')
-    
-    log_record = {
-        'timestamp': datetime.now().isoformat(),
-        'level': 'ERROR' if error else 'INFO',
-        'message': 'Vector retrieval completed' if not error else f'Vector retrieval failed: {error}',
-        'extra': {
-            'user_id': user_id,
-            'session_id': session_id,
-            'query': query,
-            'retrieval_time': round(retrieval_time, 4),
-            'result_count': len(results),
-            'results': results
-        }
-    }
-    
-    # 写入日志文件
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(log_record) + '\n')
-
-# 记录向量库写入日志
-def log_vector_store_write(user_id, session_id, items, write_time, error=None):
-    log_dir = ensure_log_directory()
-    log_file = os.path.join(log_dir, 'vector_retrieval.log')
-    
-    log_record = {
-        'timestamp': datetime.now().isoformat(),
-        'level': 'ERROR' if error else 'INFO',
-        'message': 'Vector store write completed' if not error else f'Vector store write failed: {error}',
-        'extra': {
-            'user_id': user_id,
-            'session_id': session_id,
-            'write_time': round(write_time, 4),
-            'item_count': len(items),
-            'items': [
-                {
-                    'memory_id': item.memory_id,
-                    'text': item.text,
-                    'memory_type': item.memory_type,
-                    'confidence': item.confidence
-                }
-                for item in items
-            ]
-        }
-    }
-    
-    # 写入日志文件
-    with open(log_file, 'a', encoding='utf-8') as f:
-        f.write(json.dumps(log_record) + '\n')
 
 
 INTENTS = {
@@ -264,37 +202,17 @@ async def memory_load(state: dict) -> dict:
             if filtered_items:
                 state["long_memory_text"] = "\n".join([f"- {it.text}" for it in filtered_items])
             
-            # 记录向量检索日志
-            retrieval_time = time.time() - start_time
-            log_vector_retrieval(
-                user_id=user_id,
-                session_id=session_id,
-                query=query,
-                results=[
-                    {
-                        "memory_id": it.memory_id,
-                        "text": it.text,
-                        "memory_type": it.memory_type,
-                        "source": it.source,
-                        "session_id": it.session_id,
-                        "created_at": str(it.created_at)
-                    }
-                    for it in filtered_items
-                ],
-                retrieval_time=retrieval_time
+            retrieval_time_ms = int((time.time() - start_time) * 1000)
+            logger.info(
+                "long_memory recall done count=%s cost_ms=%s",
+                len(filtered_items),
+                retrieval_time_ms,
             )
-    except Exception as e:
-        # 记录错误日志
-        log_vector_retrieval(
-            user_id=user_id,
-            session_id=session_id,
-            query=state.get("user_input", ""),
-            results=[],
-            retrieval_time=0.0,
-            error=str(e)
-        )
-        print(f"长期记忆召回失败: {e}")
-        pass
+    except Exception:
+        logger.exception("long_memory recall failed")
+
+    if not state.get("long_memory_items"):
+        logger.debug("long_memory recall empty")
 
     return state
 
@@ -1015,13 +933,11 @@ async def memory_update(state: dict) -> dict:
             items = await svc.extract_candidates(user_input=state.get("user_input", ""))
             if items:
                 await svc.add_items(user_id=state["user_id"], session_id=state["session_id"], items=items)
-                # 记录向量库写入日志
-                write_time = time.time() - start_time
-                log_vector_store_write(
-                    user_id=state["user_id"],
-                    session_id=state["session_id"],
-                    items=items,
-                    write_time=write_time
+                write_time_ms = int((time.time() - start_time) * 1000)
+                logger.info(
+                    "long_memory write done count=%s cost_ms=%s",
+                    len(items),
+                    write_time_ms,
                 )
                 
                 # 检查是否有用药事件，如果有则添加到state中，用于后续提示用户确认是否写入档案
@@ -1048,17 +964,8 @@ async def memory_update(state: dict) -> dict:
                         skill_ctx = state.get("skill_ctx") or {}
                         skill_ctx["medication_confirmation"] = {"candidate_events": drug_info_list}
                         state["skill_ctx"] = skill_ctx
-    except Exception as e:
-        # 记录错误日志
-        write_time = time.time() - start_time
-        log_vector_store_write(
-            user_id=state.get("user_id", "unknown"),
-            session_id=state.get("session_id", "unknown"),
-            items=[],
-            write_time=write_time,
-            error=str(e)
-        )
-        pass
+    except Exception:
+        logger.exception("long_memory write failed")
 
     # 持久化会话级运行状态（最小化：仅保存待确认信息）
     try:

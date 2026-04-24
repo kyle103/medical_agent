@@ -4,6 +4,7 @@ import asyncio
 import logging
 
 from app.common.exceptions import LLMCallException
+from app.common.langfuse_helper import elapsed_ms, time_block, track_llm_call
 from app.config.settings import settings
 
 logger = logging.getLogger(__name__)
@@ -30,6 +31,7 @@ class LLMService:
         timeout_s: float | None = None,
         max_tokens: int | None = None,
     ) -> str:
+        start = time_block()
         try:
             client = self._get_client()
             coro = client.chat.completions.create(
@@ -47,11 +49,41 @@ class LLMService:
 
             if stream:
                 raise LLMCallException("当前调用不支持 stream=True")
+            usage = getattr(resp, "usage", None)
+            if isinstance(usage, dict):
+                input_tokens = usage.get("prompt_tokens")
+                output_tokens = usage.get("completion_tokens")
+                total_tokens = usage.get("total_tokens")
+            else:
+                input_tokens = getattr(usage, "prompt_tokens", None)
+                output_tokens = getattr(usage, "completion_tokens", None)
+                total_tokens = getattr(usage, "total_tokens", None)
+
+            track_llm_call(
+                model=settings.LLM_MODEL_NAME,
+                latency_ms=elapsed_ms(start),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                success=True,
+            )
 
             return resp.choices[0].message.content or ""
         except asyncio.TimeoutError as e:
             logger.warning("LLM调用超时(%.2fs)", float(timeout_s or 0))
+            track_llm_call(
+                model=settings.LLM_MODEL_NAME,
+                latency_ms=elapsed_ms(start),
+                success=False,
+                error="timeout",
+            )
             raise LLMCallException("大模型调用超时") from e
         except Exception as e:
             logger.error("LLM调用失败: %s", str(e))
+            track_llm_call(
+                model=settings.LLM_MODEL_NAME,
+                latency_ms=elapsed_ms(start),
+                success=False,
+                error="call_failed",
+            )
             raise LLMCallException("大模型调用失败") from e

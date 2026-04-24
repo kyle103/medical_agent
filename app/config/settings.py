@@ -92,6 +92,10 @@ class Settings(BaseSettings):
 
     # Misc
     APP_ENV: str = Field(default="local")
+    LANGFUSE_PUBLIC_KEY: str = Field(default="")
+    LANGFUSE_SECRET_KEY: str = Field(default="")
+    LANGFUSE_HOST: str = Field(default="")
+    LANGSMITH_TRACING: bool = False
 
 
 settings = Settings()
