@@ -26,9 +26,11 @@ ENV/
 /data/chroma/
 # Source data
 /data/source_data/
-
+/data/export/
 # Pytest
 .pytest_cache/
 
+# tests
+/tests/
 # IDE
 .vscode/

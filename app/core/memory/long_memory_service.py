@@ -4,12 +4,20 @@ import re
 import time
 import uuid
 from dataclasses import dataclass
+import json
 
 from app.core.utils.text_splitter import TextSplitter
 from app.common.exceptions import ServiceUnavailableException
 from app.core.llm.llm_service import LLMService
 from app.core.prompts import Prompts
-from app.db.vector_store import init_chroma_collection
+from app.core.llm.embedding_service import EmbeddingService
+from app.db.milvus_store import (
+    ensure_long_memory_collection,
+    get_milvus_client,
+    insert_long_memory,
+    parse_metadata,
+    vector_search,
+)
 
 
 DEFAULT_COLLECTION = "user_long_memory"
@@ -44,7 +52,7 @@ class LongMemoryItem:
 
 
 class LongMemoryService:
-    """基于向量库（Chroma file persist）的长期记忆服务。
+    """基于云端向量库（Milvus）的长期记忆服务。
 
     设计目标：
     - 与 DB 全量对话分离：这里只存“可复用事实/偏好/画像摘要”，用于语义召回。
@@ -55,14 +63,15 @@ class LongMemoryService:
     def __init__(self, *, collection_name: str = DEFAULT_COLLECTION):
         self.collection_name = collection_name
         self.llm_service = LLMService()
+        self.embedder = EmbeddingService()
 
-    def _collection(self):
-        return init_chroma_collection(collection_name=self.collection_name)
+    def _escape_expr_value(self, text: str) -> str:
+        return (text or "").replace("\\", "\\\\").replace('"', '\\"')
 
     def is_enabled(self) -> bool:
         try:
-            # init_chroma_collection 内部会校验 VECTOR_STORE_TYPE
-            self._collection()
+            # 使用 Milvus 作为长期记忆向量库
+            _ = get_milvus_client()
             return True
         except ServiceUnavailableException:
             return False
@@ -232,8 +241,6 @@ class LongMemoryService:
             if not unique_items:
                 return 0
 
-            col = self._collection()
-
             ids: list[str] = []
             docs: list[str] = []
             metas: list[dict] = []
@@ -261,7 +268,28 @@ class LongMemoryService:
                     docs.append(it.text)
                     metas.append(it.to_metadata(user_id=user_id))
 
-            col.add(ids=ids, documents=docs, metadatas=metas)
+            if not docs:
+                return 0
+
+            embeddings = await self.embedder.embed_documents(docs)
+            if not embeddings:
+                return 0
+
+            ensure_long_memory_collection(
+                collection_name=self.collection_name,
+                dim=len(embeddings[0]),
+            )
+
+            json_metas = [json.dumps(m, ensure_ascii=False) for m in metas]
+            user_ids = [user_id for _ in ids]
+            insert_long_memory(
+                collection_name=self.collection_name,
+                ids=ids,
+                user_ids=user_ids,
+                documents=docs,
+                metadatas=json_metas,
+                embeddings=embeddings,
+            )
             return len(ids) if isinstance(ids, list) else 0
         except Exception as e:
             # 出错时默认返回0，避免阻塞主流程
@@ -302,34 +330,34 @@ class LongMemoryService:
         """检查文本是否与已有记忆重复。"""
         
         try:
-            col = self._collection()
-            # 搜索相似记忆
-            res = col.query(
-                query_texts=[text],
-                n_results=5,
-                where={"user_id": user_id}
-            )
-            
-            # 确保docs是列表
-            docs = res.get("documents")
-            if not isinstance(docs, list) or not docs:
+            vectors = await self.embedder.embed_documents([text])
+            if not vectors:
                 return False
-            
-            # 获取第一个结果集
-            first_docs = docs[0] if isinstance(docs[0], list) else []
-            if not isinstance(first_docs, list):
+
+            expr_user = self._escape_expr_value(user_id)
+            try:
+                hits = vector_search(
+                    collection_name=self.collection_name,
+                    query_vectors=vectors,
+                    limit=5,
+                    output_fields=["document", "metadata", "user_id"],
+                    filter_expr=f'user_id == "{expr_user}"',
+                )
+            except ServiceUnavailableException:
+                return False
+
+            if not hits:
                 return False
             
             # 改进的文本相似度判断
-            for doc in first_docs:
+            for hit in hits:
+                entity = hit.get("entity") or {}
+                doc = entity.get("document")
                 if isinstance(doc, str):
-                    # 完全相同
                     if text == doc:
                         return True
-                    # 检查文本是否高度相似（例如，一个是另一个的子集）
                     if text in doc or doc in text:
                         return True
-                    # 检查是否包含相同的关键信息（如药物名称）
                     if await self._has_same_key_information(text, doc):
                         return True
         except Exception as e:
@@ -401,47 +429,39 @@ class LongMemoryService:
         
         return False
 
-    def recall(self, *, user_id: str, query: str, top_k: int = 3) -> list[LongMemoryItem]:
+    async def recall(self, *, user_id: str, query: str, top_k: int = 3) -> list[LongMemoryItem]:
         if not user_id:
             return []
         q = (query or "").strip()
         if not q:
             return []
 
-        col = self._collection()
-        res = col.query(query_texts=[q], n_results=max(1, int(top_k)), where={"user_id": user_id})
+        vectors = await self.embedder.embed_documents([q])
+        if not vectors:
+            return []
 
-        # 处理ids
-        ids = res.get("ids")
-        if not isinstance(ids, list) or not ids:
+        expr_user = self._escape_expr_value(user_id)
+        try:
+            hits = vector_search(
+                collection_name=self.collection_name,
+                query_vectors=vectors,
+                limit=max(1, int(top_k)),
+                output_fields=["document", "metadata", "user_id"],
+                filter_expr=f'user_id == "{expr_user}"',
+            )
+        except ServiceUnavailableException:
             return []
-        first_ids = ids[0] if isinstance(ids[0], list) else []
-        if not isinstance(first_ids, list):
+        if not hits:
             return []
-        
-        # 处理docs
-        docs = res.get("documents")
-        if not isinstance(docs, list) or not docs:
-            return []
-        first_docs = docs[0] if isinstance(docs[0], list) else []
-        if not isinstance(first_docs, list):
-            return []
-        
-        # 处理metas
-        metas = res.get("metadatas")
-        if not isinstance(metas, list) or not metas:
-            metas = [[]]
-        first_metas = metas[0] if isinstance(metas[0], list) else []
-        if not isinstance(first_metas, list):
-            first_metas = []
 
         out: list[LongMemoryItem] = []
-        for i in range(min(len(first_ids), len(first_docs))):
-            md = first_metas[i] if i < len(first_metas) and isinstance(first_metas[i], dict) else {}
+        for hit in hits:
+            entity = hit.get("entity") or {}
+            md = parse_metadata(entity.get("metadata"))
             out.append(
                 LongMemoryItem(
-                    memory_id=str(first_ids[i]),
-                    text=str(first_docs[i] or ""),
+                    memory_id=str(hit.get("id") or ""),
+                    text=str(entity.get("document") or ""),
                     memory_type=str(md.get("memory_type") or "fact"),
                     source=str(md.get("source") or "chat"),
                     session_id=str(md.get("session_id") or "") or None,

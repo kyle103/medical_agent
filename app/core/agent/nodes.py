@@ -222,7 +222,7 @@ async def memory_load(state: dict) -> dict:
         query = state.get("user_input", "")
         if svc.is_enabled():
             # 增大召回top_k到6，获取更多候选结果
-            items = svc.recall(user_id=user_id, query=query, top_k=6)
+            items = await svc.recall(user_id=user_id, query=query, top_k=6)
             
             # 二次筛选：优先保留包含药物名称的记忆，然后保留其他记忆
             drug_keywords = ["药", "药物", "服用", "吃了", "吃过", "布洛芬", "阿司匹林", "抗生素", "降压药", "降糖药"]

@@ -7,7 +7,7 @@ from app.config.settings import settings
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Refresh BM25 cache for public KB")
+    parser = argparse.ArgumentParser(description="No-op for Milvus public KB (LIKE retrieval)")
     parser.add_argument(
         "--collection",
         type=str,
@@ -17,8 +17,8 @@ def main() -> None:
     args = parser.parse_args()
 
     count = PublicKnowledgeService.refresh_cache(collection_name=args.collection)
-    collection = args.collection or settings.PUBLIC_KB_COLLECTION
-    print(f"BM25 cache refreshed: collection={collection} docs={count}")
+    collection = args.collection or settings.MILVUS_PUBLIC_KB_COLLECTION
+    print(f"Milvus LIKE retrieval uses no local cache: collection={collection} docs={count}")
 
 
 if __name__ == "__main__":

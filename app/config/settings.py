@@ -61,6 +61,10 @@ class Settings(BaseSettings):
     QDRANT_HOST: str = Field(default="{{Qdrant地址}}")
     QDRANT_PORT: int = Field(default=6333)
     QDRANT_API_KEY: str = Field(default="{{Qdrant API密钥}}")
+    MILVUS_URI: str = Field(default="{{Milvus地址}}")
+    MILVUS_TOKEN: str = Field(default="{{Milvus Token}}")
+    MILVUS_PUBLIC_KB_COLLECTION: str = Field(default="kb_general")
+    MILVUS_LONG_MEMORY_COLLECTION: str = Field(default="user_long_memory")
 
     # Public KB
     PUBLIC_KB_COLLECTION: str = Field(default="kb_general")
