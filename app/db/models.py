@@ -119,11 +119,17 @@ class UserDrugRecord(Base):
     end_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     prescribe_hospital: Mapped[str | None] = mapped_column(String(128), nullable=True)
     remark: Mapped[str | None] = mapped_column(Text, nullable=True)
+    idempotent_key: Mapped[str | None] = mapped_column(String(32), unique=True, index=True, nullable=True)
     create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
     update_time: Mapped[datetime] = mapped_column(
         DateTime, server_default=func.now(), onupdate=func.now()
     )
     is_deleted: Mapped[int] = mapped_column(Integer, default=0)
+
+    __table_args__ = (
+        Index("idx_user_drug_dedup", "user_id", "drug_name", "dosage", "is_deleted"),
+        Index("idx_idempotent_key", "idempotent_key"),
+    )
 
 
 class UserLabReportRecord(Base):

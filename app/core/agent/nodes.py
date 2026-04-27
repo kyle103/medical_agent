@@ -1,75 +1,74 @@
 from __future__ import annotations
 
+import asyncio
+import json
+import re
 import time
-from datetime import datetime
+from datetime import date, datetime
 
-from app.core.memory.memory_service import MemoryService
+from sqlalchemy import and_, select
+
 from app.common.logger import get_logger
+from app.core.agent.intent_classifier import IntentClassifier
+from app.core.agent.state import ExecutionPlan, PlanStep
+from app.core.llm.llm_service import LLMService
 from app.core.memory.long_memory_service import LongMemoryService
+from app.core.memory.memory_service import MemoryService
 from app.core.rag.medical_knowledge_service import MedicalKnowledgeService
 from app.core.rag.public_kb_service import PublicKnowledgeService
 from app.core.session.agent_state_store import AgentStateStore
-from app.core.llm.llm_service import LLMService
+from app.core.skills.drug_record_state_machine import DrugRecordPhase, DrugRecordStateMachine
+from app.core.skills.input_classifier import InputClassifier
 from app.core.skills.medication_confirmation_skill import MedicationConfirmationSkill
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
-from app.core.tools.drug_interaction_tool import DrugInteractionTool
-from app.core.tools.lab_report_tool import LabReportTool
+from app.core.tools.drug_record_tool import DrugRecordTool
+
+from app.db.database import get_sessionmaker
+from app.db.models import UserDrugRecord
 
 logger = get_logger(__name__)
-
 
 INTENTS = {
     "archive": "档案查询",
     "drug": "药物相关（冲突查询/用药记录添加）",
     "lab": "化验单解读",
-    "general": "通用问答"
+    "general": "通用问答",
 }
 
 
 def _need_contextual_memory(user_input: str) -> bool:
-    """无需显式提示词的上下文需求判定（轻量规则）。"""
     t = (user_input or "").strip()
     if not t:
         return False
 
-    # 用药陈述类 - 这些是新的独立陈述，不需要上下文
-    # 检查是否包含用药陈述关键词，但排除作为其他词汇一部分的情况
     contains_drug_statement = (
-        "吃了" in t or "服用" in t or "用了" in t or 
-        "需要添加用药记录" in t or "添加用药" in t
+        "吃了" in t or "服用" in t or "用了" in t
+        or "需要添加用药记录" in t or "添加用药" in t
     )
-    # 排除特定组合词，但保留独立的用药记录请求
     exclude_combinations = ["吃药", "服药"]
     is_excluded = any(combo in t for combo in exclude_combinations) and "需要添加用药记录" not in t and "添加用药" not in t
-    
+
     if contains_drug_statement and not is_excluded:
-        # 检查是否是询问之前的用药而非陈述当前用药
         if not any(query in t for query in ["吃什么药", "什么药", "哪些药", "哪种药"]):
             return False
 
-    # 特殊回忆用药场景
     if "记得" in t and "药" in t:
         return True
 
-    # 短追问/承接
     if len(t) <= 12:
-        # 排除简单的陈述性语句
         simple_statements = ["我有", "我是", "我在", "我要", "我想"]
         if not any(statement in t for statement in simple_statements):
             return True
 
-    # 指代/省略
     pronouns = ["那个", "它", "这", "这样", "上面", "刚才", "之前", "继续", "然后", "还要", "还用", "还需要"]
     if any(p in t for p in pronouns):
         return True
 
-    # 回忆/核对类
     recall = ["总结", "回顾", "复盘", "你还记得", "你记得", "还记得", "之前", "刚才", "上次", "昨天", "今天", "最近", "回顾", "总结"]
     if any(k in t for k in recall):
         return True
 
-    # 用药追问类
     drug_queries = ["吃过什么药", "吃了什么药", "服用过什么", "用过什么药", "今天吃了什么药", "昨天吃了什么药"]
     if any(q in t for q in drug_queries):
         return True
@@ -104,13 +103,247 @@ def _format_history(history: list[dict], max_chars: int = 1400) -> str:
     return text[-max_chars:]
 
 
+def _split_user_queries(text: str) -> list[str]:
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[。！？!?；;]+", raw)
+    parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
+    out: list[str] = []
+    for p in parts:
+        sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
+        for s in sub:
+            s = s.strip(" ，,")
+            if s:
+                out.append(s)
+    dedup: list[str] = []
+    seen = set()
+    for q in out:
+        if q in seen:
+            continue
+        seen.add(q)
+        dedup.append(q)
+    return dedup
+
+
+def _route_by_intent_and_text(state: dict) -> dict:
+    intent = (state.get("intent") or "").strip().lower()
+    text = state.get("user_input", "").strip()
+    entities = state.get("extract_entities") or {}
+    drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
+
+    if intent == "lab":
+        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=lab"}
+    if intent == "archive":
+        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=archive"}
+    if intent == "general":
+        return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": float(state.get("intent_confidence") or 0.8), "reason": "route by intent=general"}
+
+    if intent == "drug":
+        conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
+        record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
+        delete_keywords = ["删除", "移除", "清空"]
+
+        is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
+        is_record = any(k in text for k in record_keywords)
+        is_delete = any(k in text for k in delete_keywords)
+
+        if is_conflict and not is_record and not is_delete:
+            return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug conflict keywords"}
+        if (is_record or is_delete) and not is_conflict:
+            return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug record keywords"}
+        if isinstance(drug_names, list) and len(drug_names) >= 2:
+            return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.75), "reason": "route by multi-drug entities"}
+        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.7), "reason": "route by drug default"}
+
+    if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
+        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
+    if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
+        return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
+    if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):
+        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": 0.7, "reason": "route by text: drug record"}
+    if any(k in text for k in ["档案", "病历", "历史记录", "就诊"]):
+        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": 0.7, "reason": "route by text: archive"}
+    return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": 0.6, "reason": "route by text: default general"}
+
+
+async def _predict_intent_for_query(query: str) -> dict | None:
+    try:
+        clf = IntentClassifier()
+        sub_intent = await clf.predict(text=query, stream=False)
+        return {"intent": sub_intent.intent, "confidence": sub_intent.confidence, "reason": sub_intent.reason}
+    except Exception:
+        return None
+
+
+def _detect_dependencies(query: str, previous_queries: list[str]) -> list[str]:
+    deps: list[str] = []
+    pronouns = ["它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还有"]
+    if any(p in query for p in pronouns):
+        for i, _ in enumerate(previous_queries):
+            deps.append(f"s{i + 1}")
+    return deps
+
+
+async def _extract_drug_info_from_text(text: str) -> dict:
+    drug_info: dict = {"dosage": "未指定", "frequency": "未指定", "start_date_text": "未指定", "purpose": "未指定"}
+
+    dosage_patterns = [
+        r"(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)",
+        r"(一次|每次)\s*(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)",
+        r"(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)\s*(一次|每次)",
+    ]
+    frequency_patterns = [
+        r"(一天|每日)\s*(\d+)\s*次",
+        r"(\d+)\s*次\s*(一天|每日)",
+        r"(早晚|早中晚|早中晚各一次|早晚各一次|早中晚各一次)",
+        r"(需要时|必要时|疼痛时|不适时)",
+    ]
+    start_date_patterns = [
+        r"(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})",
+        r"(从|自)\s*(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})",
+        r"(开始|起)\s*(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})",
+    ]
+    purpose_patterns = [
+        r"(用于|治疗|缓解|针对)\s*([^，。！？]{1,20})",
+        r"(因为|由于)\s*([^，。！？]{1,20})\s*(而|所以)",
+        r"(头痛|发烧|感冒|疼痛|炎症|高血压|糖尿病|冠心病|哮喘)",
+    ]
+
+    for pattern in dosage_patterns:
+        match = re.search(pattern, text)
+        if match:
+            drug_info["dosage"] = match.group(0)
+            break
+    for pattern in frequency_patterns:
+        match = re.search(pattern, text)
+        if match:
+            drug_info["frequency"] = match.group(0)
+            break
+    for pattern in start_date_patterns:
+        match = re.search(pattern, text)
+        if match:
+            drug_info["start_date_text"] = match.group(1) if match.groups() else match.group(0)
+            break
+    for pattern in purpose_patterns:
+        match = re.search(pattern, text)
+        if match:
+            drug_info["purpose"] = match.group(2) if len(match.groups()) > 1 else match.group(1)
+            break
+
+    return drug_info
+
+
+async def _commit_drug_record(user_id: str, sm: DrugRecordStateMachine) -> dict:
+    tool = DrugRecordTool()
+    info = sm.collected_info
+    start_date = None
+    date_text = info.get("start_date_text", "")
+    if date_text and date_text != "未指定":
+        start_date = tool._parse_date_text(date_text)
+
+    result = await tool.add_record(
+        user_id=user_id,
+        drug_name=sm.drug_name,
+        dosage=info.get("dosage", "未指定"),
+        frequency=info.get("frequency", "未指定"),
+        time_text=date_text if date_text != "未指定" else "",
+        start_date=start_date,
+    )
+    return result
+
+
+async def _process_drug_record_state_machine(state: dict) -> dict:
+    user_input = (state.get("user_input") or "").strip()
+    user_id = state.get("user_id")
+
+    sm_data = (state.get("private_scratchpads") or {}).get("drug_record_sm")
+
+    if sm_data:
+        sm = DrugRecordStateMachine.from_dict(sm_data)
+
+        if sm.is_expired():
+            sm.transition(DrugRecordPhase.EXPIRED)
+            state.setdefault("private_scratchpads", {})["drug_record_sm"] = None
+            state["final_response"] = "用药记录收集已超时取消。如需重新记录，请随时告诉我。"
+            return state
+
+        input_type = InputClassifier.classify(user_input, sm.current_field)
+
+        if input_type == "negative":
+            sm.transition(DrugRecordPhase.CANCELLED)
+            state.setdefault("private_scratchpads", {})["drug_record_sm"] = None
+            state["final_response"] = "好的，已取消用药记录收集。"
+            return state
+
+        if sm.phase == DrugRecordPhase.COLLECTING:
+            if input_type == "irrelevant":
+                result = sm.handle_irrelevant_input(user_input)
+                if result["phase"] == "cancelled":
+                    state.setdefault("private_scratchpads", {})["drug_record_sm"] = None
+                    state["final_response"] = result["message"]
+                    return state
+                state["final_response"] = result["message"]
+                state.setdefault("private_scratchpads", {})["drug_record_sm"] = sm.to_dict()
+                return state
+
+            result = sm.collect_answer(user_input)
+            if result["phase"] == "confirming":
+                state["final_response"] = result["summary"]
+            else:
+                state["final_response"] = result["question"]
+            state.setdefault("private_scratchpads", {})["drug_record_sm"] = sm.to_dict()
+            return state
+
+        if sm.phase == DrugRecordPhase.CONFIRMING:
+            if input_type == "affirmative":
+                commit_result = await _commit_drug_record(user_id, sm)
+                sm.transition(DrugRecordPhase.COMMITTED)
+                state.setdefault("private_scratchpads", {})["drug_record_sm"] = None
+                if commit_result.get("created"):
+                    state["final_response"] = f"已为您记录用药信息：{sm.drug_name}。如需修改，请随时告诉我。"
+                else:
+                    state["final_response"] = commit_result.get("message", "用药记录已存在。")
+                return state
+            elif input_type == "negative":
+                sm.transition(DrugRecordPhase.CANCELLED)
+                state.setdefault("private_scratchpads", {})["drug_record_sm"] = None
+                state["final_response"] = "好的，已取消用药记录。"
+                return state
+            else:
+                sm.transition(DrugRecordPhase.COLLECTING)
+                result = sm.collect_answer(user_input)
+                state["final_response"] = result.get("question", result.get("summary", ""))
+                state.setdefault("private_scratchpads", {})["drug_record_sm"] = sm.to_dict()
+                return state
+
+    candidate_events = state.get("candidate_drug_events")
+    if candidate_events and user_id:
+        drug_event = candidate_events[0]
+        extracted = await _extract_drug_info_from_text(drug_event.get("full_text", ""))
+
+        sm = DrugRecordStateMachine(drug_name=drug_event["drug_name"], initial_info=extracted)
+        sm.transition(DrugRecordPhase.COLLECTING)
+
+        missing = sm.get_missing_fields()
+        if not missing:
+            sm.transition(DrugRecordPhase.CONFIRMING)
+            state["final_response"] = sm.confirmation_summary
+        else:
+            question = sm.next_question()
+            state["final_response"] = question
+
+        state.setdefault("private_scratchpads", {})["drug_record_sm"] = sm.to_dict()
+        state.pop("candidate_drug_events", None)
+
+    return state
+
+
 async def input_check(state: dict) -> dict:
-    # 合规检查已禁用
     return state
 
 
 async def memory_load(state: dict) -> dict:
-    """短期记忆加载：读取 user_id + session_id 最近对话，供后续节点使用。"""
     if state.get("error_msg"):
         return state
 
@@ -141,17 +374,19 @@ async def memory_load(state: dict) -> dict:
     state.setdefault("skill_ctx", {})
     state.setdefault("retrieved_knowledge", {})
 
-    # 读取会话级运行状态（例如：待确认任务）
     try:
         rt_state = await AgentStateStore().get_state(user_id=user_id, session_id=session_id)
         state["session_runtime_state"] = rt_state
         pending = rt_state.get("pending_confirmation") if isinstance(rt_state, dict) else None
         if isinstance(pending, dict):
             state["pending_confirmation"] = pending
+
+        saved_sm = (rt_state.get("private_scratchpads") or {}).get("drug_record_sm") if isinstance(rt_state, dict) else None
+        if saved_sm:
+            state.setdefault("private_scratchpads", {})["drug_record_sm"] = saved_sm
     except Exception:
         state["session_runtime_state"] = {}
 
-    # 长期记忆召回（向量库）：不影响主流程，失败则忽略
     state["long_memory_items"] = []
     state["long_memory_text"] = ""
     try:
@@ -159,55 +394,36 @@ async def memory_load(state: dict) -> dict:
         svc = LongMemoryService()
         query = state.get("user_input", "")
         if svc.is_enabled():
-            # 增大召回top_k到6，获取更多候选结果
             items = await svc.recall(user_id=user_id, query=query, top_k=6)
-            
-            # 二次筛选：优先保留包含药物名称的记忆，然后保留其他记忆
+
             drug_keywords = ["药", "药物", "服用", "吃了", "吃过", "布洛芬", "阿司匹林", "抗生素", "降压药", "降糖药"]
             drug_related_items = []
             other_items = []
-            
+
             seen = set()
             for it in items:
                 if it.memory_id in seen:
                     continue
                 seen.add(it.memory_id)
-                
-                # 检查是否包含药物相关关键词（对中文不做lower处理）
-                text = it.text
-                is_drug_related = any(keyword in text for keyword in drug_keywords)
-                
+                text_val = it.text
+                is_drug_related = any(keyword in text_val for keyword in drug_keywords)
                 if is_drug_related:
                     drug_related_items.append(it)
                 else:
                     other_items.append(it)
-            
-            # 合并结果，药物相关记忆优先
+
             filtered_items = drug_related_items + other_items
-            # 最终保留最多5个记忆项
             filtered_items = filtered_items[:5]
-            
+
             state["long_memory_items"] = [
-                {
-                    "memory_id": it.memory_id,
-                    "text": it.text,
-                    "memory_type": it.memory_type,
-                    "source": it.source,
-                    "session_id": it.session_id,
-                    "created_at": it.created_at,
-                }
+                {"memory_id": it.memory_id, "text": it.text, "memory_type": it.memory_type, "source": it.source, "session_id": it.session_id, "created_at": it.created_at}
                 for it in filtered_items
             ]
-            
             if filtered_items:
                 state["long_memory_text"] = "\n".join([f"- {it.text}" for it in filtered_items])
-            
+
             retrieval_time_ms = int((time.time() - start_time) * 1000)
-            logger.info(
-                "long_memory recall done count=%s cost_ms=%s",
-                len(filtered_items),
-                retrieval_time_ms,
-            )
+            logger.info("long_memory recall done count=%s cost_ms=%s", len(filtered_items), retrieval_time_ms)
     except Exception:
         logger.exception("long_memory recall failed")
 
@@ -218,25 +434,9 @@ async def memory_load(state: dict) -> dict:
 
 
 async def intent_recognition(state: dict) -> dict:
-    """意图识别节点（应用级）。
-
-    - 优先使用规则分类，稳定可控
-    - 如用户已配置 LLM，则用 LLM 做可选增强（并具备失败回退）
-    - 只做意图分类，不做任何医疗结论生成
-    """
-
     from app.core.agent.intent_classifier import IntentClassifier
 
     text = state.get("user_input", "").strip().lower()
-    user_id = state.get("user_id", "")
-    session_id = state.get("session_id", "")
-    
-    # 检查用户是否在确认添加用药记录
-    if text in ["是", "是的", "确认", "确定", "好", "好的", "y", "yes", "同意", "添加", "保存"]:
-        # 如果用户确认，检查是否存在待确认的用药事件
-        if "candidate_drug_events" in state:
-            # 将候选用药事件移动到待确认列表
-            state["pending_drug_events_for_confirmation"] = state.pop("candidate_drug_events")
 
     clf = IntentClassifier()
     res = await clf.predict(text=text, stream=bool(state.get("stream", False)))
@@ -244,7 +444,7 @@ async def intent_recognition(state: dict) -> dict:
     state["intent"] = res.intent
     state["intent_confidence"] = res.confidence
     state["intent_reason"] = res.reason
-    
+
     return state
 
 
@@ -265,7 +465,6 @@ async def entity_extraction(state: dict) -> dict:
 
 
 async def knowledge_retrieve(state: dict) -> dict:
-    """医疗专业知识检索（与长期记忆隔离）。"""
     if state.get("error_msg"):
         return state
     start_time = time.time()
@@ -278,178 +477,243 @@ async def knowledge_retrieve(state: dict) -> dict:
     except Exception:
         state["retrieved_knowledge"] = {}
 
-    logger.info(
-        "knowledge_retrieve core intent=%s items=%s elapsed=%.3fs",
-        state.get("intent"),
-        len(state.get("retrieved_knowledge") or {}),
-        time.time() - start_time,
-    )
+    logger.info("knowledge_retrieve core intent=%s items=%s elapsed=%.3fs", state.get("intent"), len(state.get("retrieved_knowledge") or {}), time.time() - start_time)
 
     if state.get("intent") == "general":
         try:
             public_kb = PublicKnowledgeService()
-            state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(
-                query=state.get("user_input", ""),
-            )
+            state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(query=state.get("user_input", ""))
         except Exception:
             state.setdefault("retrieved_knowledge", {})["public_kb"] = []
-        logger.info(
-            "knowledge_retrieve public_kb count=%s",
-            len((state.get("retrieved_knowledge") or {}).get("public_kb") or []),
-        )
+        logger.info("knowledge_retrieve public_kb count=%s", len((state.get("retrieved_knowledge") or {}).get("public_kb") or []))
     return state
 
 
-def _route_by_intent_and_text(state: dict) -> dict:
-    """主路由规则：始终返回明确 target_agent。"""
-    intent = (state.get("intent") or "").strip().lower()
-    text = (state.get("user_input") or "").strip()
-    entities = state.get("extract_entities") or {}
-    drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
-
-    # 1) 基于明确意图直接路由
-    if intent == "lab":
-        return {
-            "target_agent": "lab_report_agent",
-            "intent_type": "lab_report",
-            "confidence": float(state.get("intent_confidence") or 0.9),
-            "reason": "route by intent=lab",
-        }
-    if intent == "archive":
-        return {
-            "target_agent": "main_qa_agent",
-            "intent_type": "archive",
-            "confidence": float(state.get("intent_confidence") or 0.9),
-            "reason": "route by intent=archive",
-        }
-    if intent == "general":
-        return {
-            "target_agent": "main_qa_agent",
-            "intent_type": "general",
-            "confidence": float(state.get("intent_confidence") or 0.8),
-            "reason": "route by intent=general",
-        }
-
-    # 2) drug 子意图细分
-    if intent == "drug":
-        conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
-        record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
-        delete_keywords = ["删除", "移除", "清空"]
-
-        is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
-        is_record = any(k in text for k in record_keywords)
-        is_delete = any(k in text for k in delete_keywords)
-
-        if is_conflict and not is_record and not is_delete:
-            return {
-                "target_agent": "drug_conflict_agent",
-                "intent_type": "drug_conflict",
-                "confidence": float(state.get("intent_confidence") or 0.85),
-                "reason": "route by drug conflict keywords",
-            }
-        if (is_record or is_delete) and not is_conflict:
-            return {
-                "target_agent": "drug_record_agent",
-                "intent_type": "drug_record",
-                "confidence": float(state.get("intent_confidence") or 0.85),
-                "reason": "route by drug record keywords",
-            }
-        if isinstance(drug_names, list) and len(drug_names) >= 2:
-            return {
-                "target_agent": "drug_conflict_agent",
-                "intent_type": "drug_conflict",
-                "confidence": float(state.get("intent_confidence") or 0.75),
-                "reason": "route by multi-drug entities",
-            }
-        return {
-            "target_agent": "drug_record_agent",
-            "intent_type": "drug_record",
-            "confidence": float(state.get("intent_confidence") or 0.7),
-            "reason": "route by drug default",
-        }
-
-    # 3) 当 intent 为空或异常时，按文本快速识别（仍属于主路由，不是兜底）
-    if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
-        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
-    if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
-        return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
-    if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):
-        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": 0.7, "reason": "route by text: drug record"}
-    if any(k in text for k in ["档案", "病历", "历史记录", "就诊"]):
-        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": 0.7, "reason": "route by text: archive"}
-    return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": 0.6, "reason": "route by text: default general"}
-
-
-async def agent_route(state: dict) -> dict:
-    """Agent路由：主路径必须写入 target_agent。"""
-    intent_result = _route_by_intent_and_text(state)
-    state["intent_analysis"] = intent_result
-    state["target_agent"] = intent_result["target_agent"]
-    state["intent_type"] = intent_result.get("intent_type", state.get("intent", "general"))
-
-    logger.info(
-        "agent_route selected target_agent=%s intent=%s intent_type=%s reason=%s",
-        state.get("target_agent"),
-        state.get("intent"),
-        state.get("intent_type"),
-        (state.get("intent_analysis") or {}).get("reason"),
-    )
-    
-    return state
-
-
-async def _fallback_agent_route(state: dict) -> dict:
-    """历史兼容函数：统一走主路由规则。"""
-    out = _route_by_intent_and_text(state)
-    state["intent_analysis"] = out
-    state["target_agent"] = out["target_agent"]
-    state["intent_type"] = out.get("intent_type", state.get("intent", "general"))
-    return state
-
-
-async def agent_execute(state: dict) -> dict:
-    """Agent执行：调用对应的专业Agent处理请求"""
-    from app.core.agent.agent_router import AgentRouter
-    
-    target_agent = state.get("target_agent")
-    
-    if not target_agent:
-        state["error_msg"] = (
-            "路由异常：agent_route 未写入 target_agent "
-            f"(intent={state.get('intent')}, intent_type={state.get('intent_type')}, "
-            f"has_intent_analysis={bool(state.get('intent_analysis'))})"
-        )
+async def plan_node(state: dict) -> dict:
+    if state.get("error_msg"):
         return state
-    
+
+    user_input = state.get("user_input", "")
+
+    sm_data = (state.get("private_scratchpads") or {}).get("drug_record_sm")
+    if sm_data:
+        sm = DrugRecordStateMachine.from_dict(sm_data)
+        if sm.is_active():
+            state["execution_plan"] = ExecutionPlan(
+                steps=[PlanStep(step_id="s1", query=user_input, target_agent="drug_record_agent", intent_type="drug_record_sm", depends_on=[], execution_strategy="serial")],
+                strategy="serial",
+                conflict_resolution_policy="none",
+            )
+            state["plan_phase"] = "planning"
+            return state
+
+    sub_queries = _split_user_queries(user_input)
+
+    if len(sub_queries) <= 1:
+        route_result = _route_by_intent_and_text(state)
+        state["intent_analysis"] = route_result
+        state["target_agent"] = route_result["target_agent"]
+        state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))
+
+        plan = ExecutionPlan(
+            steps=[PlanStep(
+                step_id="s1",
+                query=user_input,
+                target_agent=route_result["target_agent"],
+                intent_type=route_result.get("intent_type", "general"),
+                depends_on=[],
+                execution_strategy="serial",
+            )],
+            strategy="serial",
+            conflict_resolution_policy="evidence_priority",
+        )
+    else:
+        steps = []
+        for i, q in enumerate(sub_queries):
+            pred = await _predict_intent_for_query(q)
+            intent_val = pred.get("intent", "general") if pred else "general"
+            conf_val = pred.get("confidence", 0.5) if pred else 0.5
+
+            sub_state = dict(state)
+            sub_state["user_input"] = q
+            sub_state["intent"] = intent_val
+            sub_state["intent_confidence"] = conf_val
+            route_result = _route_by_intent_and_text(sub_state)
+
+            deps = _detect_dependencies(q, sub_queries[:i])
+
+            steps.append(PlanStep(
+                step_id=f"s{i + 1}",
+                query=q,
+                target_agent=route_result["target_agent"],
+                intent_type=route_result.get("intent_type", intent_val),
+                depends_on=deps,
+                execution_strategy="parallel" if not deps else "serial",
+            ))
+
+        has_deps = any(s.get("depends_on") for s in steps)
+        plan = ExecutionPlan(
+            steps=steps,
+            strategy="hybrid" if has_deps else "parallel",
+            conflict_resolution_policy="evidence_priority",
+        )
+
+    state["execution_plan"] = plan
+    state["plan_phase"] = "planning"
+
+    logger.info("plan_node plan=%s", json.dumps({k: v for k, v in plan.items()}, ensure_ascii=False, default=str))
+    return state
+
+
+def _group_steps_by_dependency(steps: list[PlanStep]) -> list[list[PlanStep]]:
+    topo: list[list[PlanStep]] = []
+    remaining = list(steps)
+    completed_ids: set[str] = set()
+    while remaining:
+        ready = [s for s in remaining if all(d in completed_ids for d in s.get("depends_on", []))]
+        if not ready:
+            ready = [remaining[0]]
+        topo.append(ready)
+        for s in ready:
+            completed_ids.add(s["step_id"])
+            remaining.remove(s)
+    return topo
+
+
+def _build_sub_state(state: dict, step: PlanStep) -> dict:
+    sub_state = dict(state)
+    sub_state["user_input"] = step["query"]
+    sub_state["target_agent"] = step["target_agent"]
+    sub_state["intent_type"] = step.get("intent_type", "general")
+    for key in ("final_response", "error_msg", "intent_analysis", "extract_entities", "tool_result", "llm_output"):
+        sub_state.pop(key, None)
+    return sub_state
+
+
+async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
+    from app.core.agent.agent_router import AgentRouter
+
+    target_agent = step["target_agent"]
+
+    if target_agent == "drug_record_agent" and step.get("intent_type") == "drug_record_sm":
+        result = await _process_drug_record_state_machine(sub_state)
+        result["intent_type"] = "drug_record_sm"
+        return result
+
     router = AgentRouter()
-    
     try:
-        result_state = await router.route_and_execute(state)
-        state.update(result_state)
-            
+        result_state = await router.route_and_execute(sub_state)
+        result_state["intent_type"] = step.get("intent_type", "general")
+        return result_state
     except Exception as e:
-        state["error_msg"] = f"Agent执行失败: {str(e)}"
-    
+        logger.error("execute_single_step failed step=%s error=%s", step["step_id"], e)
+        sub_state["error_msg"] = f"Agent执行失败: {str(e)}"
+        sub_state["final_response"] = f"处理'{step['query']}'时出现错误，请稍后重试。"
+        sub_state["intent_type"] = step.get("intent_type", "general")
+        return sub_state
+
+
+async def execute_node(state: dict) -> dict:
+    if state.get("error_msg"):
+        return state
+
+    plan = state.get("execution_plan", {})
+    steps = plan.get("steps", [])
+    strategy = plan.get("strategy", "serial")
+    results: dict[str, dict] = {}
+
+    if not steps:
+        state["plan_step_results"] = results
+        state["plan_phase"] = "executing"
+        return state
+
+    if strategy == "serial" or len(steps) <= 1:
+        for step in steps:
+            sub_state = _build_sub_state(state, step)
+            result = await _execute_single_step(sub_state, step)
+            results[step["step_id"]] = result
+            state.update({k: v for k, v in result.items() if k in ("final_response", "error_msg", "tool_result", "llm_output", "extract_entities")})
+    else:
+        groups = _group_steps_by_dependency(steps)
+        for group in groups:
+            tasks = [_execute_single_step(_build_sub_state(state, step), step) for step in group]
+            group_results = await asyncio.gather(*tasks, return_exceptions=True)
+            for step, result in zip(group, group_results):
+                if isinstance(result, Exception):
+                    results[step["step_id"]] = {"error_msg": str(result), "final_response": f"处理'{step['query']}'时出现错误。", "intent_type": step.get("intent_type", "general")}
+                else:
+                    results[step["step_id"]] = result
+
+    state["plan_step_results"] = results
+    state["plan_phase"] = "executing"
+
+    logger.info("execute_node done steps=%s results_keys=%s", [s["step_id"] for s in steps], list(results.keys()))
+    return state
+
+
+async def reconcile_node(state: dict) -> dict:
+    if state.get("error_msg") and not state.get("plan_step_results"):
+        return state
+
+    results = state.get("plan_step_results", {})
+    plan = state.get("execution_plan", {})
+
+    if not results:
+        return state
+
+    if len(results) == 1:
+        single = next(iter(results.values()))
+        if single.get("final_response"):
+            state["final_response"] = single["final_response"]
+        if single.get("error_msg") and not state.get("final_response"):
+            state["final_response"] = single["error_msg"]
+        state["plan_phase"] = "reconciling"
+        return state
+
+    sections: list[str] = []
+    drug_conflict_interactions: list[dict] = []
+
+    for step_id, result in results.items():
+        step = next((s for s in plan.get("steps", []) if s["step_id"] == step_id), None)
+        query = step.get("query", "") if step else ""
+        content = result.get("final_response", "") or result.get("error_msg", "")
+        intent_type = result.get("intent_type", "general")
+
+        if content:
+            sections.append(f"**{query}**\n{content}")
+
+        if intent_type == "drug_conflict":
+            interactions = (result.get("tool_result") or {}).get("interaction_result", [])
+            if interactions:
+                drug_conflict_interactions.extend(interactions)
+
+    if drug_conflict_interactions:
+        lines = ["⚠️ 跨任务药物冲突提醒："]
+        for it in drug_conflict_interactions:
+            lines.append(f"- {it.get('drug_a', '')} + {it.get('drug_b', '')}：{it.get('interaction_desc', '')}")
+        sections.append("\n".join(lines))
+
+    if sections:
+        state["final_response"] = "我分条为你处理如下：\n\n" + "\n\n".join([f"{i + 1}. {s}" for i, s in enumerate(sections)])
+        state["intent"] = "multi"
+        state["intent_type"] = "multi"
+
+    state["plan_phase"] = "reconciling"
     return state
 
 
 async def response_plan(state: dict) -> dict:
-    """响应规划：决定是否调用 LLM、是否注入记忆，以及选择 chat/format 提示词。"""
-    if state.get("error_msg"):
+    if state.get("error_msg") and state.get("final_response"):
         return state
 
     intent = state.get("intent") or "general"
     user_input = state.get("user_input", "")
     tool_name = state.get("tool_name") or ""
 
-    # 默认：更像大模型的对话生成
     mode = "llm_chat"
-
-    # 工具型意图优先走格式化
     if intent in ("archive", "drug", "lab") or tool_name in ("archive", "drug_interaction", "lab_report"):
         mode = "llm_format"
 
-    # 当long_memory_text非空时，无条件注入长期记忆
     long_mem = (state.get("long_memory_text") or "").strip()
     knowledge = state.get("retrieved_knowledge") or {}
     need_mem = _need_contextual_memory(user_input) or bool(long_mem)
@@ -464,14 +728,10 @@ async def response_plan(state: dict) -> dict:
 
 
 async def llm_generate(state: dict) -> dict:
-    """真正调用 LLM 生成更自然的输出。"""
-
-    # 检查是否已有final_response或confirmation_message
     if state.get("final_response"):
         state["llm_output"] = state["final_response"]
         return state
-    
-    # 检查是否需要确认
+
     if state.get("needs_confirmation") and state.get("confirmation_message"):
         state["llm_output"] = state["confirmation_message"]
         return state
@@ -508,7 +768,7 @@ async def llm_generate(state: dict) -> dict:
             "2) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
             "3) 禁止给出诊断结论或处方/调整用药建议。\n"
         )
-        user_prompt = (f"用户问题：{state.get('user_input','')}\n\n" f"工具结果：\n{content}\n")
+        user_prompt = (f"用户问题：{state.get('user_input', '')}\n\n" f"工具结果：\n{content}\n")
         if long_mem:
             user_prompt = f"长期记忆（用户历史偏好/事实，供参考，可能与本轮有关）：\n{long_mem}\n\n" + user_prompt
         if inject_memory and mem_summary:
@@ -537,14 +797,7 @@ async def llm_generate(state: dict) -> dict:
 
     try:
         llm = LLMService()
-        
-        raw = await llm.chat_completion(
-            prompt=user_prompt,
-            system_prompt=system_prompt,
-            stream=False,
-            timeout_s=12.0,
-            max_tokens=900,
-        )
+        raw = await llm.chat_completion(prompt=user_prompt, system_prompt=system_prompt, stream=False, timeout_s=12.0, max_tokens=900)
         state["llm_output"] = (raw or "").strip() or content
     except Exception as e:
         logger.error(f"LLM生成失败: {e}")
@@ -553,354 +806,44 @@ async def llm_generate(state: dict) -> dict:
     return state
 
 
-import re
-from datetime import datetime, date
-from sqlalchemy import select, and_
-from app.db.models import UserDrugRecord
-from app.db.database import get_sessionmaker
-from app.core.rag.drug_knowledge_service import DrugKnowledgeService
-
-
-async def _has_same_drug_record(user_id: str, drug_name: str, start_date: date = None) -> bool:
-    """检查是否存在相同的用药记录（基于 drug_name + start_date 幂等写入）"""
-    async_session = get_sessionmaker()
-    async with async_session() as session:
-        # 构建查询条件
-        conditions = [
-            UserDrugRecord.user_id == user_id,
-            UserDrugRecord.drug_name == drug_name,
-            UserDrugRecord.is_deleted == 0
-        ]
-        
-        # 如果提供了开始日期，则加入日期条件
-        if start_date:
-            conditions.append(UserDrugRecord.start_date == start_date)
-        
-        stmt = select(UserDrugRecord).where(and_(*conditions))
-        result = await session.execute(stmt)
-        existing_record = result.scalars().first()
-        
-        return existing_record is not None
-
-
-async def _extract_drug_info_from_text(text: str) -> dict:
-    """从文本中提取用药信息（剂量、频次、开始时间、用途）"""
-    drug_info = {
-        "dosage": "未指定",
-        "frequency": "未指定", 
-        "start_date": datetime.now(),
-        "purpose": "未指定"
-    }
-    
-    # 剂量提取模式
-    dosage_patterns = [
-        r'(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)',
-        r'(一次|每次)\s*(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)',
-        r'(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)\s*(一次|每次)'
-    ]
-    
-    # 频次提取模式
-    frequency_patterns = [
-        r'(一天|每日)\s*(\d+)\s*次',
-        r'(\d+)\s*次\s*(一天|每日)',
-        r'(早晚|早中晚|早中晚各一次|早晚各一次|早中晚各一次)',
-        r'(需要时|必要时|疼痛时|不适时)'
-    ]
-    
-    # 开始时间提取模式
-    start_date_patterns = [
-        r'(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})',
-        r'(从|自)\s*(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})',
-        r'(开始|起)\s*(今天|昨天|前天|\d+月\d+日|\d+年\d+月\d+日|\d{4}-\d{2}-\d{2})'
-    ]
-    
-    # 用途提取模式
-    purpose_patterns = [
-        r'(用于|治疗|缓解|针对)\s*([^，。！？]{1,20})',
-        r'(因为|由于)\s*([^，。！？]{1,20})\s*(而|所以)',
-        r'(头痛|发烧|感冒|疼痛|炎症|高血压|糖尿病|冠心病|哮喘)'
-    ]
-    
-    # 提取剂量
-    for pattern in dosage_patterns:
-        match = re.search(pattern, text)
-        if match:
-            drug_info["dosage"] = match.group(0)
-            break
-    
-    # 提取频次
-    for pattern in frequency_patterns:
-        match = re.search(pattern, text)
-        if match:
-            drug_info["frequency"] = match.group(0)
-            break
-    
-    # 提取开始时间（简化处理，实际应该解析日期）
-    for pattern in start_date_patterns:
-        match = re.search(pattern, text)
-        if match:
-            drug_info["start_date_text"] = match.group(1) if match.groups() else match.group(0)
-            break
-    
-    # 提取用途
-    for pattern in purpose_patterns:
-        match = re.search(pattern, text)
-        if match:
-            drug_info["purpose"] = match.group(2) if len(match.groups()) > 1 else match.group(1)
-            break
-    
-    return drug_info
-
-
-async def _identify_drug_name(text: str) -> str:
-    """基于药品知识库/NER识别药品名"""
-    # 首先尝试从文本中提取可能的药品名称
-    drug_patterns = [
-        r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})',
-        r'([^，。！？\s]{1,30})(?:片|粒|胶囊|支|瓶|袋|贴)',
-        r'(?:药名|药品|药物)\s*[:：]\s*([^，。！？\s]{1,30})'
-    ]
-    
-    candidate_names = []
-    for pattern in drug_patterns:
-        matches = re.findall(pattern, text)
-        candidate_names.extend(matches)
-    
-    # 使用药品知识库进行匹配
-    if candidate_names:
-        svc = DrugKnowledgeService()
-        matched_drugs = await svc.match_drugs(candidate_names)
-        
-        # 优先返回匹配成功的药品名
-        for result in matched_drugs:
-            if result.get("match"):
-                return result["match"]["drug_name"]
-        
-        # 如果没有匹配到知识库中的药品，返回第一个候选名称
-        return candidate_names[0] if candidate_names else "未知药品"
-    
-    return "未知药品"
-
-
-async def _collect_missing_drug_info(state: dict, drug_event: dict) -> dict:
-    """收集缺失的用药信息（多轮收集）"""
-    drug_name = drug_event.get("drug_name", "")
-    current_info = drug_event.get("collected_info", {})
-    
-    # 字段映射：中文字段名（用于多轮收集）到英文字段名（用于数据库存储）
-    field_mapping = {
-        "剂量": "dosage",
-        "频次": "frequency", 
-        "开始时间": "start_date_text",
-        "用途": "purpose"
-    }
-    
-    # 检查缺失的字段
-    missing_fields = []
-    for chinese_field, english_field in field_mapping.items():
-        # 检查是否已经收集了该字段
-        if chinese_field not in current_info:
-            # 如果是从文本提取的，检查英文字段
-            if english_field not in current_info or current_info.get(english_field) == "未指定":
-                missing_fields.append(chinese_field)
-        elif current_info.get(chinese_field) == "未指定":
-            missing_fields.append(chinese_field)
-    
-    # 如果所有信息都已收集，返回确认摘要
-    if not missing_fields:
-        # 构建确认摘要，使用正确的字段映射
-        summary = f"请确认以下用药信息：\n"
-        summary += f"• 药品名称：{drug_name}\n"
-        
-        # 使用字段映射获取正确的值
-        for chinese_field, english_field in field_mapping.items():
-            # 优先使用中文字段名（用户回答的值），如果没有则使用英文字段名（从文本提取的值）
-            value = current_info.get(chinese_field, current_info.get(english_field, "未指定"))
-            summary += f"• {chinese_field}：{value}\n"
-        
-        summary += "\n确认无误请回复'确认'，如需修改请直接告诉我需要修改的内容。"
-        
-        state["drug_confirmation_summary"] = summary
-        state["waiting_for_confirmation"] = True
-        return state
-    
-    # 生成追问提示
-    question_template = {
-        "剂量": f"请问您服用{drug_name}的剂量是多少？（例如：一次1片，或50毫克）",
-        "频次": f"请问您服用{drug_name}的频率是怎样的？（例如：一天3次，或早晚各一次）", 
-        "开始时间": f"请问您是从什么时候开始服用{drug_name}的？（例如：今天，或2024年1月1日）",
-        "用途": f"请问您服用{drug_name}主要是用于治疗什么？（例如：头痛、发烧、高血压等）"
-    }
-    
-    # 按优先级询问（剂量 > 频次 > 开始时间 > 用途）
-    priority_order = ["剂量", "频次", "开始时间", "用途"]
-    for field in priority_order:
-        if field in missing_fields:
-            state["current_question"] = question_template[field]
-            state["waiting_for_answer"] = field
-            state["current_drug_event"] = drug_event
-            break
-    
-    return state
-
-
-async def _process_drug_confirmation(state: dict) -> dict:
-    """
-    处理用户对用药记录的确认响应，支持多轮信息收集和确认摘要
-    """
-    user_input = state.get("user_input", "").strip().lower()
-    user_id = state.get("user_id")
-    
-    # 处理多轮信息收集的响应
-    if state.get("waiting_for_answer"):
-        current_field = state["waiting_for_answer"]
-        current_drug_event = state.get("current_drug_event", {})
-        
-        # 更新收集到的信息
-        if "collected_info" not in current_drug_event:
-            current_drug_event["collected_info"] = {}
-        
-        current_drug_event["collected_info"][current_field] = user_input
-        
-        # 清除当前等待状态
-        state.pop("waiting_for_answer", None)
-        state.pop("current_question", None)
-        
-        # 继续收集下一个缺失字段
-        state = await _collect_missing_drug_info(state, current_drug_event)
-        
-        # 如果已经进入确认阶段，设置确认摘要
-        if state.get("waiting_for_confirmation"):
-            state["confirmation_messages"] = [state.get("drug_confirmation_summary", "")]
-        
-        return state
-    
-    # 处理确认摘要的响应
-    if state.get("waiting_for_confirmation"):
-        if user_input in ["确认", "是的", "是", "确定", "好", "好的", "y", "yes", "同意"]:
-            # 用户确认，保存记录到档案
-            current_drug_event = state.get("current_drug_event", {})
-            collected_info = current_drug_event.get("collected_info", {})
-            
-            try:
-                async_session = get_sessionmaker()
-                async with async_session() as session:
-                    # 检查是否已存在相同记录
-                    if await _has_same_drug_record(user_id, current_drug_event["drug_name"]):
-                        state["confirmation_messages"] = ["用药记录已存在，无需重复添加。"]
-                    else:
-                        # 创建新的用药记录，使用 remark 字段
-                        drug_record = UserDrugRecord(
-                            user_id=user_id,
-                            drug_name=current_drug_event["drug_name"],
-                            dosage=collected_info.get("dosage", "未指定"),
-                            frequency=collected_info.get("frequency", "未指定"),
-                            start_date=datetime.now(),  # 简化处理，实际应该解析日期
-                            end_date=None,
-                            remark=f"多轮收集信息: 剂量-{collected_info.get('dosage', '未指定')}, "
-                                   f"频次-{collected_info.get('frequency', '未指定')}, "
-                                   f"开始时间-{collected_info.get('start_date_text', '未指定')}, "
-                                   f"用途-{collected_info.get('purpose', '未指定')}"
-                        )
-                        
-                        # 添加到数据库
-                        session.add(drug_record)
-                        await session.commit()
-                        
-                        state["confirmation_messages"] = ["用药记录已成功添加到您的档案中。"]
-                
-                # 清理状态
-                state.pop("waiting_for_confirmation", None)
-                state.pop("current_drug_event", None)
-                state.pop("drug_confirmation_summary", None)
-                
-            except Exception as e:
-                # 记录错误但不中断流程
-                print(f"保存用药记录到档案失败: {e}")
-                state["confirmation_messages"] = ["抱歉，保存用药记录到档案时出现错误，请稍后重试。"]
-        else:
-            # 用户需要修改信息，重新开始收集
-            current_drug_event = state.get("current_drug_event", {})
-            current_drug_event["collected_info"] = {}
-            state = await _collect_missing_drug_info(state, current_drug_event)
-            state.pop("waiting_for_confirmation", None)
-        
-        return state
-    
-    # 处理初始用药确认（简单模式）
-    if user_input in ["是", "是的", "确认", "确定", "好", "好的", "y", "yes", "同意", "添加", "保存"]:
-        # 获取候选用药事件
-        candidate_drug_events = state.get("candidate_drug_events")
-        if not candidate_drug_events:
-            skill_ctx = state.get("skill_ctx") or {}
-            med_ctx = skill_ctx.get("medication_confirmation") if isinstance(skill_ctx, dict) else {}
-            if isinstance(med_ctx, dict):
-                candidate_drug_events = med_ctx.get("candidate_events")
-        if candidate_drug_events and user_id:
-            # 选择第一个用药事件进行多轮收集
-            drug_event = candidate_drug_events[0]
-            
-            # 从文本中提取已有信息
-            extracted_info = await _extract_drug_info_from_text(drug_event.get("full_text", ""))
-            drug_event["collected_info"] = extracted_info
-            
-            # 开始多轮信息收集
-            state = await _collect_missing_drug_info(state, drug_event)
-            
-            # 清除候选用药事件，避免重复提示
-            state.pop("candidate_drug_events", None)
-    
-    return state
-
-
 async def output_check_and_disclaimer(state: dict) -> dict:
-    # 合规检查已禁用
-    pass
-
-    # 处理用户对用药记录的确认
-    state = await _process_drug_confirmation(state)
-    
-    # 检查是否处于多轮收集状态
-    if state.get("current_question"):
-        # 在多轮收集过程中，优先显示收集问题
-        state["final_response"] = state["current_question"]
-    elif state.get("waiting_for_confirmation"):
-        # 在确认阶段，显示确认摘要
-        state["final_response"] = state.get("drug_confirmation_summary", "")
-    else:
-        # 正常情况，使用LLM输出
-        state["final_response"] = state.get("llm_output", "")
-    
-    # 如果有确认消息，添加到最终响应中
-    confirmation_msgs = state.get("confirmation_messages", [])
-    if confirmation_msgs:
-        state["final_response"] += "\n\n" + "\n".join(confirmation_msgs)
+    state["final_response"] = state.get("llm_output", "") or state.get("final_response", "")
 
     proposed = state.get("proposed_updates") or []
     proposed.append({"scope": "shared", "key": "latest_response", "value": state.get("final_response", ""), "source": "out"})
     state["proposed_updates"] = proposed
-    
+
     return state
 
 
 async def commit_gate(state: dict) -> dict:
-    """提交门禁：仅允许白名单字段进入 shared_facts。"""
     if state.get("error_msg"):
         return state
 
     shared = dict(state.get("shared_facts") or {})
     allow_keys = {"intent", "target_agent", "extract_entities", "retrieved_knowledge", "latest_response"}
 
+    updates_by_key: dict[str, dict] = {}
     for item in (state.get("proposed_updates") or []):
         if not isinstance(item, dict):
             continue
         if item.get("scope") != "shared":
             continue
         key = item.get("key")
-        if key in allow_keys:
-            shared[key] = item.get("value")
+        if key not in allow_keys:
+            logger.warning("commit_gate rejected key=%s from source=%s", key, item.get("source"))
+            continue
+        if key in updates_by_key:
+            existing_priority = updates_by_key[key].get("priority", 0)
+            new_priority = item.get("priority", 0)
+            if new_priority > existing_priority:
+                updates_by_key[key] = item
+        else:
+            updates_by_key[key] = item
 
-    # 稳定写入高价值事实（即使没有显式提案）
+    for key, item in updates_by_key.items():
+        shared[key] = item.get("value")
+
     if state.get("intent"):
         shared["intent"] = state.get("intent")
     if state.get("target_agent"):
@@ -921,11 +864,9 @@ async def memory_update(state: dict) -> dict:
 
     mem = MemoryService()
     await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
-    # 只有在final_response存在时才更新助手记忆
     if "final_response" in state:
         await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
 
-    # 写入长期记忆（向量库）：LLM抽取 + add；失败不影响主流程
     try:
         start_time = time.time()
         svc = LongMemoryService()
@@ -934,31 +875,18 @@ async def memory_update(state: dict) -> dict:
             if items:
                 await svc.add_items(user_id=state["user_id"], session_id=state["session_id"], items=items)
                 write_time_ms = int((time.time() - start_time) * 1000)
-                logger.info(
-                    "long_memory write done count=%s cost_ms=%s",
-                    len(items),
-                    write_time_ms,
-                )
-                
-                # 检查是否有用药事件，如果有则添加到state中，用于后续提示用户确认是否写入档案
+                logger.info("long_memory write done count=%s cost_ms=%s", len(items), write_time_ms)
+
                 drug_events = [item for item in items if item.memory_type == "drug_event"]
                 if drug_events:
-                    # 提取药物名称和相关信息，用于构建确认提示
                     drug_info_list = []
                     for event in drug_events:
-                        # 从文本中提取药物名称
-                        import re
-                        # 先尝试从处理过的文本中恢复原始表述，如果包含'用户'则替换成'我'
-                        original_text = event.text.replace('用户', '我')
-                        drug_match = re.search(r'(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})', original_text)
+                        original_text = event.text.replace("用户", "我")
+                        drug_match = re.search(r"(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})", original_text)
                         if drug_match:
                             drug_name = drug_match.group(1).strip()
-                            drug_info_list.append({
-                                "drug_name": drug_name,
-                                "full_text": original_text,  # 使用恢复的原始文本
-                                "confidence": event.confidence
-                            })
-                    
+                            drug_info_list.append({"drug_name": drug_name, "full_text": original_text, "confidence": event.confidence})
+
                     if drug_info_list:
                         state["candidate_drug_events"] = drug_info_list
                         skill_ctx = state.get("skill_ctx") or {}
@@ -967,7 +895,6 @@ async def memory_update(state: dict) -> dict:
     except Exception:
         logger.exception("long_memory write failed")
 
-    # 持久化会话级运行状态（最小化：仅保存待确认信息）
     try:
         user_id = state.get("user_id")
         session_id = state.get("session_id")
@@ -979,11 +906,12 @@ async def memory_update(state: dict) -> dict:
             runtime_state["pending_confirmation"] = pending
         else:
             runtime_state.pop("pending_confirmation", None)
-        await AgentStateStore().upsert_state(
-            user_id=user_id,
-            session_id=session_id,
-            state=runtime_state,
-        )
+
+        scratchpads = state.get("private_scratchpads") or {}
+        if scratchpads:
+            runtime_state["private_scratchpads"] = scratchpads
+
+        await AgentStateStore().upsert_state(user_id=user_id, session_id=session_id, state=runtime_state)
     except Exception:
         pass
 

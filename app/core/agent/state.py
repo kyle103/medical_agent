@@ -4,6 +4,21 @@ from typing import Literal
 from typing import TypedDict
 
 
+class PlanStep(TypedDict, total=False):
+    step_id: str
+    query: str
+    target_agent: str
+    intent_type: str
+    depends_on: list[str]
+    execution_strategy: Literal["serial", "parallel"]
+
+
+class ExecutionPlan(TypedDict, total=False):
+    steps: list[PlanStep]
+    strategy: Literal["serial", "parallel", "hybrid"]
+    conflict_resolution_policy: str
+
+
 class AgentState(TypedDict, total=False):
     user_id: str
     session_id: str
@@ -11,32 +26,25 @@ class AgentState(TypedDict, total=False):
     stream: bool
     enable_archive_link: bool
 
-    # 短期记忆（会话上下文）
-    history: list[dict]  # [{role, content, create_time}]
+    history: list[dict]
     history_text: str
     recall_mode: bool
 
-    # 长期记忆（向量库召回，按 user_id 隔离）
-    long_memory_items: list[dict]  # [{memory_id,text,memory_type,source,session_id,created_at}]
+    long_memory_items: list[dict]
     long_memory_text: str
 
-    # 记忆摘要（用于注入LLM，优先摘要；必要时再加短窗口原文）
     memory_summary: str
 
-    # 分层状态：共享事实/私有草稿/候选提交
     shared_facts: dict
-    private_scratchpads: dict  # {agent_name: {...}}
-    proposed_updates: list[dict]  # [{scope,key,value,source}]
-    skill_ctx: dict  # 各 skill 私有上下文
+    private_scratchpads: dict
+    proposed_updates: list[dict]
+    skill_ctx: dict
 
-    # 响应规划：决定是否调用LLM、是否注入记忆、使用何种提示词
     response_mode: Literal["llm_chat", "llm_format", "template_only"]
     inject_memory: bool
 
-    # 专业知识检索结果（非用户长期记忆）
     retrieved_knowledge: dict
 
-    # 可观测性
     intent: str
     intent_confidence: float
     intent_reason: str
@@ -54,16 +62,12 @@ class AgentState(TypedDict, total=False):
     final_response: str
     error_msg: str
 
-    # 运行过程中的中间状态
     candidate_drug_events: list[dict]
     pending_drug_events_for_confirmation: list[dict]
-    waiting_for_answer: str
-    waiting_for_confirmation: bool
-    current_question: str
-    current_drug_event: dict
-    drug_confirmation_summary: str
-    confirmation_messages: list[str]
 
-    # 会话级运行状态（持久化）
     session_runtime_state: dict
     pending_confirmation: dict
+
+    execution_plan: ExecutionPlan
+    plan_step_results: dict
+    plan_phase: Literal["planning", "executing", "reconciling", "responding"]

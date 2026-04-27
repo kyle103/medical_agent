@@ -6,11 +6,10 @@ from langgraph.graph import END, StateGraph
 
 from app.common.exceptions import UserAuthException
 from app.core.agent.nodes import (
-    agent_execute,
-    agent_route,
     commit_gate,
     entity_extraction,
     error_finalize,
+    execute_node,
     input_check,
     intent_recognition,
     knowledge_retrieve,
@@ -18,6 +17,8 @@ from app.core.agent.nodes import (
     memory_load,
     memory_update,
     output_check_and_disclaimer,
+    plan_node,
+    reconcile_node,
     response_plan,
 )
 from app.core.agent.state import AgentState
@@ -35,9 +36,10 @@ class MedicalAgent:
         g.add_node("intent_node", intent_recognition)
         g.add_node("entities", entity_extraction)
         g.add_node("knowledge", knowledge_retrieve)
-        g.add_node("agent_route", agent_route)
-        g.add_node("agent_exec", agent_execute)
-        g.add_node("plan", response_plan)
+        g.add_node("plan", plan_node)
+        g.add_node("execute", execute_node)
+        g.add_node("reconcile", reconcile_node)
+        g.add_node("response_plan", response_plan)
         g.add_node("llm", llm_generate)
         g.add_node("out", output_check_and_disclaimer)
         g.add_node("commit", commit_gate)
@@ -54,10 +56,11 @@ class MedicalAgent:
         g.add_edge("mem_load", "intent_node")
         g.add_edge("intent_node", "entities")
         g.add_edge("entities", "knowledge")
-        g.add_edge("knowledge", "agent_route")
-        g.add_edge("agent_route", "agent_exec")
-        g.add_edge("agent_exec", "plan")
-        g.add_edge("plan", "llm")
+        g.add_edge("knowledge", "plan")
+        g.add_edge("plan", "execute")
+        g.add_edge("execute", "reconcile")
+        g.add_edge("reconcile", "response_plan")
+        g.add_edge("response_plan", "llm")
         g.add_edge("llm", "out")
 
         def _need_error2(state: dict) -> str:
