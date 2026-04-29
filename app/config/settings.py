@@ -74,6 +74,11 @@ class Settings(BaseSettings):
     PUBLIC_KB_RRF_K: int = Field(default=60)
     PUBLIC_KB_BM25_CACHE_DIR: str = Field(default="data/bm25_cache")
 
+    # Rerank
+    RERANK_API_BASE: str = Field(default="")
+    RERANK_API_KEY: str = Field(default="")
+    RERANK_MODEL_NAME: str = Field(default="qwen3-rerank")
+
     # Redis (prod)
     REDIS_HOST: str = Field(default="{{Redis地址}}")
     REDIS_PORT: int = Field(default=6379)
