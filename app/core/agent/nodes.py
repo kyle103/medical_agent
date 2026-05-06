@@ -598,6 +598,23 @@ async def reconcile_node(state: dict) -> dict:
         content = result.get("final_response", "") or result.get("error_msg", "")
         intent_type = result.get("intent_type", "general")
 
+        if not content and result.get("tool_result"):
+            tool_result = result["tool_result"]
+            if isinstance(tool_result, dict):
+                content = tool_result.get("final_desc", "")
+                if not content and tool_result.get("interaction_result"):
+                    interactions = tool_result["interaction_result"]
+                    if isinstance(interactions, list) and len(interactions) > 0:
+                        lines = []
+                        for it in interactions:
+                            drug_a = it.get("drug_a", "")
+                            drug_b = it.get("drug_b", "")
+                            desc = it.get("interaction_desc", "")
+                            lines.append(f"{drug_a} + {drug_b}：{desc}")
+                        content = "\n".join(lines)
+                    else:
+                        content = tool_result.get("message", "已匹配到药品，但未查询到两两相互作用记录；如需更精确信息，请查阅说明书或咨询执业药师。")
+
         if content:
             sections.append(f"**{query}**\n{content}")
 
@@ -726,7 +743,12 @@ async def llm_generate(state: dict) -> dict:
 
 
 async def output_check_and_disclaimer(state: dict) -> dict:
+    from app.core.compliance.compliance_service import ComplianceService
+
     state["final_response"] = state.get("llm_output", "") or state.get("final_response", "")
+
+    compliance = ComplianceService()
+    state["final_response"] = compliance.add_disclaimer(state["final_response"])
 
     proposed = state.get("proposed_updates") or []
     proposed.append({"scope": "shared", "key": "latest_response", "value": state.get("final_response", ""), "source": "out"})

@@ -50,9 +50,7 @@ class MainQAAgent(BaseAgent):
                 query_conditions=query_conditions,
             )
         except Exception as e:
-            state["final_response"] = self._add_disclaimer(
-                f"档案查询服务暂时不可用，请稍后重试。错误信息：{str(e)}"
-            )
+            state["final_response"] = f"档案查询服务暂时不可用，请稍后重试。错误信息：{str(e)}"
             return state
         
         # 生成档案查询结果
@@ -80,12 +78,10 @@ class MainQAAgent(BaseAgent):
         ok, msg = self._check_compliance(response)
         if not ok:
             state["error_msg"] = msg
-            state["final_response"] = self._add_disclaimer(
-                "抱歉，由于合规要求，无法提供相关档案信息。"
-            )
+            state["final_response"] = "抱歉，由于合规要求，无法提供相关档案信息。"
             return state
         
-        state["final_response"] = self._add_disclaimer(response)
+        state["final_response"] = response
         
         # 记录Agent调用
         self._log_agent_call(user_id, self.agent_name, user_input, response)
@@ -134,12 +130,10 @@ class MainQAAgent(BaseAgent):
         ok, msg = self._check_compliance(response)
         if not ok:
             state["error_msg"] = msg
-            state["final_response"] = self._add_disclaimer(
-                "抱歉，由于合规要求，无法回答该问题。"
-            )
+            state["final_response"] = "抱歉，由于合规要求，无法回答该问题。"
             return state
         
-        state["final_response"] = self._add_disclaimer(response)
+        state["final_response"] = response
         
         # 记录Agent调用
         self._log_agent_call(user_id, self.agent_name, user_input, response)

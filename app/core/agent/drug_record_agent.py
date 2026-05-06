@@ -36,7 +36,7 @@ class DrugRecordAgent(BaseAgent):
         else:
             result = await self._handle_general_operation(user_id, user_input, state)
         
-        state["final_response"] = self._add_disclaimer(result)
+        state["final_response"] = result
         
         # 记录Agent调用
         self._log_agent_call(user_id, self.agent_name, user_input, result)
