@@ -15,6 +15,7 @@ logger = get_logger(__name__)
 
 _client: MilvusClient | None = None
 _client_lock = threading.Lock()
+_milvus_available: bool | None = None
 
 
 def _milvus_uri() -> str:
@@ -31,31 +32,46 @@ def _milvus_token() -> str:
     return token
 
 
+def is_milvus_configured() -> bool:
+    return bool(_milvus_uri())
+
+
 def _ensure_connection() -> None:
+    global _milvus_available
+    if _milvus_available is False:
+        raise ServiceUnavailableException("Milvus 不可用（已标记为不可达）")
     uri = _milvus_uri()
     if not uri:
+        _milvus_available = False
         raise ServiceUnavailableException("MILVUS_URI 未配置")
     token = _milvus_token()
     try:
-        connections.connect(uri=uri, token=token)
+        connections.connect(uri=uri, token=token, timeout=5)
+        _milvus_available = True
     except Exception as exc:
+        _milvus_available = False
         raise ServiceUnavailableException(f"Milvus 连接失败: {exc}") from exc
 
 
 def get_milvus_client() -> MilvusClient:
-    global _client
+    global _client, _milvus_available
     if _client is not None:
         return _client
+    if _milvus_available is False:
+        raise ServiceUnavailableException("Milvus 不可用（已标记为不可达）")
     with _client_lock:
         if _client is not None:
             return _client
         uri = _milvus_uri()
         if not uri:
+            _milvus_available = False
             raise ServiceUnavailableException("MILVUS_URI 未配置")
         token = _milvus_token()
         try:
-            _client = MilvusClient(uri=uri, token=token)
+            _client = MilvusClient(uri=uri, token=token, timeout=5)
+            _milvus_available = True
         except Exception as exc:
+            _milvus_available = False
             raise ServiceUnavailableException(f"MilvusClient 初始化失败: {exc}") from exc
     return _client
 

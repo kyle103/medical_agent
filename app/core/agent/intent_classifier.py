@@ -49,7 +49,6 @@ class IntentClassifier:
         # archive：档案增删改查/查询我的记录
         archive_keywords = [
             "档案",
-            "记录",
             "就诊",
             "病历",
             "处方",
@@ -67,7 +66,7 @@ class IntentClassifier:
         drug_interaction_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "同时吃"]
         
         # drug：用药记录添加/当前用药陈述
-        drug_record_keywords = ["吃了", "服用", "用了", "吃", "服用", "使用", "用", "剂量", "频次", "一天", "一次", "每次"]
+        drug_record_keywords = ["记录", "吃了", "服用", "用了", "吃", "服用", "使用", "用", "剂量", "频次", "一天", "一次", "每次"]
 
         # lab：血常规/指标/数值/单位等
         lab_keywords = ["化验", "检验", "指标", "参考范围", "正常值", "血常规", "尿常规", "mmol", "mg/L"]
@@ -93,16 +92,23 @@ class IntentClassifier:
             return IntentResult(intent="drug", confidence=0.7, reason="rule:drug-interaction")
         
         # 用药记录添加意图（当前用药陈述）
-        if any(k in t for k in drug_record_keywords) and "药" in t:
-            # 排除历史用药查询（包含"昨天"、"上次"、"之前"等时间词）
-            time_keywords = ["昨天", "上次", "之前", "以前", "曾经", "过", "哪些", "什么药"]
-            # 区分历史用药查询和当前用药记录
+        # "记录" 是强信号，无需额外要求"药"字
+        if "记录" in t and not any(k in t for k in drug_interaction_keywords):
+            time_keywords = ["昨天", "上次", "之前", "以前", "曾经", "哪些", "什么药"]
             if any(time_k in t for time_k in time_keywords):
-                # 历史用药查询属于档案查询
+                return IntentResult(intent="archive", confidence=0.7, reason="rule:archive-drug-history-query")
+            return IntentResult(intent="drug", confidence=0.8, reason="rule:drug-record-add")
+
+        if any(k in t for k in drug_record_keywords) and "药" in t:
+            time_keywords = ["昨天", "上次", "之前", "以前", "曾经", "过", "哪些", "什么药"]
+            if any(time_k in t for time_k in time_keywords):
                 return IntentResult(intent="archive", confidence=0.7, reason="rule:archive-drug-history-query")
             else:
-                # 当前用药记录属于药物记录
                 return IntentResult(intent="drug", confidence=0.8, reason="rule:drug-record-add")
+
+        strong_drug_action_keywords = ["吃了", "服用", "用了"]
+        if any(k in t for k in strong_drug_action_keywords):
+            return IntentResult(intent="drug", confidence=0.75, reason="rule:drug-action-without-drug-word")
 
         # "药"单独出现不再强制判 drug，避免把"我昨天吃的什么药"误判
         if "药" in t:

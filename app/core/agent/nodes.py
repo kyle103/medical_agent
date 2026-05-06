@@ -10,7 +10,9 @@ from sqlalchemy import and_, select
 
 from app.common.logger import get_logger
 from app.core.agent.intent_classifier import IntentClassifier
+from app.core.agent.planner_agent import PlannerAgent
 from app.core.agent.state import ExecutionPlan, PlanStep
+from app.core.agent.tool_executor import ToolExecutor
 from app.core.llm.llm_service import LLMService
 from app.core.memory.long_memory_service import LongMemoryService
 from app.core.memory.memory_service import MemoryService
@@ -28,6 +30,9 @@ from app.db.database import get_sessionmaker
 from app.db.models import UserDrugRecord
 
 logger = get_logger(__name__)
+
+_planner = PlannerAgent()
+_tool_executor = ToolExecutor()
 
 INTENTS = {
     "archive": "档案查询",
@@ -101,88 +106,6 @@ def _format_history(history: list[dict], max_chars: int = 1400) -> str:
     if len(text) <= max_chars:
         return text
     return text[-max_chars:]
-
-
-def _split_user_queries(text: str) -> list[str]:
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    parts = re.split(r"[。！？!?；;]+", raw)
-    parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
-    out: list[str] = []
-    for p in parts:
-        sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
-        for s in sub:
-            s = s.strip(" ，,")
-            if s:
-                out.append(s)
-    dedup: list[str] = []
-    seen = set()
-    for q in out:
-        if q in seen:
-            continue
-        seen.add(q)
-        dedup.append(q)
-    return dedup
-
-
-def _route_by_intent_and_text(state: dict) -> dict:
-    intent = (state.get("intent") or "").strip().lower()
-    text = state.get("user_input", "").strip()
-    entities = state.get("extract_entities") or {}
-    drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
-
-    if intent == "lab":
-        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=lab"}
-    if intent == "archive":
-        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=archive"}
-    if intent == "general":
-        return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": float(state.get("intent_confidence") or 0.8), "reason": "route by intent=general"}
-
-    if intent == "drug":
-        conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
-        record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
-        delete_keywords = ["删除", "移除", "清空"]
-
-        is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
-        is_record = any(k in text for k in record_keywords)
-        is_delete = any(k in text for k in delete_keywords)
-
-        if is_conflict and not is_record and not is_delete:
-            return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug conflict keywords"}
-        if (is_record or is_delete) and not is_conflict:
-            return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug record keywords"}
-        if isinstance(drug_names, list) and len(drug_names) >= 2:
-            return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.75), "reason": "route by multi-drug entities"}
-        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.7), "reason": "route by drug default"}
-
-    if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
-        return {"target_agent": "lab_report_agent", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
-    if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
-        return {"target_agent": "drug_conflict_agent", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
-    if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):
-        return {"target_agent": "drug_record_agent", "intent_type": "drug_record", "confidence": 0.7, "reason": "route by text: drug record"}
-    if any(k in text for k in ["档案", "病历", "历史记录", "就诊"]):
-        return {"target_agent": "main_qa_agent", "intent_type": "archive", "confidence": 0.7, "reason": "route by text: archive"}
-    return {"target_agent": "main_qa_agent", "intent_type": "general", "confidence": 0.6, "reason": "route by text: default general"}
-
-
-async def _predict_intent_for_query(query: str) -> dict | None:
-    try:
-        clf = IntentClassifier()
-        sub_intent = await clf.predict(text=query, stream=False)
-        return {"intent": sub_intent.intent, "confidence": sub_intent.confidence, "reason": sub_intent.reason}
-    except Exception:
-        return None
-
-
-def _detect_dependencies(query: str, previous_queries: list[str]) -> list[str]:
-    deps: list[str] = []
-    pronouns = ["它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还有"]
-    if any(p in query for p in pronouns):
-        for i, _ in enumerate(previous_queries):
-            deps.append(f"s{i + 1}")
-    return deps
 
 
 async def _extract_drug_info_from_text(text: str) -> dict:
@@ -469,11 +392,16 @@ async def knowledge_retrieve(state: dict) -> dict:
         return state
     start_time = time.time()
     try:
-        svc = MedicalKnowledgeService()
-        state["retrieved_knowledge"] = await svc.retrieve(
-            user_input=state.get("user_input", ""),
-            intent=state.get("intent", "general"),
-        )
+        from app.db.milvus_store import is_milvus_configured
+        if is_milvus_configured():
+            svc = MedicalKnowledgeService()
+            state["retrieved_knowledge"] = await svc.retrieve(
+                user_input=state.get("user_input", ""),
+                intent=state.get("intent", "general"),
+            )
+        else:
+            logger.info("knowledge_retrieve skipped: Milvus not configured")
+            state["retrieved_knowledge"] = {}
     except Exception:
         state["retrieved_knowledge"] = {}
 
@@ -481,8 +409,12 @@ async def knowledge_retrieve(state: dict) -> dict:
 
     if state.get("intent") == "general":
         try:
-            public_kb = PublicKnowledgeService()
-            state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(query=state.get("user_input", ""))
+            from app.db.milvus_store import is_milvus_configured as _is_milvus_cfg
+            if _is_milvus_cfg():
+                public_kb = PublicKnowledgeService()
+                state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(query=state.get("user_input", ""))
+            else:
+                state.setdefault("retrieved_knowledge", {})["public_kb"] = []
         except Exception:
             state.setdefault("retrieved_knowledge", {})["public_kb"] = []
         logger.info("knowledge_retrieve public_kb count=%s", len((state.get("retrieved_knowledge") or {}).get("public_kb") or []))
@@ -493,75 +425,13 @@ async def plan_node(state: dict) -> dict:
     if state.get("error_msg"):
         return state
 
-    user_input = state.get("user_input", "")
+    state = await _planner.generate_plan(state)
 
-    sm_data = (state.get("private_scratchpads") or {}).get("drug_record_sm")
-    if sm_data:
-        sm = DrugRecordStateMachine.from_dict(sm_data)
-        if sm.is_active():
-            state["execution_plan"] = ExecutionPlan(
-                steps=[PlanStep(step_id="s1", query=user_input, target_agent="drug_record_agent", intent_type="drug_record_sm", depends_on=[], execution_strategy="serial")],
-                strategy="serial",
-                conflict_resolution_policy="none",
-            )
-            state["plan_phase"] = "planning"
-            return state
+    route_result = state.get("intent_analysis") or {}
+    if route_result:
+        state["target_agent"] = route_result.get("target_name", "")
 
-    sub_queries = _split_user_queries(user_input)
-
-    if len(sub_queries) <= 1:
-        route_result = _route_by_intent_and_text(state)
-        state["intent_analysis"] = route_result
-        state["target_agent"] = route_result["target_agent"]
-        state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))
-
-        plan = ExecutionPlan(
-            steps=[PlanStep(
-                step_id="s1",
-                query=user_input,
-                target_agent=route_result["target_agent"],
-                intent_type=route_result.get("intent_type", "general"),
-                depends_on=[],
-                execution_strategy="serial",
-            )],
-            strategy="serial",
-            conflict_resolution_policy="evidence_priority",
-        )
-    else:
-        steps = []
-        for i, q in enumerate(sub_queries):
-            pred = await _predict_intent_for_query(q)
-            intent_val = pred.get("intent", "general") if pred else "general"
-            conf_val = pred.get("confidence", 0.5) if pred else 0.5
-
-            sub_state = dict(state)
-            sub_state["user_input"] = q
-            sub_state["intent"] = intent_val
-            sub_state["intent_confidence"] = conf_val
-            route_result = _route_by_intent_and_text(sub_state)
-
-            deps = _detect_dependencies(q, sub_queries[:i])
-
-            steps.append(PlanStep(
-                step_id=f"s{i + 1}",
-                query=q,
-                target_agent=route_result["target_agent"],
-                intent_type=route_result.get("intent_type", intent_val),
-                depends_on=deps,
-                execution_strategy="parallel" if not deps else "serial",
-            ))
-
-        has_deps = any(s.get("depends_on") for s in steps)
-        plan = ExecutionPlan(
-            steps=steps,
-            strategy="hybrid" if has_deps else "parallel",
-            conflict_resolution_policy="evidence_priority",
-        )
-
-    state["execution_plan"] = plan
-    state["plan_phase"] = "planning"
-
-    logger.info("plan_node plan=%s", json.dumps({k: v for k, v in plan.items()}, ensure_ascii=False, default=str))
+    logger.info("plan_node delegated to PlannerAgent, plan_phase=%s", state.get("plan_phase"))
     return state
 
 
@@ -580,26 +450,58 @@ def _group_steps_by_dependency(steps: list[PlanStep]) -> list[list[PlanStep]]:
     return topo
 
 
-def _build_sub_state(state: dict, step: PlanStep) -> dict:
+def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = None) -> dict:
     sub_state = dict(state)
     sub_state["user_input"] = step["query"]
-    sub_state["target_agent"] = step["target_agent"]
+    sub_state["target_agent"] = step.get("target_name", "")
     sub_state["intent_type"] = step.get("intent_type", "general")
+
     for key in ("final_response", "error_msg", "intent_analysis", "extract_entities", "tool_result", "llm_output"):
         sub_state.pop(key, None)
+
+    if step_results and step.get("depends_on"):
+        dep_summaries: list[str] = []
+        for dep_id in step["depends_on"]:
+            dep_result = step_results.get(dep_id)
+            if isinstance(dep_result, dict) and dep_result.get("final_response"):
+                dep_summaries.append(f"[步骤{dep_id}的结果]: {dep_result['final_response']}")
+            elif isinstance(dep_result, dict) and dep_result.get("tool_result"):
+                dep_summaries.append(f"[步骤{dep_id}的工具结果]: {json.dumps(dep_result['tool_result'], ensure_ascii=False)}")
+        if dep_summaries:
+            original = sub_state["user_input"]
+            sub_state["user_input"] = original + "\n" + "\n".join(dep_summaries)
+            sub_state["step_context"] = {"dep_summaries": dep_summaries}
+
     return sub_state
 
 
 async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
-    from app.core.agent.agent_router import AgentRouter
+    target_type = step.get("target_type", "agent")
+    target_name = step.get("target_name", "")
 
-    target_agent = step["target_agent"]
+    if target_type == "tool":
+        logger.info("_execute_single_step tool=%s step=%s", target_name, step["step_id"])
+        try:
+            tool_result = await _tool_executor.execute(target_name, sub_state)
+            sub_state["tool_result"] = tool_result.get("tool_result", tool_result)
+            if tool_result.get("extract_entities"):
+                sub_state["extract_entities"] = tool_result["extract_entities"]
+            if tool_result.get("intent_type"):
+                sub_state["intent_type"] = tool_result["intent_type"]
+            if tool_result.get("error_msg"):
+                sub_state["error_msg"] = tool_result["error_msg"]
+            return sub_state
+        except Exception as e:
+            logger.error("_execute_single_step tool=%s failed: %s", target_name, e)
+            sub_state["error_msg"] = str(e)
+            return sub_state
 
-    if target_agent == "drug_record_agent" and step.get("intent_type") == "drug_record_sm":
+    if target_name == "drug_record_agent" and step.get("intent_type") == "drug_record_sm":
         result = await _process_drug_record_state_machine(sub_state)
         result["intent_type"] = "drug_record_sm"
         return result
 
+    from app.core.agent.agent_router import AgentRouter
     router = AgentRouter()
     try:
         result_state = await router.route_and_execute(sub_state)
@@ -620,7 +522,7 @@ async def execute_node(state: dict) -> dict:
     plan = state.get("execution_plan", {})
     steps = plan.get("steps", [])
     strategy = plan.get("strategy", "serial")
-    results: dict[str, dict] = {}
+    results: dict[str, dict] = state.get("plan_step_results") or {}
 
     if not steps:
         state["plan_step_results"] = results
@@ -629,16 +531,27 @@ async def execute_node(state: dict) -> dict:
 
     if strategy == "serial" or len(steps) <= 1:
         for step in steps:
-            sub_state = _build_sub_state(state, step)
+            if step["step_id"] in results:
+                continue
+            sub_state = _build_sub_state(state, step, step_results=results)
             result = await _execute_single_step(sub_state, step)
             results[step["step_id"]] = result
             state.update({k: v for k, v in result.items() if k in ("final_response", "error_msg", "tool_result", "llm_output", "extract_entities")})
     else:
         groups = _group_steps_by_dependency(steps)
         for group in groups:
-            tasks = [_execute_single_step(_build_sub_state(state, step), step) for step in group]
+            tasks = []
+            group_steps = []
+            for step in group:
+                if step["step_id"] in results:
+                    continue
+                sub_state = _build_sub_state(state, step, step_results=results)
+                tasks.append(_execute_single_step(sub_state, step))
+                group_steps.append(step)
+            if not tasks:
+                continue
             group_results = await asyncio.gather(*tasks, return_exceptions=True)
-            for step, result in zip(group, group_results):
+            for step, result in zip(group_steps, group_results):
                 if isinstance(result, Exception):
                     results[step["step_id"]] = {"error_msg": str(result), "final_response": f"处理'{step['query']}'时出现错误。", "intent_type": step.get("intent_type", "general")}
                 else:
@@ -659,6 +572,12 @@ async def reconcile_node(state: dict) -> dict:
     plan = state.get("execution_plan", {})
 
     if not results:
+        return state
+
+    state = await _planner.evaluate_for_replan(state)
+    if state.get("needs_replan"):
+        logger.info("reconcile_node: needs_replan=True reason=%s", state.get("replan_reason"))
+        state["plan_phase"] = "reconciling"
         return state
 
     if len(results) == 1:

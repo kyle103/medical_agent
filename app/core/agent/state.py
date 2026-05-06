@@ -7,10 +7,12 @@ from typing import TypedDict
 class PlanStep(TypedDict, total=False):
     step_id: str
     query: str
-    target_agent: str
+    target_type: Literal["agent", "tool"]
+    target_name: str
     intent_type: str
     depends_on: list[str]
     execution_strategy: Literal["serial", "parallel"]
+    step_context: dict
 
 
 class ExecutionPlan(TypedDict, total=False):
@@ -71,3 +73,7 @@ class AgentState(TypedDict, total=False):
     execution_plan: ExecutionPlan
     plan_step_results: dict
     plan_phase: Literal["planning", "executing", "reconciling", "responding"]
+
+    replan_count: int
+    replan_reason: str
+    needs_replan: bool

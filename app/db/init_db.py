@@ -5,17 +5,48 @@ import csv
 import json
 import os
 from pathlib import Path
-from sqlalchemy import select
+
+from sqlalchemy import inspect, select, text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
+from app.common.logger import get_logger
 from app.config.settings import settings
 from app.db.database import get_engine
 from app.db.models import Base, DrugKnowledgeBase, LabItemReferenceBase
+
+logger = get_logger(__name__)
 
 
 async def init_schema(engine: AsyncEngine) -> None:
     async with engine.begin() as conn:
         await conn.run_sync(Base.metadata.create_all)
+
+    await _migrate_missing_columns(engine)
+
+
+async def _migrate_missing_columns(engine: AsyncEngine) -> None:
+    def _do_migrate(sync_conn) -> None:
+        model_tables = Base.metadata.tables
+        for table_name, table_obj in model_tables.items():
+            try:
+                existing_cols = {row["name"] for row in sync_conn.execute(text(f"PRAGMA table_info({table_name})")).mappings().all()}
+            except Exception:
+                continue
+            for col in table_obj.columns:
+                if col.name not in existing_cols:
+                    col_type = str(col.type).upper()
+                    nullable = "NULL" if col.nullable else "NOT NULL"
+                    default = ""
+                    if col.server_default is not None:
+                        default = f"DEFAULT {col.server_default.arg}"
+                    elif col.nullable:
+                        default = "DEFAULT NULL"
+                    sql = f"ALTER TABLE {table_name} ADD COLUMN {col.name} {col_type} {nullable} {default}".strip()
+                    logger.info("Migrating missing column: %s", sql)
+                    sync_conn.execute(text(sql))
+
+    async with engine.begin() as conn:
+        await conn.run_sync(_do_migrate)
 
 
 async def import_min_kb(engine: AsyncEngine) -> None:

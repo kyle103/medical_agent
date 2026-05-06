@@ -1,9 +1,11 @@
 from __future__ import annotations
 
+import re
+
 from app.common.utils import contains_sensitive_personal_info, detect_prompt_injection
 from app.config.compliance_rules import (
     BANNED_INTENT_HINTS,
-    FORBIDDEN_WORDS,
+    FORBIDDEN_OUTPUT_PATTERNS,
     STANDARD_DISCLAIMER,
 )
 from app.config.settings import settings
@@ -11,7 +13,7 @@ from app.config.settings import settings
 
 class ComplianceService:
     def __init__(self):
-        self.forbidden_words = FORBIDDEN_WORDS
+        self.forbidden_patterns = FORBIDDEN_OUTPUT_PATTERNS
         self.banned_intents = BANNED_INTENT_HINTS
         self.standard_disclaimer = STANDARD_DISCLAIMER
 
@@ -35,9 +37,9 @@ class ComplianceService:
         if not settings.ENABLE_OUTPUT_CHECK:
             return True, ""
 
-        for w in self.forbidden_words:
-            if w in output_content:
-                return False, f"检测到违规医疗内容（{w}），已拦截。"
+        for pattern, label in self.forbidden_patterns:
+            if re.search(pattern, output_content):
+                return False, f"检测到违规医疗内容（{label}），已拦截。"
 
         return True, ""
 

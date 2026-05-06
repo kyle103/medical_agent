@@ -3,9 +3,13 @@ from __future__ import annotations
 from abc import ABC, abstractmethod
 from typing import Any
 
+from app.common.logger import get_logger
 from app.core.agent.agent_card import AgentCard
 from app.core.agent.state_accessor import StateAccessor
+from app.core.compliance.compliance_service import ComplianceService
 from app.core.llm.llm_service import LLMService
+
+logger = get_logger(__name__)
 
 
 class BaseAgent(ABC):
@@ -13,6 +17,7 @@ class BaseAgent(ABC):
     def __init__(self, agent_name: str):
         self.agent_name = agent_name
         self.llm_service = LLMService()
+        self._compliance = ComplianceService()
 
     @abstractmethod
     async def process(self, state: dict[str, Any]) -> dict[str, Any]:
@@ -49,6 +54,13 @@ class BaseAgent(ABC):
             return f"抱歉，处理请求时出现错误：{str(e)}"
 
     def _log_agent_call(self, user_id: str, agent_name: str, input_text: str, output_text: str):
-        from app.common.logger import get_logger
-        logger = get_logger(__name__)
         logger.info("Agent调用 - 用户:%s Agent:%s 输入长度:%s 输出长度:%s", user_id, agent_name, len(input_text), len(output_text))
+
+    def _check_compliance(self, content: str) -> tuple[bool, str]:
+        ok, msg = self._compliance.output_compliance_check(content)
+        if not ok:
+            logger.warning("合规拦截 agent=%s msg=%s", self.agent_name, msg)
+        return ok, msg
+
+    def _add_disclaimer(self, content: str) -> str:
+        return self._compliance.add_disclaimer(content)
