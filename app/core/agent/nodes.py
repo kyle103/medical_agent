@@ -109,7 +109,23 @@ def _format_history(history: list[dict], max_chars: int = 1400) -> str:
 
 
 async def _extract_drug_info_from_text(text: str) -> dict:
-    drug_info: dict = {"dosage": "未指定", "frequency": "未指定", "start_date_text": "未指定", "purpose": "未指定"}
+    from app.core.agent.llm_decision_service import LLMDecisionService
+
+    default_info: dict = {"dosage": "未指定", "frequency": "未指定", "start_date_text": "未指定", "purpose": "未指定"}
+
+    llm_decision = LLMDecisionService()
+    llm_result = await llm_decision.extract_drug_info(text)
+    if llm_result and llm_result.get("drug_name"):
+        drug_info = dict(default_info)
+        if llm_result.get("dosage"):
+            drug_info["dosage"] = llm_result["dosage"]
+        if llm_result.get("frequency"):
+            drug_info["frequency"] = llm_result["frequency"]
+        if llm_result.get("start_date_text"):
+            drug_info["start_date_text"] = llm_result["start_date_text"]
+        if llm_result.get("purpose"):
+            drug_info["purpose"] = llm_result["purpose"]
+        return drug_info
 
     dosage_patterns = [
         r"(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋|贴)",
@@ -136,25 +152,25 @@ async def _extract_drug_info_from_text(text: str) -> dict:
     for pattern in dosage_patterns:
         match = re.search(pattern, text)
         if match:
-            drug_info["dosage"] = match.group(0)
+            default_info["dosage"] = match.group(0)
             break
     for pattern in frequency_patterns:
         match = re.search(pattern, text)
         if match:
-            drug_info["frequency"] = match.group(0)
+            default_info["frequency"] = match.group(0)
             break
     for pattern in start_date_patterns:
         match = re.search(pattern, text)
         if match:
-            drug_info["start_date_text"] = match.group(1) if match.groups() else match.group(0)
+            default_info["start_date_text"] = match.group(1) if match.groups() else match.group(0)
             break
     for pattern in purpose_patterns:
         match = re.search(pattern, text)
         if match:
-            drug_info["purpose"] = match.group(2) if len(match.groups()) > 1 else match.group(1)
+            default_info["purpose"] = match.group(2) if len(match.groups()) > 1 else match.group(1)
             break
 
-    return drug_info
+    return default_info
 
 
 async def _commit_drug_record(user_id: str, sm: DrugRecordStateMachine) -> dict:
@@ -372,14 +388,32 @@ async def intent_recognition(state: dict) -> dict:
 
 
 async def entity_extraction(state: dict) -> dict:
+    from app.core.agent.llm_decision_service import LLMDecisionService
+
     intent = state.get("intent")
     text = state.get("user_input", "")
 
     entities: dict = {}
     if intent == "drug":
-        entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
+        llm_decision = LLMDecisionService()
+        llm_entities = await llm_decision.extract_entities(text, "drug")
+        if llm_entities and llm_entities.get("drug_name_list"):
+            entities["drug_name_list"] = llm_entities["drug_name_list"]
+            if llm_entities.get("dosage"):
+                entities["dosage"] = llm_entities["dosage"]
+            if llm_entities.get("frequency"):
+                entities["frequency"] = llm_entities["frequency"]
+            if llm_entities.get("start_date_text"):
+                entities["start_date_text"] = llm_entities["start_date_text"]
+        else:
+            entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
     elif intent == "lab":
-        entities["raw"] = text
+        llm_decision = LLMDecisionService()
+        llm_entities = await llm_decision.extract_entities(text, "lab")
+        if llm_entities and llm_entities.get("lab_items"):
+            entities.update(llm_entities)
+        else:
+            entities["raw"] = text
     else:
         entities["query"] = text
 
@@ -821,11 +855,16 @@ async def memory_update(state: dict) -> dict:
                 drug_events = [item for item in items if item.memory_type == "drug_event"]
                 if drug_events:
                     drug_info_list = []
+                    from app.core.agent.llm_decision_service import LLMDecisionService
+                    llm_decision = LLMDecisionService()
                     for event in drug_events:
                         original_text = event.text.replace("用户", "我")
-                        drug_match = re.search(r"(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})", original_text)
-                        if drug_match:
-                            drug_name = drug_match.group(1).strip()
+                        drug_name = await llm_decision.extract_drug_name_from_event(original_text)
+                        if not drug_name:
+                            drug_match = re.search(r"(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})", original_text)
+                            if drug_match:
+                                drug_name = drug_match.group(1).strip()
+                        if drug_name:
                             drug_info_list.append({"drug_name": drug_name, "full_text": original_text, "confidence": event.confidence})
 
                     if drug_info_list:

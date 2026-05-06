@@ -6,6 +6,7 @@ from typing import Any
 from app.common.logger import get_logger
 from app.config.settings import settings
 from app.core.agent.intent_classifier import IntentClassifier
+from app.core.agent.llm_decision_service import LLMDecisionService
 from app.core.agent.state import ExecutionPlan, PlanStep
 from app.core.llm.llm_service import LLMService
 from app.core.skills.drug_record_state_machine import DrugRecordPhase, DrugRecordStateMachine
@@ -115,12 +116,78 @@ def _llm_enabled() -> bool:
     return _ok(settings.LLM_API_BASE) and _ok(settings.LLM_API_KEY) and _ok(settings.LLM_MODEL_NAME)
 
 
+def _split_user_queries_rule(text: str) -> list[str]:
+    import re
+    raw = (text or "").strip()
+    if not raw:
+        return []
+    parts = re.split(r"[。！？!?；;]+", raw)
+    parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
+    out: list[str] = []
+    for p in parts:
+        sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
+        for s in sub:
+            s = s.strip(" ，,")
+            if s:
+                out.append(s)
+    dedup: list[str] = []
+    seen = set()
+    for q in out:
+        if q in seen:
+            continue
+        seen.add(q)
+        dedup.append(q)
+    return dedup
+
+
+async def _split_user_queries(text: str) -> list[str]:
+    if _llm_enabled():
+        llm_decision = LLMDecisionService()
+        llm_result = await llm_decision.split_queries(text)
+        if llm_result and len(llm_result) > 0:
+            logger.info("_split_user_queries: LLM split into %d queries", len(llm_result))
+            return llm_result
+    rule_result = _split_user_queries_rule(text)
+    logger.info("_split_user_queries: rule split into %d queries", len(rule_result))
+    return rule_result
+
+
+async def _predict_intent_for_query(query: str) -> dict | None:
+    try:
+        clf = IntentClassifier()
+        sub_intent = await clf.predict(text=query, stream=False)
+        return {"intent": sub_intent.intent, "confidence": sub_intent.confidence, "reason": sub_intent.reason}
+    except Exception:
+        return None
+
+
+async def _route_single_query(query: str, state: dict) -> dict:
+    if _llm_enabled():
+        llm_decision = LLMDecisionService()
+        llm_route = await llm_decision.classify_intent_and_route(query)
+        if llm_route and llm_route.get("confidence", 0) >= 0.5:
+            logger.info("_route_single_query: LLM route query=%s -> %s", query[:20], llm_route.get("target_name"))
+            return llm_route
+
+    pred = await _predict_intent_for_query(query)
+    intent_val = pred.get("intent", "general") if pred else "general"
+    conf_val = pred.get("confidence", 0.5) if pred else 0.5
+
+    sub_state = dict(state)
+    sub_state["user_input"] = query
+    sub_state["intent"] = intent_val
+    sub_state["intent_confidence"] = conf_val
+    rule_route = _route_by_intent_and_text(sub_state)
+    logger.info("_route_single_query: rule route query=%s -> %s", query[:20], rule_route.get("target_name"))
+    return rule_route
+
+
 class PlannerAgent:
     """Plan-and-Execute 协调者：负责计划生成、执行评估与动态重规划。
 
     设计原则：
-    - 规则优先（快速、确定性高、零额外延迟）
-    - LLM 增强（处理复杂/模糊场景的依赖检测与重规划评估）
+    - LLM 优先（暴露工具/Agent 描述，由 LLM 统一决策）
+    - 正则/关键词兜底（LLM 不可用或失败时）
     - 支持重规划循环（最多 MAX_REPLAN 次）
     """
 
@@ -154,10 +221,10 @@ class PlannerAgent:
                 logger.info("PlannerAgent plan: active state machine -> drug_record_agent")
                 return state
 
-        sub_queries = _split_user_queries(user_input)
+        sub_queries = await _split_user_queries(user_input)
 
         if len(sub_queries) <= 1:
-            route_result = _route_by_intent_and_text(state)
+            route_result = await _route_single_query(user_input, state)
             state["intent_analysis"] = route_result
             state["target_agent"] = route_result["target_name"]
             state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))
@@ -178,15 +245,7 @@ class PlannerAgent:
         else:
             steps = []
             for i, q in enumerate(sub_queries):
-                pred = await _predict_intent_for_query(q)
-                intent_val = pred.get("intent", "general") if pred else "general"
-                conf_val = pred.get("confidence", 0.5) if pred else 0.5
-
-                sub_state = dict(state)
-                sub_state["user_input"] = q
-                sub_state["intent"] = intent_val
-                sub_state["intent_confidence"] = conf_val
-                route_result = _route_by_intent_and_text(sub_state)
+                route_result = await _route_single_query(q, state)
 
                 deps = await _detect_dependencies_semantic(q, sub_queries, i)
 
@@ -195,7 +254,7 @@ class PlannerAgent:
                     query=q,
                     target_type=route_result.get("target_type", "agent"),
                     target_name=route_result["target_name"],
-                    intent_type=route_result.get("intent_type", intent_val),
+                    intent_type=route_result.get("intent_type", "general"),
                     depends_on=deps,
                     execution_strategy="parallel" if not deps else "serial",
                 ))
@@ -293,37 +352,4 @@ class PlannerAgent:
 
         if len(drug_names_from_steps) >= 2:
             return f"多步骤涉及药物{drug_names_from_steps}，需补充冲突检查"
-        return None
-
-
-def _split_user_queries(text: str) -> list[str]:
-    import re
-    raw = (text or "").strip()
-    if not raw:
-        return []
-    parts = re.split(r"[。！？!?；;]+", raw)
-    parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
-    out: list[str] = []
-    for p in parts:
-        sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
-        for s in sub:
-            s = s.strip(" ，,")
-            if s:
-                out.append(s)
-    dedup: list[str] = []
-    seen = set()
-    for q in out:
-        if q in seen:
-            continue
-        seen.add(q)
-        dedup.append(q)
-    return dedup
-
-
-async def _predict_intent_for_query(query: str) -> dict | None:
-    try:
-        clf = IntentClassifier()
-        sub_intent = await clf.predict(text=query, stream=False)
-        return {"intent": sub_intent.intent, "confidence": sub_intent.confidence, "reason": sub_intent.reason}
-    except Exception:
         return None

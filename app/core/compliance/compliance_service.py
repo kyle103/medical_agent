@@ -44,6 +44,8 @@ class ComplianceService:
         return True, ""
 
     def add_disclaimer(self, content: str) -> str:
-        if settings.FORCE_DISCLAIMER:
-            return f"{content}\n\n{self.standard_disclaimer}"
-        return content
+        if not content:
+            return self.standard_disclaimer
+        if self.standard_disclaimer in content or "免责声明" in content:
+            return content
+        return f"{content}\n\n{self.standard_disclaimer}"
