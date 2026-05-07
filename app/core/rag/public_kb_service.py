@@ -3,7 +3,7 @@ from __future__ import annotations
 from typing import Any
 
 from app.common.langfuse_helper import elapsed_ms, time_block, track_rag_retrieval
-from app.common.logger import get_logger
+from app.common.logger import get_logger, log_rag_retrieval as _log_rag
 from app.config.settings import settings
 from app.core.llm.embedding_service import EmbeddingService
 from app.db.milvus_store import (
@@ -102,13 +102,7 @@ class PublicKnowledgeService:
             bm25_top_k = int(getattr(settings, "PUBLIC_KB_BM25_TOP_K", 0))
             rrf_k = int(getattr(settings, "PUBLIC_KB_RRF_K", 60))
 
-            logger.info(
-                "public_kb retrieve start collection=%s top_k=%s bm25_top_k=%s rrf_k=%s",
-                self.collection_name,
-                top_k,
-                bm25_top_k,
-                rrf_k,
-            )
+            mode = "hybrid" if bm25_top_k > 0 else "dense_only"
 
             vectors = await self.embedder.embed_documents([q])
             dense_hits = vector_search(
@@ -148,14 +142,25 @@ class PublicKnowledgeService:
                         continue
                     seen.add(key)
                     deduped.append(it)
-                logger.info("public_kb retrieve done dense_only count=%s", len(deduped))
                 final = deduped[: max(1, int(top_k))]
+                latency = elapsed_ms(start)
                 track_rag_retrieval(
                     source="public_kb",
                     count=len(final),
-                    latency_ms=elapsed_ms(start),
+                    latency_ms=latency,
                     success=True,
                     extra={"mode": "dense_only"},
+                )
+                _log_rag(
+                    source="public_kb",
+                    query=q,
+                    method="dense_only",
+                    collection=self.collection_name,
+                    top_k=top_k,
+                    result_count=len(final),
+                    latency_ms=latency,
+                    success=True,
+                    extra={"dense_hits": len(items)},
                 )
                 return final
 
@@ -218,26 +223,43 @@ class PublicKnowledgeService:
                 seen.add(key)
                 deduped.append(it)
             final = deduped[: max(1, int(top_k))]
-            logger.info(
-                "public_kb retrieve done hybrid count=%s dense_hits=%s bm25_hits=%s",
-                len(final),
-                len(items),
-                len(bm25_items),
-            )
+            latency = elapsed_ms(start)
             track_rag_retrieval(
                 source="public_kb",
                 count=len(final),
-                latency_ms=elapsed_ms(start),
+                latency_ms=latency,
                 success=True,
                 extra={"mode": "hybrid", "dense_hits": len(items), "bm25_hits": len(bm25_items)},
             )
+            _log_rag(
+                source="public_kb",
+                query=q,
+                method="hybrid_rrf",
+                collection=self.collection_name,
+                top_k=top_k,
+                result_count=len(final),
+                latency_ms=latency,
+                success=True,
+                extra={"dense_hits": len(items), "bm25_hits": len(bm25_items), "rrf_k": rrf_k},
+            )
             return final
         except Exception as exc:
+            latency = elapsed_ms(start)
             track_rag_retrieval(
                 source="public_kb",
                 count=0,
-                latency_ms=elapsed_ms(start),
+                latency_ms=latency,
                 success=False,
                 error=str(exc),
+            )
+            _log_rag(
+                source="public_kb",
+                query=q,
+                method=mode,
+                collection=self.collection_name,
+                result_count=0,
+                latency_ms=latency,
+                success=False,
+                error=str(exc)[:100],
             )
             raise

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import re
+import time
 
 from app.common.logger import get_logger
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
@@ -27,12 +28,25 @@ class ToolExecutor:
             logger.error("ToolExecutor unknown tool=%s", tool_name)
             return {"error_msg": f"未知工具: {tool_name}", "final_desc": ""}
 
+        start_time = time.perf_counter()
         try:
             result = await handler(state)
-            logger.info("ToolExecutor tool=%s success", tool_name)
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.info(
+                "[TOOL] %s | latency=%dms | OK | has_error=%s",
+                tool_name,
+                latency_ms,
+                bool(result.get("error_msg")),
+            )
             return result
         except Exception as e:
-            logger.error("ToolExecutor tool=%s failed: %s", tool_name, e)
+            latency_ms = int((time.perf_counter() - start_time) * 1000)
+            logger.error(
+                "[TOOL] %s | latency=%dms | FAIL | error=%s",
+                tool_name,
+                latency_ms,
+                str(e)[:100],
+            )
             return {"error_msg": str(e), "final_desc": ""}
 
     async def _execute_drug_interaction(self, state: dict) -> dict:

@@ -8,7 +8,7 @@ from datetime import date, datetime
 
 from sqlalchemy import and_, select
 
-from app.common.logger import get_logger
+from app.common.logger import get_logger, log_node_execution
 from app.core.agent.intent_classifier import IntentClassifier
 from app.core.agent.planner_agent import PlannerAgent
 from app.core.agent.state import ExecutionPlan, PlanStep
@@ -279,11 +279,17 @@ async def _process_drug_record_state_machine(state: dict) -> dict:
 
 
 async def input_check(state: dict) -> dict:
+    _t0 = time.perf_counter()
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="input_check", latency_ms=latency_ms)
     return state
 
 
 async def memory_load(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="memory_load", latency_ms=latency_ms, skipped=True)
         return state
 
     user_id = state.get("user_id")
@@ -369,10 +375,13 @@ async def memory_load(state: dict) -> dict:
     if not state.get("long_memory_items"):
         logger.debug("long_memory recall empty")
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="memory_load", latency_ms=latency_ms, long_mem_count=len(state.get("long_memory_items") or []))
     return state
 
 
 async def intent_recognition(state: dict) -> dict:
+    _t0 = time.perf_counter()
     from app.core.agent.intent_classifier import IntentClassifier
 
     text = state.get("user_input", "").strip().lower()
@@ -384,10 +393,13 @@ async def intent_recognition(state: dict) -> dict:
     state["intent_confidence"] = res.confidence
     state["intent_reason"] = res.reason
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=res.intent, confidence=res.confidence)
     return state
 
 
 async def entity_extraction(state: dict) -> dict:
+    _t0 = time.perf_counter()
     from app.core.agent.llm_decision_service import LLMDecisionService
 
     intent = state.get("intent")
@@ -418,11 +430,16 @@ async def entity_extraction(state: dict) -> dict:
         entities["query"] = text
 
     state["extract_entities"] = entities
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="entity_extraction", latency_ms=latency_ms, intent=intent, entity_keys=list(entities.keys()))
     return state
 
 
 async def knowledge_retrieve(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, skipped=True)
         return state
     start_time = time.time()
     try:
@@ -452,11 +469,24 @@ async def knowledge_retrieve(state: dict) -> dict:
         except Exception:
             state.setdefault("retrieved_knowledge", {})["public_kb"] = []
         logger.info("knowledge_retrieve public_kb count=%s", len((state.get("retrieved_knowledge") or {}).get("public_kb") or []))
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, intent=state.get("intent"), knowledge_keys=list((state.get("retrieved_knowledge") or {}).keys()))
     return state
 
 
 async def plan_node(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="plan_node", latency_ms=latency_ms, skipped=True)
+        return state
+
+    if state.get("needs_replan"):
+        state["needs_replan"] = False
+        state["plan_phase"] = "planning"
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="plan_node", latency_ms=latency_ms, replan=True, replan_reason=state.get("replan_reason", ""))
+        logger.info("plan_node: replan using revised plan, plan_phase=%s", state.get("plan_phase"))
         return state
 
     state = await _planner.generate_plan(state)
@@ -465,6 +495,10 @@ async def plan_node(state: dict) -> dict:
     if route_result:
         state["target_agent"] = route_result.get("target_name", "")
 
+    plan = state.get("execution_plan", {})
+    steps = plan.get("steps", [])
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="plan_node", latency_ms=latency_ms, step_count=len(steps), strategy=plan.get("strategy", ""))
     logger.info("plan_node delegated to PlannerAgent, plan_phase=%s", state.get("plan_phase"))
     return state
 
@@ -550,7 +584,10 @@ async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
 
 
 async def execute_node(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="execute_node", latency_ms=latency_ms, skipped=True)
         return state
 
     plan = state.get("execution_plan", {})
@@ -561,16 +598,47 @@ async def execute_node(state: dict) -> dict:
     if not steps:
         state["plan_step_results"] = results
         state["plan_phase"] = "executing"
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="execute_node", latency_ms=latency_ms, step_count=0)
         return state
 
     if strategy == "serial" or len(steps) <= 1:
         for step in steps:
             if step["step_id"] in results:
                 continue
+            step_t0 = time.perf_counter()
             sub_state = _build_sub_state(state, step, step_results=results)
             result = await _execute_single_step(sub_state, step)
             results[step["step_id"]] = result
             state.update({k: v for k, v in result.items() if k in ("final_response", "error_msg", "tool_result", "llm_output", "extract_entities")})
+            state["plan_step_results"] = results
+
+            step_latency_ms = int((time.perf_counter() - step_t0) * 1000)
+            logger.info(
+                "[STEP] %s | target=%s query=\"%s\" | latency=%dms | has_error=%s",
+                step["step_id"],
+                step.get("target_name", ""),
+                step.get("query", "")[:30],
+                step_latency_ms,
+                bool(result.get("error_msg")),
+            )
+
+            state = await _planner.evaluate_for_replan(state)
+            if state.get("needs_replan"):
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                log_node_execution(
+                    node_name="execute_node",
+                    latency_ms=latency_ms,
+                    needs_replan=True,
+                    replan_reason=state.get("replan_reason", ""),
+                    completed_step=step["step_id"],
+                )
+                logger.info(
+                    "execute_node: needs_replan after step=%s reason=%s",
+                    step["step_id"],
+                    state.get("replan_reason"),
+                )
+                return state
     else:
         groups = _group_steps_by_dependency(steps)
         for group in groups:
@@ -584,34 +652,64 @@ async def execute_node(state: dict) -> dict:
                 group_steps.append(step)
             if not tasks:
                 continue
+            group_t0 = time.perf_counter()
             group_results = await asyncio.gather(*tasks, return_exceptions=True)
+            group_latency_ms = int((time.perf_counter() - group_t0) * 1000)
             for step, result in zip(group_steps, group_results):
                 if isinstance(result, Exception):
                     results[step["step_id"]] = {"error_msg": str(result), "final_response": f"处理'{step['query']}'时出现错误。", "intent_type": step.get("intent_type", "general")}
                 else:
                     results[step["step_id"]] = result
 
+            state["plan_step_results"] = results
+            logger.info(
+                "[STEP_GROUP] steps=%s | latency=%dms",
+                [s["step_id"] for s in group_steps],
+                group_latency_ms,
+            )
+
+            state = await _planner.evaluate_for_replan(state)
+            if state.get("needs_replan"):
+                latency_ms = int((time.perf_counter() - _t0) * 1000)
+                log_node_execution(
+                    node_name="execute_node",
+                    latency_ms=latency_ms,
+                    needs_replan=True,
+                    replan_reason=state.get("replan_reason", ""),
+                )
+                logger.info(
+                    "execute_node: needs_replan after group reason=%s",
+                    state.get("replan_reason"),
+                )
+                return state
+
     state["plan_step_results"] = results
     state["plan_phase"] = "executing"
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(
+        node_name="execute_node",
+        latency_ms=latency_ms,
+        step_count=len(steps),
+        results_count=len(results),
+    )
     logger.info("execute_node done steps=%s results_keys=%s", [s["step_id"] for s in steps], list(results.keys()))
     return state
 
 
 async def reconcile_node(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg") and not state.get("plan_step_results"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="reconcile_node", latency_ms=latency_ms, skipped=True)
         return state
 
     results = state.get("plan_step_results", {})
     plan = state.get("execution_plan", {})
 
     if not results:
-        return state
-
-    state = await _planner.evaluate_for_replan(state)
-    if state.get("needs_replan"):
-        logger.info("reconcile_node: needs_replan=True reason=%s", state.get("replan_reason"))
-        state["plan_phase"] = "reconciling"
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="reconcile_node", latency_ms=latency_ms, skipped=True)
         return state
 
     if len(results) == 1:
@@ -669,11 +767,16 @@ async def reconcile_node(state: dict) -> dict:
         state["intent_type"] = "multi"
 
     state["plan_phase"] = "reconciling"
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="reconcile_node", latency_ms=latency_ms, result_count=len(results), has_sections=bool(sections))
     return state
 
 
 async def response_plan(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg") and state.get("final_response"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="response_plan", latency_ms=latency_ms, skipped=True)
         return state
 
     intent = state.get("intent") or "general"
@@ -694,16 +797,23 @@ async def response_plan(state: dict) -> dict:
 
     state["response_mode"] = mode
     state["inject_memory"] = bool(need_mem)
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="response_plan", latency_ms=latency_ms, mode=mode, inject_memory=bool(need_mem))
     return state
 
 
 async def llm_generate(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("final_response"):
         state["llm_output"] = state["final_response"]
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="final_response")
         return state
 
     if state.get("needs_confirmation") and state.get("confirmation_message"):
         state["llm_output"] = state["confirmation_message"]
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="confirmation")
         return state
 
     content = (state.get("tool_result") or {}).get("final_desc") or ""
@@ -728,6 +838,8 @@ async def llm_generate(state: dict) -> dict:
         state["llm_output"] = skill.build_confirmation_message(candidate_drug_events)
         state["skill_ctx"] = state.get("skill_ctx") or {}
         state["skill_ctx"]["medication_confirmation"] = {"candidate_events": candidate_drug_events}
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="drug_confirmation")
         return state
 
     if mode == "llm_format":
@@ -773,10 +885,13 @@ async def llm_generate(state: dict) -> dict:
         logger.error(f"LLM生成失败: {e}")
         state["llm_output"] = content
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="llm_generate", latency_ms=latency_ms, mode=mode, output_len=len(state.get("llm_output") or ""))
     return state
 
 
 async def output_check_and_disclaimer(state: dict) -> dict:
+    _t0 = time.perf_counter()
     from app.core.compliance.compliance_service import ComplianceService
 
     state["final_response"] = state.get("llm_output", "") or state.get("final_response", "")
@@ -788,11 +903,16 @@ async def output_check_and_disclaimer(state: dict) -> dict:
     proposed.append({"scope": "shared", "key": "latest_response", "value": state.get("final_response", ""), "source": "out"})
     state["proposed_updates"] = proposed
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="output_check_and_disclaimer", latency_ms=latency_ms)
     return state
 
 
 async def commit_gate(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="commit_gate", latency_ms=latency_ms, skipped=True)
         return state
 
     shared = dict(state.get("shared_facts") or {})
@@ -830,11 +950,16 @@ async def commit_gate(state: dict) -> dict:
 
     state["shared_facts"] = shared
     state["proposed_updates"] = []
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="commit_gate", latency_ms=latency_ms)
     return state
 
 
 async def memory_update(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="memory_update", latency_ms=latency_ms, skipped=True)
         return state
 
     mem = MemoryService()
@@ -895,10 +1020,15 @@ async def memory_update(state: dict) -> dict:
     except Exception:
         pass
 
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="memory_update", latency_ms=latency_ms)
     return state
 
 
 async def error_finalize(state: dict) -> dict:
+    _t0 = time.perf_counter()
     if state.get("error_msg"):
         state["final_response"] = state["error_msg"]
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="error_finalize", latency_ms=latency_ms, has_error=bool(state.get("error_msg")))
     return state

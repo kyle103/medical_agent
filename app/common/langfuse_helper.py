@@ -4,7 +4,7 @@ import os
 import time
 from typing import Any, Optional
 
-from app.common.logger import get_logger
+from app.common.logger import get_logger, log_rag_retrieval as _log_rag
 
 logger = get_logger(__name__)
 

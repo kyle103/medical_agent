@@ -58,14 +58,15 @@ class MedicalAgent:
         g.add_edge("entities", "knowledge")
         g.add_edge("knowledge", "plan")
         g.add_edge("plan", "execute")
-        g.add_edge("execute", "reconcile")
 
-        def _after_reconcile(state: dict) -> str:
+        def _after_execute(state: dict) -> str:
             if state.get("needs_replan"):
                 return "plan"
-            return "response_plan"
+            return "reconcile"
 
-        g.add_conditional_edges("reconcile", _after_reconcile, {"plan": "plan", "response_plan": "response_plan"})
+        g.add_conditional_edges("execute", _after_execute, {"plan": "plan", "reconcile": "reconcile"})
+
+        g.add_edge("reconcile", "response_plan")
 
         g.add_edge("response_plan", "llm")
         g.add_edge("llm", "out")
