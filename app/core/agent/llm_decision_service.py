@@ -20,13 +20,13 @@ CAPABILITY_REGISTRY = [
         "name": "drug_record_agent",
         "type": "agent",
         "description": "管理用药记录：添加、查询、删除用户的用药信息。输入：药品名称、剂量、频率等。输出：操作确认或记录列表。",
-        "when_to_use": "用户想记录/添加/删除自己的用药信息，或查询自己的用药记录。",
+        "when_to_use": "用户明确想记录/添加/删除自己的用药信息（如'我吃了XX药'、'帮我记录用药'），或查询自己的用药记录列表。注意：如果用户只是问'可以吃什么药'或'推荐什么药'，应路由到main_qa_agent。",
     },
     {
         "name": "main_qa_agent",
         "type": "agent",
-        "description": "通用医疗问答与档案查询。输入：用户问题。输出：基于档案或知识的回答。",
-        "when_to_use": "用户查询自己的健康档案、就诊记录、历史用药，或提出通用健康科普问题。",
+        "description": "通用医疗问答、档案查询与药物推荐。输入：用户问题。输出：基于档案或知识的回答，包括疾病用药推荐等科普信息。",
+        "when_to_use": "用户查询自己的健康档案、就诊记录、历史用药，提出通用健康科普问题，或询问某种疾病可以吃什么药、推荐用药等。",
     },
     {
         "name": "lab_report",
@@ -98,7 +98,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=8.0,
+                timeout_s=4.0,
                 max_tokens=300,
             )
             if not raw:
@@ -139,6 +139,94 @@ class LLMDecisionService:
             logger.warning("LLMDecisionService.classify_intent_and_route failed: %s", e)
             return None
 
+    async def batch_route_queries(self, queries: list[str]) -> list[dict | None]:
+        """LLM 批量路由：一次调用完成所有子查询的路由决策。
+
+        返回与 queries 等长的列表，每个元素格式同 classify_intent_and_route。
+        """
+        if not _llm_enabled() or not queries:
+            return [None] * len(queries)
+        if len(queries) == 1:
+            result = await self.classify_intent_and_route(queries[0])
+            return [result]
+
+        capabilities_desc = "\n".join(
+            f"- {c['name']} (类型: {c['type']}): {c['description']}\n  适用场景: {c['when_to_use']}"
+            for c in CAPABILITY_REGISTRY
+        )
+
+        queries_desc = "\n".join(f"{i+1}. {q}" for i, q in enumerate(queries))
+
+        system_prompt = (
+            "你是一个医疗问答系统的批量意图分类与路由决策器。\n"
+            "以下是系统可用的工具和Agent：\n\n"
+            f"{capabilities_desc}\n\n"
+            "请对每个子查询分别判断意图并选择最合适的工具/Agent。\n"
+            "你必须只输出合法JSON数组，不要输出Markdown标记，不要有任何其他解释内容。\n"
+            "数组长度必须与输入子查询数量一致。\n"
+            "每个元素的JSON字段：\n"
+            '- intent: "archive"(档案查询) | "drug"(药物相关) | "lab"(化验解读) | "general"(通用问答)\n'
+            '- intent_type: "archive" | "drug_conflict" | "drug_record" | "drug_query" | "lab_report" | "general"\n'
+            '- target_type: "agent" | "tool"\n'
+            '- target_name: 从上面的工具/Agent列表中选择\n'
+            "- confidence: 0.0~1.0\n"
+            "- reason: 简短说明决策理由"
+        )
+
+        user_prompt = f"子查询列表：\n{queries_desc}\n\n请输出决策JSON数组："
+
+        try:
+            raw = await self.llm.chat_completion(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                stream=False,
+                timeout_s=6.0,
+                max_tokens=800,
+            )
+            if not raw:
+                return [None] * len(queries)
+            import re
+            match = re.search(r"\[.*\]", raw, re.DOTALL)
+            json_str = match.group(0) if match else raw
+            data = json.loads(json_str)
+            if not isinstance(data, list):
+                return [None] * len(queries)
+
+            valid_intents = {"archive", "drug", "lab", "general"}
+            valid_targets = {c["name"] for c in CAPABILITY_REGISTRY}
+            valid_types = {"agent", "tool"}
+
+            results: list[dict | None] = []
+            for item in data:
+                if not isinstance(item, dict):
+                    results.append(None)
+                    continue
+                intent = item.get("intent", "")
+                target_name = item.get("target_name", "")
+                target_type = item.get("target_type", "")
+                confidence = float(item.get("confidence", 0.0) or 0.0)
+                if intent not in valid_intents or target_name not in valid_targets or target_type not in valid_types:
+                    results.append(None)
+                    continue
+                expected_type = next((c["type"] for c in CAPABILITY_REGISTRY if c["name"] == target_name), None)
+                if expected_type and target_type != expected_type:
+                    target_type = expected_type
+                results.append({
+                    "intent": intent,
+                    "intent_type": item.get("intent_type", intent),
+                    "target_type": target_type,
+                    "target_name": target_name,
+                    "confidence": max(min(confidence, 1.0), 0.0),
+                    "reason": item.get("reason", ""),
+                })
+
+            while len(results) < len(queries):
+                results.append(None)
+            return results[:len(queries)]
+        except Exception as e:
+            logger.warning("LLMDecisionService.batch_route_queries failed: %s", e)
+            return [None] * len(queries)
+
     async def split_queries(self, text: str) -> list[str] | None:
         """LLM 优先：将多意图输入拆分为独立子查询。"""
         if not _llm_enabled():
@@ -159,7 +247,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=6.0,
+                timeout_s=3.0,
                 max_tokens=300,
             )
             if not raw:
@@ -205,7 +293,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=6.0,
+                timeout_s=3.0,
                 max_tokens=300,
             )
             if not raw:
@@ -243,7 +331,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=6.0,
+                timeout_s=3.0,
                 max_tokens=300,
             )
             if not raw:
@@ -281,7 +369,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=5.0,
+                timeout_s=3.0,
                 max_tokens=20,
             )
             if not raw:
@@ -319,7 +407,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=6.0,
+                timeout_s=4.0,
                 max_tokens=300,
             )
             if not raw:
@@ -357,7 +445,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=4.0,
+                timeout_s=2.0,
                 max_tokens=30,
             )
             if raw:

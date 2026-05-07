@@ -101,7 +101,7 @@ class MedicalAgent:
             "stream": stream,
             "enable_archive_link": enable_archive_link,
         }
-        out = await self.graph.ainvoke(state)
+        out = await self.graph.ainvoke(state, config={"callbacks": None})
 
         return {
             "session_id": session_id,

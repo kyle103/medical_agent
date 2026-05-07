@@ -33,8 +33,8 @@ class Settings(BaseSettings):
     LLM_MAX_TOKENS: int = 2048
     # 对低意图/不确定意图场景的额外 LLM 增强（意图识别专用）
     INTENT_LLM_ENABLED: bool = True
-    INTENT_LLM_TIMEOUT_S: float = 10.2
-    INTENT_LLM_MAX_TOKENS: int = 512
+    INTENT_LLM_TIMEOUT_S: float = 4.0
+    INTENT_LLM_MAX_TOKENS: int = 256
 
     # Embedding
     EMBEDDING_TYPE: str = Field(default="{{local/api}}")

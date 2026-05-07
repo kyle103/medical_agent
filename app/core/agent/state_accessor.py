@@ -63,29 +63,42 @@ class StateAccessor:
                     result[k] = val
         return result
 
+    MAX_CONTEXT_CHARS = 3000
+
     def build_memory_context(self) -> str:
         visible = self.read_visible_state()
         parts = []
 
+        retrieved_knowledge = visible.get("retrieved_knowledge")
+        if isinstance(retrieved_knowledge, dict) and retrieved_knowledge:
+            knowledge_str = json.dumps(retrieved_knowledge, ensure_ascii=False)
+            if len(knowledge_str) > 1500:
+                knowledge_str = knowledge_str[:1500] + "...(截断)"
+            parts.append(f"医疗知识检索结果：\n{knowledge_str}")
+
         memory_summary = visible.get("memory_summary")
         if isinstance(memory_summary, str) and memory_summary.strip():
-            parts.append(f"会话摘要：\n{memory_summary}")
+            parts.append(f"会话摘要：\n{memory_summary[:500]}")
 
         shared_facts = visible.get("shared_facts")
         if isinstance(shared_facts, dict) and shared_facts:
-            parts.append(f"共享事实：\n{json.dumps(shared_facts, ensure_ascii=False)}")
-
-        retrieved_knowledge = visible.get("retrieved_knowledge")
-        if isinstance(retrieved_knowledge, dict) and retrieved_knowledge:
-            parts.append(f"医疗知识检索结果：\n{json.dumps(retrieved_knowledge, ensure_ascii=False)}")
+            facts_str = json.dumps(shared_facts, ensure_ascii=False)
+            if len(facts_str) > 500:
+                facts_str = facts_str[:500] + "...(截断)"
+            parts.append(f"共享事实：\n{facts_str}")
 
         long_memory_items = visible.get("long_memory_items")
         if isinstance(long_memory_items, list) and long_memory_items:
-            safe_items = [f"- ({it.get('memory_type', 'fact')}) {it.get('text', '')}" for it in long_memory_items[:4]]
+            safe_items = [f"- ({it.get('memory_type', 'fact')}) {it.get('text', '')}" for it in long_memory_items[:3]]
             parts.append("召回长期记忆（可能不准确，仅供参考）：\n" + "\n".join(safe_items))
 
         history_text = visible.get("history_text")
         if isinstance(history_text, str) and history_text.strip():
+            if len(history_text) > 800:
+                history_text = history_text[-800:]
             parts.append(f"近期对话历史：\n{history_text}")
 
-        return "\n\n".join(parts)
+        result = "\n\n".join(parts)
+        if len(result) > self.MAX_CONTEXT_CHARS:
+            result = result[:self.MAX_CONTEXT_CHARS] + "\n...(上下文已截断)"
+        return result

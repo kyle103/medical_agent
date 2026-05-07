@@ -8,8 +8,8 @@ from datetime import date, datetime
 
 from sqlalchemy import and_, select
 
-from app.common.logger import get_logger, log_node_execution
-from app.core.agent.intent_classifier import IntentClassifier
+from app.common.logger import get_logger, log_node_execution, log_step_execution
+from app.core.agent.intent_classifier import IntentClassifier, IntentResult
 from app.core.agent.planner_agent import PlannerAgent
 from app.core.agent.state import ExecutionPlan, PlanStep
 from app.core.agent.tool_executor import ToolExecutor
@@ -33,6 +33,14 @@ logger = get_logger(__name__)
 
 _planner = PlannerAgent()
 _tool_executor = ToolExecutor()
+
+
+def _llm_enabled_for_nodes() -> bool:
+    from app.config.settings import settings
+    def _ok(v: str) -> bool:
+        v = (v or '').strip()
+        return bool(v) and not (v.startswith('{{') and v.endswith('}}'))
+    return _ok(settings.LLM_API_BASE) and _ok(settings.LLM_API_KEY) and _ok(settings.LLM_MODEL_NAME)
 
 INTENTS = {
     "archive": "档案查询",
@@ -383,23 +391,69 @@ async def memory_load(state: dict) -> dict:
 async def intent_recognition(state: dict) -> dict:
     _t0 = time.perf_counter()
     from app.core.agent.intent_classifier import IntentClassifier
+    from app.core.agent.llm_decision_service import LLMDecisionService
 
     text = state.get("user_input", "").strip().lower()
+    user_input_raw = state.get("user_input", "")
 
     clf = IntentClassifier()
-    res = await clf.predict(text=text, stream=bool(state.get("stream", False)))
+    intent_coro = clf.predict(text=text, stream=bool(state.get("stream", False)))
+
+    parallel_coros = [intent_coro]
+    llm_decision = None
+    if _llm_enabled_for_nodes():
+        llm_decision = LLMDecisionService()
+        parallel_coros.append(llm_decision.extract_entities(user_input_raw, "drug"))
+        parallel_coros.append(llm_decision.extract_entities(user_input_raw, "lab"))
+
+    results = await asyncio.gather(*parallel_coros, return_exceptions=True)
+    res = results[0]
+    llm_drug_entities = results[1] if len(results) > 1 else None
+    llm_lab_entities = results[2] if len(results) > 2 else None
+
+    if isinstance(res, Exception):
+        res = IntentResult(intent="general", confidence=0.5, reason="intent classification failed")
 
     state["intent"] = res.intent
     state["intent_confidence"] = res.confidence
     state["intent_reason"] = res.reason
 
+    entities: dict = {}
+    intent = res.intent
+    if intent == "drug":
+        if isinstance(llm_drug_entities, dict) and llm_drug_entities.get("drug_name_list"):
+            entities["drug_name_list"] = llm_drug_entities["drug_name_list"]
+            if llm_drug_entities.get("dosage"):
+                entities["dosage"] = llm_drug_entities["dosage"]
+            if llm_drug_entities.get("frequency"):
+                entities["frequency"] = llm_drug_entities["frequency"]
+            if llm_drug_entities.get("start_date_text"):
+                entities["start_date_text"] = llm_drug_entities["start_date_text"]
+        if not entities.get("drug_name_list"):
+            entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
+    elif intent == "lab":
+        if isinstance(llm_lab_entities, dict) and llm_lab_entities.get("lab_items"):
+            entities.update(llm_lab_entities)
+        else:
+            entities["raw"] = text
+    else:
+        entities["query"] = text
+
+    state["extract_entities"] = entities
+
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=res.intent, confidence=res.confidence)
+    log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=res.intent, confidence=res.confidence, entity_keys=list(entities.keys()))
     return state
 
 
 async def entity_extraction(state: dict) -> dict:
     _t0 = time.perf_counter()
+
+    if state.get("extract_entities"):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="entity_extraction", latency_ms=latency_ms, skipped=True, reason="pre_extracted")
+        return state
+
     from app.core.agent.llm_decision_service import LLMDecisionService
 
     intent = state.get("intent")
@@ -408,7 +462,10 @@ async def entity_extraction(state: dict) -> dict:
     entities: dict = {}
     if intent == "drug":
         llm_decision = LLMDecisionService()
-        llm_entities = await llm_decision.extract_entities(text, "drug")
+        try:
+            llm_entities = await llm_decision.extract_entities(text, "drug")
+        except Exception:
+            llm_entities = None
         if llm_entities and llm_entities.get("drug_name_list"):
             entities["drug_name_list"] = llm_entities["drug_name_list"]
             if llm_entities.get("dosage"):
@@ -419,19 +476,25 @@ async def entity_extraction(state: dict) -> dict:
                 entities["start_date_text"] = llm_entities["start_date_text"]
         else:
             entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
+            entities["_fallback"] = "regex"
     elif intent == "lab":
         llm_decision = LLMDecisionService()
-        llm_entities = await llm_decision.extract_entities(text, "lab")
+        try:
+            llm_entities = await llm_decision.extract_entities(text, "lab")
+        except Exception:
+            llm_entities = None
         if llm_entities and llm_entities.get("lab_items"):
             entities.update(llm_entities)
         else:
             entities["raw"] = text
+            entities["_fallback"] = "raw"
     else:
         entities["query"] = text
 
     state["extract_entities"] = entities
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="entity_extraction", latency_ms=latency_ms, intent=intent, entity_keys=list(entities.keys()))
+    fallback = entities.pop("_fallback", None)
+    log_node_execution(node_name="entity_extraction", latency_ms=latency_ms, intent=intent, entity_keys=list(entities.keys()), fallback=fallback)
     return state
 
 
@@ -441,36 +504,43 @@ async def knowledge_retrieve(state: dict) -> dict:
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, skipped=True)
         return state
-    start_time = time.time()
-    try:
-        from app.db.milvus_store import is_milvus_configured
-        if is_milvus_configured():
-            svc = MedicalKnowledgeService()
-            state["retrieved_knowledge"] = await svc.retrieve(
-                user_input=state.get("user_input", ""),
-                intent=state.get("intent", "general"),
-            )
-        else:
-            logger.info("knowledge_retrieve skipped: Milvus not configured")
-            state["retrieved_knowledge"] = {}
-    except Exception:
-        state["retrieved_knowledge"] = {}
 
-    logger.info("knowledge_retrieve core intent=%s items=%s elapsed=%.3fs", state.get("intent"), len(state.get("retrieved_knowledge") or {}), time.time() - start_time)
+    user_input = state.get("user_input", "")
+    intent = state.get("intent", "general")
 
-    if state.get("intent") == "general":
+    async def _retrieve_drug_knowledge():
         try:
-            from app.db.milvus_store import is_milvus_configured as _is_milvus_cfg
-            if _is_milvus_cfg():
-                public_kb = PublicKnowledgeService()
-                state["retrieved_knowledge"]["public_kb"] = await public_kb.retrieve(query=state.get("user_input", ""))
-            else:
-                state.setdefault("retrieved_knowledge", {})["public_kb"] = []
+            from app.db.milvus_store import is_milvus_configured
+            if is_milvus_configured():
+                svc = MedicalKnowledgeService()
+                return await svc.retrieve(user_input=user_input, intent=intent)
+            return {}
         except Exception:
-            state.setdefault("retrieved_knowledge", {})["public_kb"] = []
-        logger.info("knowledge_retrieve public_kb count=%s", len((state.get("retrieved_knowledge") or {}).get("public_kb") or []))
+            return {}
+
+    async def _retrieve_public_kb():
+        try:
+            from app.db.milvus_store import is_milvus_configured
+            if is_milvus_configured():
+                public_kb = PublicKnowledgeService()
+                return await public_kb.retrieve(query=user_input)
+            return []
+        except Exception:
+            return []
+
+    need_public = intent == "general"
+    if need_public:
+        drug_result, public_result = await asyncio.gather(
+            _retrieve_drug_knowledge(),
+            _retrieve_public_kb(),
+        )
+        state["retrieved_knowledge"] = drug_result
+        state["retrieved_knowledge"]["public_kb"] = public_result
+    else:
+        state["retrieved_knowledge"] = await _retrieve_drug_knowledge()
+
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, intent=state.get("intent"), knowledge_keys=list((state.get("retrieved_knowledge") or {}).keys()))
+    log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, intent=intent, knowledge_keys=list((state.get("retrieved_knowledge") or {}).keys()))
     return state
 
 
@@ -499,7 +569,6 @@ async def plan_node(state: dict) -> dict:
     steps = plan.get("steps", [])
     latency_ms = int((time.perf_counter() - _t0) * 1000)
     log_node_execution(node_name="plan_node", latency_ms=latency_ms, step_count=len(steps), strategy=plan.get("strategy", ""))
-    logger.info("plan_node delegated to PlannerAgent, plan_phase=%s", state.get("plan_phase"))
     return state
 
 
@@ -527,18 +596,49 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
     for key in ("final_response", "error_msg", "intent_analysis", "extract_entities", "tool_result", "llm_output"):
         sub_state.pop(key, None)
 
+    original_input = state.get("original_user_input") or state.get("user_input", "")
+    step_query = step.get("query", "")
+    has_deps = step.get("depends_on") and step_results
+    if not has_deps and original_input and step_query and original_input != step_query and step_query not in original_input:
+        sub_state["user_input"] = f"[背景信息：用户原始问题是「{original_input}」]\n{step_query}"
+
     if step_results and step.get("depends_on"):
         dep_summaries: list[str] = []
+        merged_drug_names: list[str] = []
         for dep_id in step["depends_on"]:
             dep_result = step_results.get(dep_id)
-            if isinstance(dep_result, dict) and dep_result.get("final_response"):
+            if not isinstance(dep_result, dict):
+                continue
+            if dep_result.get("final_response"):
                 dep_summaries.append(f"[步骤{dep_id}的结果]: {dep_result['final_response']}")
-            elif isinstance(dep_result, dict) and dep_result.get("tool_result"):
+            elif dep_result.get("tool_result"):
                 dep_summaries.append(f"[步骤{dep_id}的工具结果]: {json.dumps(dep_result['tool_result'], ensure_ascii=False)}")
+            dep_entities = dep_result.get("extract_entities") or {}
+            if isinstance(dep_entities, dict):
+                dep_drug_names = dep_entities.get("drug_name_list", [])
+                if isinstance(dep_drug_names, list):
+                    merged_drug_names.extend(dep_drug_names)
+            dep_tool_result = dep_result.get("tool_result") or {}
+            if isinstance(dep_tool_result, dict):
+                tool_drug_list = dep_tool_result.get("drug_list", [])
+                for d in tool_drug_list:
+                    dn = d.get("drug_name", "") if isinstance(d, dict) else ""
+                    if dn and d.get("match_status") == "匹配成功":
+                        merged_drug_names.append(dn)
         if dep_summaries:
             original = sub_state["user_input"]
             sub_state["user_input"] = original + "\n" + "\n".join(dep_summaries)
             sub_state["step_context"] = {"dep_summaries": dep_summaries}
+        if merged_drug_names:
+            existing_entities = sub_state.get("extract_entities") or {}
+            if not isinstance(existing_entities, dict):
+                existing_entities = {}
+            existing_names = existing_entities.get("drug_name_list", [])
+            if not isinstance(existing_names, list):
+                existing_names = []
+            combined = list(set(existing_names + merged_drug_names))
+            existing_entities["drug_name_list"] = combined
+            sub_state["extract_entities"] = existing_entities
 
     return sub_state
 
@@ -548,7 +648,6 @@ async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
     target_name = step.get("target_name", "")
 
     if target_type == "tool":
-        logger.info("_execute_single_step tool=%s step=%s", target_name, step["step_id"])
         try:
             tool_result = await _tool_executor.execute(target_name, sub_state)
             sub_state["tool_result"] = tool_result.get("tool_result", tool_result)
@@ -595,6 +694,9 @@ async def execute_node(state: dict) -> dict:
     strategy = plan.get("strategy", "serial")
     results: dict[str, dict] = state.get("plan_step_results") or {}
 
+    if "original_user_input" not in state:
+        state["original_user_input"] = state.get("user_input", "")
+
     if not steps:
         state["plan_step_results"] = results
         state["plan_phase"] = "executing"
@@ -614,13 +716,13 @@ async def execute_node(state: dict) -> dict:
             state["plan_step_results"] = results
 
             step_latency_ms = int((time.perf_counter() - step_t0) * 1000)
-            logger.info(
-                "[STEP] %s | target=%s query=\"%s\" | latency=%dms | has_error=%s",
-                step["step_id"],
-                step.get("target_name", ""),
-                step.get("query", "")[:30],
-                step_latency_ms,
-                bool(result.get("error_msg")),
+            log_step_execution(
+                step_id=step["step_id"],
+                target=step.get("target_name", ""),
+                query=step.get("query", ""),
+                latency_ms=step_latency_ms,
+                has_error=bool(result.get("error_msg")),
+                depends_on=step.get("depends_on"),
             )
 
             state = await _planner.evaluate_for_replan(state)
@@ -632,11 +734,6 @@ async def execute_node(state: dict) -> dict:
                     needs_replan=True,
                     replan_reason=state.get("replan_reason", ""),
                     completed_step=step["step_id"],
-                )
-                logger.info(
-                    "execute_node: needs_replan after step=%s reason=%s",
-                    step["step_id"],
-                    state.get("replan_reason"),
                 )
                 return state
     else:
@@ -662,11 +759,16 @@ async def execute_node(state: dict) -> dict:
                     results[step["step_id"]] = result
 
             state["plan_step_results"] = results
-            logger.info(
-                "[STEP_GROUP] steps=%s | latency=%dms",
-                [s["step_id"] for s in group_steps],
-                group_latency_ms,
-            )
+            for step in group_steps:
+                step_result = results.get(step["step_id"], {})
+                log_step_execution(
+                    step_id=step["step_id"],
+                    target=step.get("target_name", ""),
+                    query=step.get("query", ""),
+                    latency_ms=group_latency_ms,
+                    has_error=bool(step_result.get("error_msg")),
+                    depends_on=step.get("depends_on"),
+                )
 
             state = await _planner.evaluate_for_replan(state)
             if state.get("needs_replan"):
@@ -693,7 +795,6 @@ async def execute_node(state: dict) -> dict:
         step_count=len(steps),
         results_count=len(results),
     )
-    logger.info("execute_node done steps=%s results_keys=%s", [s["step_id"] for s in steps], list(results.keys()))
     return state
 
 

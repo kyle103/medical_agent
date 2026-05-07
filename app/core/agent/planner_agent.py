@@ -34,20 +34,24 @@ def _route_by_intent_and_text(state: dict) -> dict:
 
     if intent == "drug":
         conflict_keywords = ["相互作用", "一起吃", "同服", "配伍", "冲突", "禁忌", "能不能一起", "可以一起"]
-        record_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
+        record_keywords = ["记录", "添加用药", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
         delete_keywords = ["删除", "移除", "清空"]
+        query_drug_keywords = ["可以吃什么药", "吃什么药", "能用什么药", "有什么药", "该吃什么", "要吃什么", "吃什么好"]
 
         is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
-        is_record = any(k in text for k in record_keywords)
+        is_record = any(k in text for k in record_keywords) and not any(k in text for k in query_drug_keywords)
         is_delete = any(k in text for k in delete_keywords)
+        is_query_drug = any(k in text for k in query_drug_keywords)
 
         if is_conflict and not is_record and not is_delete:
             return {"target_type": "tool", "target_name": "drug_interaction", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug conflict keywords"}
+        if is_query_drug:
+            return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "drug_query", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug query keywords"}
         if (is_record or is_delete) and not is_conflict:
             return {"target_type": "agent", "target_name": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug record keywords"}
         if isinstance(drug_names, list) and len(drug_names) >= 2:
             return {"target_type": "tool", "target_name": "drug_interaction", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.75), "reason": "route by multi-drug entities"}
-        return {"target_type": "agent", "target_name": "drug_record_agent", "intent_type": "drug_record", "confidence": float(state.get("intent_confidence") or 0.7), "reason": "route by drug default"}
+        return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "drug_query", "confidence": float(state.get("intent_confidence") or 0.7), "reason": "route by drug default to qa"}
 
     if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
         return {"target_type": "tool", "target_name": "lab_report", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
@@ -62,11 +66,22 @@ def _route_by_intent_and_text(state: dict) -> dict:
 
 def _detect_dependencies_rule(query: str, previous_queries: list[str]) -> list[str]:
     deps: list[str] = []
-    pronouns = ["它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还有"]
+    pronouns = ["它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还有", "其中"]
     if any(p in query for p in pronouns):
         for i, _ in enumerate(previous_queries):
             deps.append(f"s{i + 1}")
-    return deps
+    result_ref_keywords = ["其中哪些药", "这些药", "那些药", "上面的药", "推荐的药", "上面提到的药"]
+    if any(k in query for k in result_ref_keywords) and previous_queries:
+        for i, prev_q in enumerate(previous_queries):
+            if any(kw in prev_q for kw in ["药", "原因", "症状", "治疗", "怎么办", "腹泻", "发烧", "咳嗽", "头痛", "疼痛", "感冒", "炎症", "感染"]):
+                deps.append(f"s{i + 1}")
+    conflict_keywords = ["一起吃", "同服", "相互作用", "配伍", "冲突", "禁忌"]
+    if any(k in query for k in conflict_keywords) and previous_queries:
+        for i, prev_q in enumerate(previous_queries):
+            if any(kw in prev_q for kw in ["药", "吃什么", "用什么", "推荐"]):
+                if f"s{i + 1}" not in deps:
+                    deps.append(f"s{i + 1}")
+    return list(set(deps))
 
 
 async def _detect_dependencies_semantic(query: str, all_queries: list[str], query_index: int) -> list[str]:
@@ -107,6 +122,53 @@ async def _detect_dependencies_semantic(query: str, all_queries: list[str], quer
     except Exception:
         logger.debug("semantic dependency detection fallback to rule")
     return []
+
+
+async def _detect_dependencies_batch(queries: list[str]) -> list[list[str]]:
+    """批量检测多个查询之间的依赖关系。规则优先，仅对规则未覆盖的查询做一次LLM调用。"""
+    results: list[list[str]] = []
+    need_llm_indices: list[int] = []
+    for i, q in enumerate(queries):
+        rule_deps = _detect_dependencies_rule(q, queries[:i])
+        results.append(rule_deps)
+        if not rule_deps and i > 0:
+            need_llm_indices.append(i)
+
+    if not need_llm_indices or not _llm_enabled() or len(queries) <= 1:
+        return results
+
+    llm = LLMService()
+    queries_desc = "\n".join(f"s{i+1}: {q}" for i, q in enumerate(queries))
+    need_desc = ", ".join(f"s{i+1}" for i in need_llm_indices)
+    prompt = (
+        f"分析以下查询之间的依赖关系。\n"
+        f"所有查询：\n{queries_desc}\n\n"
+        f"请判断 {need_desc} 是否依赖前面的查询结果（如代词引用、需要前文药名等）。\n"
+        f"输出JSON对象，键为步骤编号(s1,s2,...)，值为依赖的步骤编号数组。无依赖则为空数组。\n"
+        f"示例：{{\"s2\": [\"s1\"], \"s3\": [\"s2\"]}}\n"
+        f"只输出JSON，不要其他内容。"
+    )
+    try:
+        raw = await llm.chat_completion(
+            prompt=prompt,
+            system_prompt="你是依赖分析助手，只输出JSON对象。",
+            stream=False,
+            timeout_s=3.0,
+            max_tokens=120,
+        )
+        data = json.loads(raw.strip())
+        if isinstance(data, dict):
+            for idx in need_llm_indices:
+                key = f"s{idx + 1}"
+                deps = data.get(key, [])
+                if isinstance(deps, list):
+                    valid = [d for d in deps if isinstance(d, str) and d.startswith("s")]
+                    if valid:
+                        results[idx] = valid
+    except Exception:
+        logger.debug("batch semantic dependency detection fallback to rule")
+
+    return results
 
 
 def _llm_enabled() -> bool:
@@ -243,11 +305,18 @@ class PlannerAgent:
                 conflict_resolution_policy="evidence_priority",
             )
         else:
+            llm_decision = LLMDecisionService()
+            batch_routes = await llm_decision.batch_route_queries(sub_queries)
+
+            dep_results = await _detect_dependencies_batch(sub_queries)
+
             steps = []
             for i, q in enumerate(sub_queries):
-                route_result = await _route_single_query(q, state)
+                route_result = batch_routes[i]
+                if not route_result or not isinstance(route_result, dict):
+                    route_result = _route_by_intent_and_text({"user_input": q, "intent": "general", "intent_confidence": 0.5, "extract_entities": {}})
 
-                deps = await _detect_dependencies_semantic(q, sub_queries, i)
+                deps = dep_results[i]
 
                 steps.append(PlanStep(
                     step_id=f"s{i + 1}",

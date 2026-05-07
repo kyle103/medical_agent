@@ -60,6 +60,15 @@ class ToolExecutor:
             drug_names = DrugEntityExtractor.extract_drug_candidates(user_input, max_items=10)
 
         if not drug_names:
+            step_context = state.get("step_context") or {}
+            dep_summaries = step_context.get("dep_summaries") or []
+            if dep_summaries:
+                combined_text = " ".join(dep_summaries)
+                dep_names = DrugEntityExtractor.extract_drug_candidates(combined_text, max_items=10)
+                if dep_names:
+                    drug_names = dep_names
+
+        if not drug_names:
             return {
                 "tool_result": {
                     "drug_list": [],

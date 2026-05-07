@@ -43,7 +43,10 @@ class BaseAgent(ABC):
                 user_input = state.get("user_input", "")
 
                 if memory_context:
-                    final_prompt = f"{memory_context}\n\n用户当前查询：{user_input}\n\n{prompt}"
+                    if prompt == user_input:
+                        final_prompt = f"{memory_context}\n\n用户当前查询：{prompt}"
+                    else:
+                        final_prompt = f"{memory_context}\n\n用户当前查询：{user_input}\n\n{prompt}"
 
             response = await self.llm_service.chat_completion(
                 prompt=final_prompt,

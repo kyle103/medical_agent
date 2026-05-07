@@ -156,6 +156,36 @@ def log_node_execution(
     )
 
 
+def log_step_execution(
+    *,
+    step_id: str,
+    target: str = "",
+    query: str = "",
+    latency_ms: int = 0,
+    has_error: bool = False,
+    depends_on: Optional[list] = None,
+    **detail: Any,
+) -> None:
+    _logger = get_logger("medical_agent.workflow")
+    query_preview = (query[:40] + "...") if len(query) > 40 else query
+    dep_str = ""
+    if depends_on:
+        dep_str = f" depends_on={depends_on}"
+    detail_str = ""
+    if detail:
+        detail_str = " " + " ".join(f"{k}={v}" for k, v in detail.items())
+    _logger.info(
+        "[STEP] %s | target=%s query=\"%s\" | latency=%dms | has_error=%s%s%s",
+        step_id,
+        target,
+        query_preview,
+        latency_ms,
+        has_error,
+        dep_str,
+        detail_str,
+    )
+
+
 class NodeTimer:
     def __init__(self, node_name: str, **detail: Any):
         self.node_name = node_name
