@@ -98,7 +98,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=4.0,
+                timeout_s=8.0,
                 max_tokens=300,
             )
             if not raw:
@@ -180,7 +180,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=6.0,
+                timeout_s=10.0,
                 max_tokens=800,
             )
             if not raw:
@@ -247,7 +247,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=3.0,
+                timeout_s=6.0,
                 max_tokens=300,
             )
             if not raw:
@@ -293,7 +293,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=3.0,
+                timeout_s=6.0,
                 max_tokens=300,
             )
             if not raw:
@@ -331,7 +331,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=3.0,
+                timeout_s=6.0,
                 max_tokens=300,
             )
             if not raw:
@@ -369,7 +369,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=3.0,
+                timeout_s=5.0,
                 max_tokens=20,
             )
             if not raw:
@@ -407,7 +407,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=4.0,
+                timeout_s=6.0,
                 max_tokens=300,
             )
             if not raw:
@@ -445,7 +445,7 @@ class LLMDecisionService:
                 prompt=user_prompt,
                 system_prompt=system_prompt,
                 stream=False,
-                timeout_s=2.0,
+                timeout_s=4.0,
                 max_tokens=30,
             )
             if raw:

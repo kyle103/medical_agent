@@ -81,6 +81,12 @@ def _detect_dependencies_rule(query: str, previous_queries: list[str]) -> list[s
             if any(kw in prev_q for kw in ["药", "吃什么", "用什么", "推荐"]):
                 if f"s{i + 1}" not in deps:
                     deps.append(f"s{i + 1}")
+    implicit_dep_keywords = ["可以吃什么药", "吃什么药", "用什么药", "有什么药", "该吃什么", "要吃什么", "吃什么好", "怎么办", "怎么治", "如何治疗", "怎么处理", "怎么缓解", "如何缓解"]
+    if any(k in query for k in implicit_dep_keywords) and previous_queries:
+        for i, prev_q in enumerate(previous_queries):
+            if any(kw in prev_q for kw in ["原因", "症状", "怎么办", "腹泻", "发烧", "咳嗽", "头痛", "疼痛", "感冒", "炎症", "感染", "什么病", "得了", "患有", "诊断"]):
+                if f"s{i + 1}" not in deps:
+                    deps.append(f"s{i + 1}")
     return list(set(deps))
 
 

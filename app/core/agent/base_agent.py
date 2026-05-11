@@ -41,12 +41,20 @@ class BaseAgent(ABC):
                 accessor = self._create_accessor(state)
                 memory_context = accessor.build_memory_context()
                 user_input = state.get("user_input", "")
+                has_step_context = bool(state.get("step_context"))
 
-                if memory_context:
-                    if prompt == user_input:
-                        final_prompt = f"{memory_context}\n\n用户当前查询：{prompt}"
+                if memory_context or has_step_context:
+                    parts = []
+                    if memory_context:
+                        parts.append(memory_context)
+                    if has_step_context:
+                        parts.append(user_input)
                     else:
-                        final_prompt = f"{memory_context}\n\n用户当前查询：{user_input}\n\n{prompt}"
+                        if prompt == user_input:
+                            parts.append(f"用户当前查询：{prompt}")
+                        else:
+                            parts.append(f"用户当前查询：{user_input}\n\n{prompt}")
+                    final_prompt = "\n\n".join(parts)
 
             response = await self.llm_service.chat_completion(
                 prompt=final_prompt,

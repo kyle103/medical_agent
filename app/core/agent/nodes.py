@@ -599,6 +599,7 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
     original_input = state.get("original_user_input") or state.get("user_input", "")
     step_query = step.get("query", "")
     has_deps = step.get("depends_on") and step_results
+
     if not has_deps and original_input and step_query and original_input != step_query and step_query not in original_input:
         sub_state["user_input"] = f"[背景信息：用户原始问题是「{original_input}」]\n{step_query}"
 
@@ -609,10 +610,12 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
             dep_result = step_results.get(dep_id)
             if not isinstance(dep_result, dict):
                 continue
-            if dep_result.get("final_response"):
-                dep_summaries.append(f"[步骤{dep_id}的结果]: {dep_result['final_response']}")
+            dep_response = dep_result.get("final_response", "")
+            if dep_response:
+                truncated = dep_response[:500] + ("...(内容过长已截断)" if len(dep_response) > 500 else "")
+                dep_summaries.append(f"[步骤{dep_id}的结果]: {truncated}")
             elif dep_result.get("tool_result"):
-                dep_summaries.append(f"[步骤{dep_id}的工具结果]: {json.dumps(dep_result['tool_result'], ensure_ascii=False)}")
+                dep_summaries.append(f"[步骤{dep_id}的工具结果]: {json.dumps(dep_result['tool_result'], ensure_ascii=False)[:300]}")
             dep_entities = dep_result.get("extract_entities") or {}
             if isinstance(dep_entities, dict):
                 dep_drug_names = dep_entities.get("drug_name_list", [])
@@ -626,9 +629,23 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
                     if dn and d.get("match_status") == "匹配成功":
                         merged_drug_names.append(dn)
         if dep_summaries:
-            original = sub_state["user_input"]
-            sub_state["user_input"] = original + "\n" + "\n".join(dep_summaries)
+            context_parts = []
+            if original_input and step_query and original_input != step_query and step_query not in original_input:
+                context_parts.append(f"[用户原始问题]: {original_input}")
+            context_parts.append(f"[当前需要回答的问题]: {step_query}")
+            context_parts.extend(dep_summaries)
+            context_parts.append("请基于以上前置步骤的结果来回答当前问题。")
+            sub_state["user_input"] = "\n".join(context_parts)
             sub_state["step_context"] = {"dep_summaries": dep_summaries}
+            if not merged_drug_names:
+                for dep_id in step["depends_on"]:
+                    dep_result = step_results.get(dep_id)
+                    if not isinstance(dep_result, dict):
+                        continue
+                    dep_response = dep_result.get("final_response", "")
+                    if dep_response:
+                        dep_names = DrugEntityExtractor.extract_drug_candidates(dep_response, max_items=10)
+                        merged_drug_names.extend(dep_names)
         if merged_drug_names:
             existing_entities = sub_state.get("extract_entities") or {}
             if not isinstance(existing_entities, dict):
