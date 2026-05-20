@@ -292,7 +292,12 @@ class PlannerAgent:
         sub_queries = await _split_user_queries(user_input)
 
         if len(sub_queries) <= 1:
-            route_result = await _route_single_query(user_input, state)
+            existing_route = state.get("intent_analysis")
+            if existing_route and isinstance(existing_route, dict) and existing_route.get("target_name"):
+                route_result = existing_route
+                logger.info("generate_plan: reuse intent_analysis route=%s", route_result.get("target_name"))
+            else:
+                route_result = await _route_single_query(user_input, state)
             state["intent_analysis"] = route_result
             state["target_agent"] = route_result["target_name"]
             state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))

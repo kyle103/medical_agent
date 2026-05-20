@@ -72,8 +72,12 @@ class AgentState(TypedDict, total=False):
 
     execution_plan: ExecutionPlan
     plan_step_results: dict
+    reconciled_sections: list[str]
     plan_phase: Literal["planning", "executing", "reconciling", "responding"]
 
     replan_count: int
     replan_reason: str
     needs_replan: bool
+
+    force_long_memory_write: bool
+    long_memory_write_source: str

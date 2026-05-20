@@ -337,8 +337,28 @@ async def memory_load(state: dict) -> dict:
         saved_sm = (rt_state.get("private_scratchpads") or {}).get("drug_record_sm") if isinstance(rt_state, dict) else None
         if saved_sm:
             state.setdefault("private_scratchpads", {})["drug_record_sm"] = saved_sm
+
+        if isinstance(rt_state, dict) and not rt_state.get("long_memory_flushed"):
+            prev_history = await mem.get_user_memory(user_id=user_id, session_id=session_id, limit=50)
+            if prev_history and len(prev_history) >= 2:
+                asyncio.create_task(_async_flush_session_long_memory(user_id=user_id, session_id=session_id, history=prev_history))
+                logger.info("long_memory session_end flush triggered: session=%s history_count=%s", session_id, len(prev_history))
+                try:
+                    rt_state["long_memory_flushed"] = True
+                    await AgentStateStore().upsert_state(user_id=user_id, session_id=session_id, state=rt_state)
+                except Exception:
+                    pass
     except Exception:
         state["session_runtime_state"] = {}
+
+    if len(history) > 20:
+        try:
+            svc = LongMemoryService()
+            if svc.is_enabled():
+                asyncio.create_task(_async_compress_and_write_long_memory(user_id=user_id, session_id=session_id, history=history))
+                logger.info("long_memory compress_pre_write triggered: session=%s history_count=%s", session_id, len(history))
+        except Exception:
+            pass
 
     state["long_memory_items"] = []
     state["long_memory_text"] = ""
@@ -396,53 +416,73 @@ async def intent_recognition(state: dict) -> dict:
     text = state.get("user_input", "").strip().lower()
     user_input_raw = state.get("user_input", "")
 
-    clf = IntentClassifier()
-    intent_coro = clf.predict(text=text, stream=bool(state.get("stream", False)))
+    if _detect_memory_save_intent(user_input_raw):
+        state["force_long_memory_write"] = True
+        state["long_memory_write_source"] = "explicit"
+        logger.info("memory_save intent detected: user_input=%s", user_input_raw[:50])
 
-    parallel_coros = [intent_coro]
-    llm_decision = None
     if _llm_enabled_for_nodes():
         llm_decision = LLMDecisionService()
-        parallel_coros.append(llm_decision.extract_entities(user_input_raw, "drug"))
-        parallel_coros.append(llm_decision.extract_entities(user_input_raw, "lab"))
+        combined = await llm_decision.classify_route_and_extract(user_input_raw)
 
-    results = await asyncio.gather(*parallel_coros, return_exceptions=True)
-    res = results[0]
-    llm_drug_entities = results[1] if len(results) > 1 else None
-    llm_lab_entities = results[2] if len(results) > 2 else None
+        if combined and combined.get("target_name") and combined.get("confidence", 0) >= 0.5:
+            state["intent"] = combined.get("intent", "general")
+            state["intent_confidence"] = combined.get("confidence", 0.8)
+            state["intent_reason"] = combined.get("reason", "llm_route")
+            state["intent_analysis"] = combined
+            state["target_agent"] = combined.get("target_name", "")
+            state["intent_type"] = combined.get("intent_type", "general")
 
-    if isinstance(res, Exception):
-        res = IntentResult(intent="general", confidence=0.5, reason="intent classification failed")
+            entities: dict = {}
+            llm_entities = combined.get("entities", {})
+            intent = state["intent"]
 
-    state["intent"] = res.intent
-    state["intent_confidence"] = res.confidence
-    state["intent_reason"] = res.reason
+            if intent == "drug" and isinstance(llm_entities, dict):
+                if llm_entities.get("drug_name_list"):
+                    entities["drug_name_list"] = llm_entities["drug_name_list"]
+                    if llm_entities.get("dosage"):
+                        entities["dosage"] = llm_entities["dosage"]
+                    if llm_entities.get("frequency"):
+                        entities["frequency"] = llm_entities["frequency"]
+                    if llm_entities.get("start_date_text"):
+                        entities["start_date_text"] = llm_entities["start_date_text"]
+                if not entities.get("drug_name_list"):
+                    entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
+            elif intent == "lab" and isinstance(llm_entities, dict):
+                if llm_entities.get("lab_items"):
+                    entities.update(llm_entities)
+                else:
+                    entities["raw"] = text
+            else:
+                entities["query"] = text
+
+            state["extract_entities"] = entities
+            latency_ms = int((time.perf_counter() - _t0) * 1000)
+            log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=state.get("intent"), confidence=state.get("intent_confidence"), entity_keys=list(entities.keys()), merged_llm=True)
+            return state
+
+    clf = IntentClassifier()
+    try:
+        route_result = await clf.predict(text=text, stream=False)
+    except Exception:
+        route_result = IntentResult(intent="general", confidence=0.5, reason="fallback")
+
+    state["intent"] = route_result.intent
+    state["intent_confidence"] = route_result.confidence
+    state["intent_reason"] = route_result.reason
 
     entities: dict = {}
-    intent = res.intent
+    intent = state.get("intent", "general")
     if intent == "drug":
-        if isinstance(llm_drug_entities, dict) and llm_drug_entities.get("drug_name_list"):
-            entities["drug_name_list"] = llm_drug_entities["drug_name_list"]
-            if llm_drug_entities.get("dosage"):
-                entities["dosage"] = llm_drug_entities["dosage"]
-            if llm_drug_entities.get("frequency"):
-                entities["frequency"] = llm_drug_entities["frequency"]
-            if llm_drug_entities.get("start_date_text"):
-                entities["start_date_text"] = llm_drug_entities["start_date_text"]
-        if not entities.get("drug_name_list"):
-            entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
+        entities["drug_name_list"] = DrugEntityExtractor.extract_drug_candidates(text, max_items=10)
     elif intent == "lab":
-        if isinstance(llm_lab_entities, dict) and llm_lab_entities.get("lab_items"):
-            entities.update(llm_lab_entities)
-        else:
-            entities["raw"] = text
+        entities["raw"] = text
     else:
         entities["query"] = text
 
     state["extract_entities"] = entities
-
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=res.intent, confidence=res.confidence, entity_keys=list(entities.keys()))
+    log_node_execution(node_name="intent_recognition", latency_ms=latency_ms, intent=state.get("intent"), confidence=state.get("intent_confidence"), entity_keys=list(entities.keys()), fallback=True)
     return state
 
 
@@ -880,7 +920,7 @@ async def reconcile_node(state: dict) -> dict:
         sections.append("\n".join(lines))
 
     if sections:
-        state["final_response"] = "我分条为你处理如下：\n\n" + "\n\n".join([f"{i + 1}. {s}" for i, s in enumerate(sections)])
+        state["reconciled_sections"] = sections
         state["intent"] = "multi"
         state["intent_type"] = "multi"
 
@@ -922,6 +962,41 @@ async def response_plan(state: dict) -> dict:
 
 async def llm_generate(state: dict) -> dict:
     _t0 = time.perf_counter()
+
+    reconciled_sections = state.get("reconciled_sections")
+    if reconciled_sections and len(reconciled_sections) > 1:
+        system_prompt = (
+            "你是医疗问答助手，需要将多个子问题的回答整合为一个清晰、自然的回复。\n"
+            "原则：\n"
+            "1) 必须保留每个子问题的回答要点，不得遗漏或编造。\n"
+            "2) 每个子问题用二级标题（##）分隔，标题即为子问题本身。\n"
+            "3) 每个子问题的回答要简洁精炼，去除重复和冗余内容。\n"
+            "4) 使用**加粗**标记关键信息（如药名、症状、注意事项）。\n"
+            "5) 使用项目符号或编号列表组织多条信息，每条之间空一行。\n"
+            "6) 语言自然亲切，像一位耐心的家庭医生在和你聊天。\n"
+            "7) 如果某个子问题无法回答（如工具查询失败），用简短一句话说明，不要输出原始错误信息。\n"
+            "8) 整体回复结尾用一句温馨提示收束。\n"
+        )
+        sections_text = ""
+        for i, section in enumerate(reconciled_sections):
+            sections_text += f"\n\n--- 子问题 {i + 1} ---\n{section}"
+        user_prompt = f"用户原始问题：{state.get('user_input', '')}\n\n以下是各子问题的回答：{sections_text}"
+
+        try:
+            llm = LLMService()
+            raw = await llm.chat_completion(prompt=user_prompt, system_prompt=system_prompt, timeout_s=15.0, max_tokens=1200)
+            state["llm_output"] = (raw or "").strip()
+            state["final_response"] = state["llm_output"]
+        except Exception as e:
+            logger.error("llm_generate multi-intent failed: %s", e)
+            combined = "\n\n".join([f"## {s}" for s in reconciled_sections])
+            state["llm_output"] = combined
+            state["final_response"] = combined
+
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="llm_generate", latency_ms=latency_ms, mode="multi_intent", section_count=len(reconciled_sections))
+        return state
+
     if state.get("final_response"):
         state["llm_output"] = state["final_response"]
         latency_ms = int((time.perf_counter() - _t0) * 1000)
@@ -967,6 +1042,12 @@ async def llm_generate(state: dict) -> dict:
             "1) 只能基于提供的工具结果输出，不得编造任何未给出的事实。\n"
             "2) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
             "3) 禁止给出诊断结论或处方/调整用药建议。\n"
+            "4) 回复格式要求：\n"
+            "   - 使用**加粗**标记关键信息（如药名、指标名）\n"
+            "   - 使用编号列表或项目符号组织多条信息\n"
+            "   - 每个要点之间用空行分隔，保持视觉清晰\n"
+            "   - 语言自然亲切，像医生对患者解释一样，避免生硬的罗列\n"
+            "   - 结尾用一段简短的温馨提示收束\n"
         )
         user_prompt = (f"用户问题：{state.get('user_input', '')}\n\n" f"工具结果：\n{content}\n")
         if long_mem:
@@ -982,6 +1063,12 @@ async def llm_generate(state: dict) -> dict:
             "1) 如提供了会话记忆/长期记忆或工具结果，你必须优先使用它们来保持上下文一致。\n"
             "2) 不得编造不存在的个人信息/检查结果/用药记录。\n"
             "3) 禁止诊断与处方/调整用药建议；可以给出通用科普与就医指引。\n"
+            "4) 回复格式要求：\n"
+            "   - 语气亲切自然，像一位耐心的家庭医生在和你聊天\n"
+            "   - 使用**加粗**标记关键信息（如药名、症状、注意事项）\n"
+            "   - 多条信息用编号列表或项目符号组织，每条之间空一行\n"
+            "   - 先给简短总结，再展开说明，避免一上来就堆砌大量文字\n"
+            "   - 结尾用一句温馨提示收束（如：如有不适请及时就医）\n"
         )
         parts = []
         if long_mem:
@@ -1085,38 +1172,11 @@ async def memory_update(state: dict) -> dict:
     if "final_response" in state:
         await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
 
-    try:
-        start_time = time.time()
-        svc = LongMemoryService()
-        if svc.is_enabled():
-            items = await svc.extract_candidates(user_input=state.get("user_input", ""))
-            if items:
-                await svc.add_items(user_id=state["user_id"], session_id=state["session_id"], items=items)
-                write_time_ms = int((time.time() - start_time) * 1000)
-                logger.info("long_memory write done count=%s cost_ms=%s", len(items), write_time_ms)
-
-                drug_events = [item for item in items if item.memory_type == "drug_event"]
-                if drug_events:
-                    drug_info_list = []
-                    from app.core.agent.llm_decision_service import LLMDecisionService
-                    llm_decision = LLMDecisionService()
-                    for event in drug_events:
-                        original_text = event.text.replace("用户", "我")
-                        drug_name = await llm_decision.extract_drug_name_from_event(original_text)
-                        if not drug_name:
-                            drug_match = re.search(r"(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})", original_text)
-                            if drug_match:
-                                drug_name = drug_match.group(1).strip()
-                        if drug_name:
-                            drug_info_list.append({"drug_name": drug_name, "full_text": original_text, "confidence": event.confidence})
-
-                    if drug_info_list:
-                        state["candidate_drug_events"] = drug_info_list
-                        skill_ctx = state.get("skill_ctx") or {}
-                        skill_ctx["medication_confirmation"] = {"candidate_events": drug_info_list}
-                        state["skill_ctx"] = skill_ctx
-    except Exception:
-        logger.exception("long_memory write failed")
+    if state.get("force_long_memory_write"):
+        asyncio.create_task(_async_long_memory_write(state, source=state.get("long_memory_write_source", "explicit")))
+        logger.info("long_memory write triggered by force: source=%s", state.get("long_memory_write_source", "explicit"))
+    else:
+        logger.debug("long_memory write skipped (not forced, will write on session end)")
 
     try:
         user_id = state.get("user_id")
@@ -1139,8 +1199,80 @@ async def memory_update(state: dict) -> dict:
         pass
 
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="memory_update", latency_ms=latency_ms)
+    log_node_execution(node_name="memory_update", latency_ms=latency_ms, forced_write=bool(state.get("force_long_memory_write")))
     return state
+
+
+async def _async_long_memory_write(state: dict, source: str = "chat"):
+    try:
+        start_time = time.time()
+        svc = LongMemoryService()
+        if not svc.is_enabled():
+            return
+        items = await svc.extract_candidates(user_input=state.get("user_input", ""))
+        if not items:
+            return
+        result = await svc.write_with_conflict_check(
+            user_id=state["user_id"], session_id=state["session_id"], items=items, source=source
+        )
+        write_time_ms = int((time.time() - start_time) * 1000)
+        logger.info("long_memory write done source=%s result=%s cost_ms=%s", source, result, write_time_ms)
+
+        drug_events = [item for item in items if item.memory_type == "drug_event"]
+        if drug_events:
+            drug_info_list = []
+            from app.core.agent.llm_decision_service import LLMDecisionService
+            llm_decision = LLMDecisionService()
+            for event in drug_events:
+                original_text = event.text.replace("用户", "我")
+                drug_name = await llm_decision.extract_drug_name_from_event(original_text)
+                if not drug_name:
+                    drug_match = re.search(r"(?:吃了|服用了|用了|吃|服用|使用|用)([^，。！？\s]{1,30})", original_text)
+                    if drug_match:
+                        drug_name = drug_match.group(1).strip()
+                if drug_name:
+                    drug_info_list.append({"drug_name": drug_name, "full_text": original_text, "confidence": event.confidence})
+
+            if drug_info_list:
+                logger.info("async_long_memory_write: drug_events=%s", [d["drug_name"] for d in drug_info_list])
+    except Exception:
+        logger.exception("async_long_memory_write failed")
+
+
+async def _async_flush_session_long_memory(*, user_id: str, session_id: str, history: list[dict]):
+    """对话结束后批量写入长期记忆（session_end 策略）。"""
+    try:
+        svc = LongMemoryService()
+        if not svc.is_enabled():
+            return
+        result = await svc.batch_write_session(user_id=user_id, session_id=session_id, history=history)
+        logger.info("long_memory session_end flush done: session=%s result=%s", session_id, result)
+    except Exception:
+        logger.exception("async_flush_session_long_memory failed")
+
+
+async def _async_compress_and_write_long_memory(*, user_id: str, session_id: str, history: list[dict]):
+    """短期记忆压缩前写入长期记忆（compress_pre_write 策略）。"""
+    try:
+        svc = LongMemoryService()
+        if not svc.is_enabled():
+            return
+        result = await svc.batch_write_session(user_id=user_id, session_id=session_id, history=history)
+        logger.info("long_memory compress_pre_write done: session=%s result=%s", session_id, result)
+    except Exception:
+        logger.exception("async_compress_and_write_long_memory failed")
+
+
+_MEMORY_SAVE_PATTERNS = [
+    "记住", "帮我记", "记下来", "记录一下", "保存", "别忘了",
+    "记住这个", "帮我记住", "记一下", "存一下", "备忘",
+]
+
+
+def _detect_memory_save_intent(user_input: str) -> bool:
+    """检测用户是否有显式要求保存记忆的意图。"""
+    text = user_input.strip()
+    return any(pat in text for pat in _MEMORY_SAVE_PATTERNS)
 
 
 async def error_finalize(state: dict) -> dict:

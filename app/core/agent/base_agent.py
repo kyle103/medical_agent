@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from abc import ABC, abstractmethod
+from collections.abc import AsyncGenerator
 from typing import Any
 
 from app.common.logger import get_logger
@@ -34,28 +35,31 @@ class BaseAgent(ABC):
     def _create_accessor(self, state: dict[str, Any]) -> StateAccessor:
         return StateAccessor(state, self.agent_name)
 
+    def _build_final_prompt(self, prompt: str, state: dict[str, Any] = None) -> str:
+        final_prompt = prompt
+        if state:
+            accessor = self._create_accessor(state)
+            memory_context = accessor.build_memory_context()
+            user_input = state.get("user_input", "")
+            has_step_context = bool(state.get("step_context"))
+
+            if memory_context or has_step_context:
+                parts = []
+                if memory_context:
+                    parts.append(memory_context)
+                if has_step_context:
+                    parts.append(user_input)
+                else:
+                    if prompt == user_input:
+                        parts.append(f"用户当前查询：{prompt}")
+                    else:
+                        parts.append(f"用户当前查询：{user_input}\n\n{prompt}")
+                final_prompt = "\n\n".join(parts)
+        return final_prompt
+
     async def _call_llm(self, prompt: str, system_prompt: str, state: dict[str, Any] = None) -> str:
         try:
-            final_prompt = prompt
-            if state:
-                accessor = self._create_accessor(state)
-                memory_context = accessor.build_memory_context()
-                user_input = state.get("user_input", "")
-                has_step_context = bool(state.get("step_context"))
-
-                if memory_context or has_step_context:
-                    parts = []
-                    if memory_context:
-                        parts.append(memory_context)
-                    if has_step_context:
-                        parts.append(user_input)
-                    else:
-                        if prompt == user_input:
-                            parts.append(f"用户当前查询：{prompt}")
-                        else:
-                            parts.append(f"用户当前查询：{user_input}\n\n{prompt}")
-                    final_prompt = "\n\n".join(parts)
-
+            final_prompt = self._build_final_prompt(prompt, state)
             response = await self.llm_service.chat_completion(
                 prompt=final_prompt,
                 system_prompt=system_prompt,
@@ -63,6 +67,17 @@ class BaseAgent(ABC):
             return response
         except Exception as e:
             return f"抱歉，处理请求时出现错误：{str(e)}"
+
+    async def _call_llm_stream(self, prompt: str, system_prompt: str, state: dict[str, Any] = None) -> AsyncGenerator[str, None]:
+        try:
+            final_prompt = self._build_final_prompt(prompt, state)
+            async for chunk in self.llm_service.chat_completion_stream(
+                prompt=final_prompt,
+                system_prompt=system_prompt,
+            ):
+                yield chunk
+        except Exception as e:
+            yield f"抱歉，处理请求时出现错误：{str(e)}"
 
     def _log_agent_call(self, user_id: str, agent_name: str, input_text: str, output_text: str):
         logger.info("Agent调用 - 用户:%s Agent:%s 输入长度:%s 输出长度:%s", user_id, agent_name, len(input_text), len(output_text))

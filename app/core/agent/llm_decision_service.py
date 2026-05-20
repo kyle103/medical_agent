@@ -139,6 +139,118 @@ class LLMDecisionService:
             logger.warning("LLMDecisionService.classify_intent_and_route failed: %s", e)
             return None
 
+    async def classify_route_and_extract(self, text: str) -> dict | None:
+        """一次 LLM 调用同时完成：意图分类 + 路由决策 + 实体提取。
+
+        返回格式：
+        {
+            "intent": "archive|drug|lab|general",
+            "intent_type": "archive|drug_conflict|drug_record|lab_report|general",
+            "target_type": "agent|tool",
+            "target_name": "...",
+            "confidence": 0.0~1.0,
+            "reason": "...",
+            "entities": {
+                "drug_name_list": [...],
+                "dosage": "...",
+                "frequency": "...",
+                "start_date_text": "...",
+                "purpose": "...",
+                "lab_items": [...]
+            }
+        }
+        """
+        if not _llm_enabled():
+            return None
+
+        capabilities_desc = "\n".join(
+            f"- {c['name']} (类型: {c['type']}): {c['description']}\n  适用场景: {c['when_to_use']}"
+            for c in CAPABILITY_REGISTRY
+        )
+
+        system_prompt = (
+            "你是一个医疗问答系统的意图分类、路由决策与实体提取器。\n"
+            "以下是系统可用的工具和Agent：\n\n"
+            f"{capabilities_desc}\n\n"
+            "请根据用户输入，同时完成以下任务：\n"
+            "1. 判断意图并选择最合适的工具/Agent\n"
+            "2. 提取相关实体信息\n\n"
+            "你必须只输出合法JSON，不要输出Markdown标记，不要有任何其他解释内容。\n"
+            "JSON字段：\n"
+            '- intent: "archive"(档案查询) | "drug"(药物相关) | "lab"(化验解读) | "general"(通用问答)\n'
+            '- intent_type: "archive" | "drug_conflict" | "drug_record" | "lab_report" | "general"\n'
+            '- target_type: "agent" | "tool"\n'
+            '- target_name: 从上面的工具/Agent列表中选择\n'
+            "- confidence: 0.0~1.0\n"
+            "- reason: 简短说明决策理由\n"
+            "- entities: 提取的实体信息，格式如下：\n"
+            '  - 如果意图为 drug：{"drug_name_list": ["药品1", "药品2"], "dosage": "剂量", "frequency": "频率", "start_date_text": "开始时间", "purpose": "目的"}\n'
+            '  - 如果意图为 lab：{"lab_items": [{"item_name": "指标名", "test_value": "数值", "unit": "单位"}]}\n'
+            '  - 其他意图：entities 为空对象 {}'
+        )
+
+        user_prompt = f"用户输入：{text}\n\n请输出决策与实体JSON："
+
+        try:
+            raw = await self.llm.chat_completion(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                stream=False,
+                timeout_s=10.0,
+                max_tokens=500,
+            )
+            if not raw:
+                return None
+            import re
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            json_str = match.group(0) if match else raw
+            data = json.loads(json_str)
+
+            valid_intents = {"archive", "drug", "lab", "general"}
+            valid_targets = {c["name"] for c in CAPABILITY_REGISTRY}
+            valid_types = {"agent", "tool"}
+
+            intent = data.get("intent", "")
+            target_name = data.get("target_name", "")
+            target_type = data.get("target_type", "")
+            confidence = float(data.get("confidence", 0.0) or 0.0)
+
+            if intent not in valid_intents:
+                return None
+            if target_name not in valid_targets:
+                return None
+            if target_type not in valid_types:
+                return None
+
+            expected_type = next((c["type"] for c in CAPABILITY_REGISTRY if c["name"] == target_name), None)
+            if expected_type and target_type != expected_type:
+                target_type = expected_type
+
+            result = {
+                "intent": intent,
+                "intent_type": data.get("intent_type", intent),
+                "target_type": target_type,
+                "target_name": target_name,
+                "confidence": max(min(confidence, 1.0), 0.0),
+                "reason": data.get("reason", ""),
+                "entities": data.get("entities", {}),
+            }
+
+            entities = result["entities"]
+            if intent == "drug" and isinstance(entities, dict):
+                drug_names = entities.get("drug_name_list", [])
+                if isinstance(drug_names, list):
+                    entities["drug_name_list"] = [str(n).strip() for n in drug_names if str(n).strip()]
+            elif intent == "lab" and isinstance(entities, dict):
+                lab_items = entities.get("lab_items", [])
+                if isinstance(lab_items, list):
+                    entities["lab_items"] = lab_items
+
+            return result
+        except Exception as e:
+            logger.warning("LLMDecisionService.classify_route_and_extract failed: %s", e)
+            return None
+
     async def batch_route_queries(self, queries: list[str]) -> list[dict | None]:
         """LLM 批量路由：一次调用完成所有子查询的路由决策。
 

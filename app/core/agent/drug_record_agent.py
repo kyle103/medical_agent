@@ -139,32 +139,25 @@ class DrugRecordAgent(BaseAgent):
             return drug_info
 
         import re
+        from datetime import datetime
         candidates = re.findall(r"(阿司匹林|布洛芬|感康|对乙酰氨基酚|头孢|青霉素|奥美拉唑|氯雷他定|二甲双胍|缬沙坦)", user_input)
         rule_drug_name = candidates[0] if candidates else ""
 
-        memory_messages = state.get('history', [])
-        ctx_msgs = memory_messages[-6:] if len(memory_messages) > 6 else memory_messages
-        system_prompt = "你是一个医疗信息抽取助手。请从用户的最新回复和上下文中，提取用药记录信息。以JSON格式返回，包含以下字段：1. drug_name 药品名称，如果是补充信息且未提及药名，请从上下文中找到药名并填入。如果仍然找不到，填空字符串。 2. dosage 剂量，如'100mg'，'1片'。3. frequency 频率，如'每天一次'，'早晚各一次'。4. time 用药时间，如'昨天晚上八点'、'今天中午'，不要用现在的系统时间。如果字段没有提及并没有在上下文中，请填空字符串。必须且只输出合法的 JSON，不要输出 Markdown 标记，也不要有任何其他解释内容。"
-        user_prompt = f"对话上下文：\n{ctx_msgs}\n\n用户最新输入：{user_input}"
-        try:
-            import json
-            from datetime import datetime
-            response = await self._call_llm(user_prompt, system_prompt, state)
-            match = re.search(r'\{.*\}', response, re.DOTALL)
-            json_str = match.group(0) if match else response
-            data = json.loads(json_str)
-            drug_info = {
-                'drug_name': data.get('drug_name', '') or rule_drug_name,
-                'dosage': data.get('dosage', ''),
-                'frequency': data.get('frequency', ''),
-                'time': data.get('time', '')
-            }
-            if not drug_info['time']:
-                 drug_info['time'] = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
-            return drug_info
-        except Exception:
-            from datetime import datetime
-            return {'drug_name': rule_drug_name, 'dosage': '', 'frequency': '', 'time': datetime.now().strftime('%Y-%m-%d %H:%M:%S')}
+        dosage = ""
+        freq = ""
+        dosage_match = re.search(r"(\d+\.?\d*)\s*(mg|毫克|g|克|ml|毫升|片|粒|胶囊|支|瓶|袋)", user_input)
+        if dosage_match:
+            dosage = dosage_match.group(0)
+        freq_match = re.search(r"(一天|每日|每天)\s*(\d+)\s*次|(\d+)\s*次\s*(一天|每日|每天)", user_input)
+        if freq_match:
+            freq = freq_match.group(0)
+
+        return {
+            "drug_name": rule_drug_name,
+            "dosage": dosage,
+            "frequency": freq,
+            "time": datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        }
 
     def get_system_prompt(self) -> str:
         return Prompts.get_prompt("DRUG_RECORD_AGENT")

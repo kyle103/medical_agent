@@ -1,6 +1,9 @@
 from __future__ import annotations
 
 import asyncio
+from collections.abc import AsyncGenerator
+
+import httpx
 
 from app.common.exceptions import LLMCallException
 from app.common.langfuse_helper import elapsed_ms, time_block, track_llm_call
@@ -9,17 +12,114 @@ from app.config.settings import settings
 
 logger = get_logger(__name__)
 
+_global_client: AsyncOpenAI | None = None
+_http2_available: bool = False
+_client_lock = asyncio.Lock()
+
+try:
+    import h2  # noqa: F401
+    _http2_available = True
+except ImportError:
+    pass
+
+
+def _build_http_client() -> httpx.AsyncClient:
+    return httpx.AsyncClient(
+        limits=httpx.Limits(
+            max_connections=20,
+            max_keepalive_connections=10,
+            keepalive_expiry=120,
+        ),
+        timeout=httpx.Timeout(
+            connect=10.0,
+            read=60.0,
+            write=30.0,
+            pool=10.0,
+        ),
+        http2=_http2_available,
+    )
+
+
+async def get_shared_client() -> AsyncOpenAI:
+    global _global_client
+    if _global_client is not None:
+        return _global_client
+    async with _client_lock:
+        if _global_client is not None:
+            return _global_client
+        from openai import AsyncOpenAI
+
+        _global_client = AsyncOpenAI(
+            api_key=settings.LLM_API_KEY,
+            base_url=settings.LLM_API_BASE,
+            http_client=_build_http_client(),
+        )
+        logger.info(
+            "LLM shared client created: base_url=%s max_conn=20 keepalive=10 http2=%s",
+            settings.LLM_API_BASE,
+            _http2_available,
+        )
+        return _global_client
+
 
 class LLMService:
     def __init__(self):
         self._client = None
 
-    def _get_client(self):
-        if self._client is None:
-            from openai import AsyncOpenAI
-
-            self._client = AsyncOpenAI(api_key=settings.LLM_API_KEY, base_url=settings.LLM_API_BASE)
+    async def _get_client(self):
+        if self._client is not None:
+            return self._client
+        self._client = await get_shared_client()
         return self._client
+
+    async def chat_completion_stream(
+        self,
+        *,
+        prompt: str,
+        system_prompt: str,
+        timeout_s: float | None = None,
+        max_tokens: int | None = None,
+    ) -> AsyncGenerator[str, None]:
+        model = settings.LLM_MODEL_NAME
+        start = time_block()
+        total_content = ""
+        try:
+            client = await self._get_client()
+            coro = client.chat.completions.create(
+                model=model,
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=settings.LLM_TEMPERATURE,
+                max_tokens=max_tokens if max_tokens is not None else settings.LLM_MAX_TOKENS,
+                stream=True,
+            )
+            stream_resp = await (asyncio.wait_for(coro, timeout=timeout_s) if timeout_s else coro)
+            async for chunk in stream_resp:
+                if chunk.choices and chunk.choices[0].delta.content:
+                    content = chunk.choices[0].delta.content
+                    total_content += content
+                    yield content
+            latency_ms = elapsed_ms(start)
+            log_llm_call(
+                model=model,
+                prompt_len=len(prompt),
+                system_prompt_len=len(system_prompt),
+                response_len=len(total_content),
+                latency_ms=latency_ms,
+                success=True,
+            )
+        except asyncio.TimeoutError:
+            latency_ms = elapsed_ms(start)
+            logger.warning("LLM流式调用超时(%.2fs)", float(timeout_s or 0))
+            track_llm_call(model=model, latency_ms=latency_ms, success=False, error="timeout")
+            raise LLMCallException("大模型流式调用超时")
+        except Exception as e:
+            latency_ms = elapsed_ms(start)
+            logger.error("LLM流式调用失败: %s", str(e))
+            track_llm_call(model=model, latency_ms=latency_ms, success=False, error="call_failed")
+            raise LLMCallException("大模型流式调用失败")
 
     async def chat_completion(
         self,
@@ -33,7 +133,7 @@ class LLMService:
         start = time_block()
         model = settings.LLM_MODEL_NAME
         try:
-            client = self._get_client()
+            client = await self._get_client()
             coro = client.chat.completions.create(
                 model=model,
                 messages=[

@@ -6,6 +6,7 @@ import uuid
 from dataclasses import dataclass
 import json
 
+from app.common.logger import get_logger
 from app.core.utils.text_splitter import TextSplitter
 from app.common.exceptions import ServiceUnavailableException
 from app.core.llm.llm_service import LLMService
@@ -18,6 +19,8 @@ from app.db.milvus_store import (
     parse_metadata,
     vector_search,
 )
+
+logger = get_logger(__name__)
 
 
 DEFAULT_COLLECTION = "user_long_memory"
@@ -471,3 +474,179 @@ class LongMemoryService:
             )
 
         return out
+
+    async def detect_conflicts(self, *, user_id: str, items: list[LongMemoryItem]) -> list[dict]:
+        """检测候选记忆与已有记忆之间的冲突。
+
+        返回冲突列表，每个元素格式：
+        {
+            "candidate": LongMemoryItem,
+            "conflict_with": LongMemoryItem,
+            "conflict_type": "contradict" | "supersede" | "duplicate",
+            "resolution": "skip" | "replace" | "merge"
+        }
+        """
+        if not items or not user_id:
+            return []
+
+        conflicts = []
+        for item in items:
+            try:
+                vectors = await self.embedder.embed_documents([item.text])
+                if not vectors:
+                    continue
+
+                expr_user = self._escape_expr_value(user_id)
+                try:
+                    hits = vector_search(
+                        collection_name=self.collection_name,
+                        query_vectors=vectors,
+                        limit=5,
+                        output_fields=["document", "metadata", "user_id"],
+                        filter_expr=f'user_id == "{expr_user}"',
+                    )
+                except ServiceUnavailableException:
+                    continue
+
+                if not hits:
+                    continue
+
+                for hit in hits:
+                    entity = hit.get("entity") or {}
+                    existing_text = str(entity.get("document") or "")
+                    md = parse_metadata(entity.get("metadata"))
+                    existing_item = LongMemoryItem(
+                        memory_id=str(hit.get("id") or ""),
+                        text=existing_text,
+                        memory_type=str(md.get("memory_type") or "fact"),
+                        source=str(md.get("source") or "chat"),
+                        session_id=str(md.get("session_id") or "") or None,
+                        created_at=int(md.get("created_at") or 0),
+                        confidence=float(md.get("confidence") or 1.0),
+                    )
+
+                    conflict_type = self._classify_conflict(item.text, existing_text)
+                    if conflict_type:
+                        resolution = self._resolve_conflict(conflict_type, item, existing_item)
+                        conflicts.append({
+                            "candidate": item,
+                            "conflict_with": existing_item,
+                            "conflict_type": conflict_type,
+                            "resolution": resolution,
+                        })
+                        logger.info(
+                            "long_memory conflict detected: type=%s resolution=%s candidate=%s existing=%s",
+                            conflict_type, resolution, item.text[:50], existing_text[:50],
+                        )
+            except Exception as e:
+                logger.error("detect_conflicts item failed: %s", e)
+
+        return conflicts
+
+    def _classify_conflict(self, new_text: str, existing_text: str) -> str | None:
+        """判断新记忆与已有记忆的冲突类型。"""
+        if new_text.strip() == existing_text.strip():
+            return "duplicate"
+
+        if new_text in existing_text or existing_text in new_text:
+            return "supersede"
+
+        contradict_patterns = [
+            (r"对(.+?)过敏", r"对(.+?)不过敏|对(.+?)已脱敏"),
+            (r"有(.+?)病史", r"没有(.+?)病史|(.+?)已治愈"),
+            (r"正在服用(.+?)", r"已停用(.+?)|不再服用(.+?)"),
+            (r"患有(.+?)", r"未患有(.+?)|排除(.+?)"),
+        ]
+        for pat_new, pat_existing in contradict_patterns:
+            new_match = re.search(pat_new, new_text)
+            if new_match:
+                existing_match = re.search(pat_existing, existing_text)
+                if existing_match:
+                    return "contradict"
+
+        return None
+
+    def _resolve_conflict(self, conflict_type: str, new_item: LongMemoryItem, existing_item: LongMemoryItem) -> str:
+        """根据冲突类型决定解决策略。"""
+        if conflict_type == "duplicate":
+            return "skip"
+        if conflict_type == "supersede":
+            if new_item.created_at >= existing_item.created_at:
+                return "replace"
+            return "skip"
+        if conflict_type == "contradict":
+            if new_item.created_at >= existing_item.created_at and new_item.confidence >= existing_item.confidence:
+                return "replace"
+            return "skip"
+        return "skip"
+
+    async def write_with_conflict_check(self, *, user_id: str, session_id: str, items: list[LongMemoryItem], source: str = "chat") -> dict:
+        """带冲突检测的写入，返回写入结果摘要。"""
+        if not items:
+            return {"written": 0, "skipped": 0, "replaced": 0}
+
+        conflicts = await self.detect_conflicts(user_id=user_id, items=items)
+        conflict_map = {}
+        for c in conflicts:
+            conflict_map[c["candidate"].memory_id] = c
+
+        to_write = []
+        skipped = 0
+        replaced = 0
+
+        for item in items:
+            conflict = conflict_map.get(item.memory_id)
+            if not conflict:
+                to_write.append(item)
+                continue
+
+            resolution = conflict["resolution"]
+            if resolution == "skip":
+                skipped += 1
+                logger.info("long_memory write skipped (conflict): %s", item.text[:50])
+            elif resolution == "replace":
+                replaced += 1
+                to_write.append(item)
+                logger.info("long_memory write replace (conflict): new=%s old=%s", item.text[:50], conflict["conflict_with"].text[:50])
+            elif resolution == "merge":
+                skipped += 1
+                logger.info("long_memory write merge (conflict): %s", item.text[:50])
+
+        for item in to_write:
+            item.source = source
+
+        written = await self.add_items(user_id=user_id, session_id=session_id, items=to_write)
+
+        logger.info(
+            "long_memory write_with_conflict_check: source=%s total=%d written=%d skipped=%d replaced=%d",
+            source, len(items), written, skipped, replaced,
+        )
+        return {"written": written, "skipped": skipped, "replaced": replaced}
+
+    async def batch_write_session(self, *, user_id: str, session_id: str, history: list[dict]) -> dict:
+        """批量写入一个 session 的对话历史到长期记忆。
+
+        用于对话结束后批量提取并写入，避免每轮都触发写入。
+        """
+        if not history:
+            return {"written": 0, "skipped": 0, "replaced": 0}
+
+        all_items: list[LongMemoryItem] = []
+        for msg in history:
+            if msg.get("role") != "user":
+                continue
+            content = msg.get("content", "").strip()
+            if not content:
+                continue
+            try:
+                items = await self.extract_candidates(user_input=content)
+                all_items.extend(items)
+            except Exception as e:
+                logger.error("batch_write_session extract failed for msg: %s", e)
+
+        if not all_items:
+            return {"written": 0, "skipped": 0, "replaced": 0}
+
+        return await self.write_with_conflict_check(
+            user_id=user_id, session_id=session_id, items=all_items, source="session_end"
+        )

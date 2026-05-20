@@ -86,6 +86,35 @@
             background: #e9ecef;
             color: #333;
             margin-right: auto;
+            line-height: 1.7;
+        }
+
+        .assistant-message h2, .assistant-message h3, .assistant-message h4 {
+            margin: 8px 0 4px 0;
+            color: #007bff;
+        }
+
+        .assistant-message ul {
+            margin: 4px 0 4px 20px;
+            padding: 0;
+        }
+
+        .assistant-message li {
+            margin-bottom: 4px;
+        }
+
+        .assistant-message p {
+            margin: 4px 0;
+        }
+
+        .streaming-cursor {
+            animation: blink 0.8s infinite;
+            color: #007bff;
+        }
+
+        @keyframes blink {
+            0%, 50% { opacity: 1; }
+            51%, 100% { opacity: 0; }
         }
 
         .input-section {
@@ -542,6 +571,8 @@
             }
         }
 
+        let conversationTurns = 0;
+
         // 发送消息
         async function sendMessage() {
             if (!accessToken || !currentUser) {
@@ -554,15 +585,17 @@
             
             if (!message) return;
             
-            // 添加用户消息到聊天界面
             addMessage('user', message);
             input.value = '';
             
-            // 显示加载中
-            const loadingDiv = document.createElement('div');
-            loadingDiv.className = 'message assistant-message loading';
-            loadingDiv.innerHTML = '<strong>助手：</strong>思考中...';
-            document.getElementById('chatMessages').appendChild(loadingDiv);
+            conversationTurns++;
+            updateSystemInfo({conversation_turns: conversationTurns, needs_confirmation: false});
+            
+            const assistantDiv = document.createElement('div');
+            assistantDiv.className = 'message assistant-message';
+            assistantDiv.innerHTML = '<strong>助手：</strong><span class="streaming-cursor">▍</span>';
+            document.getElementById('chatMessages').appendChild(assistantDiv);
+            scrollToBottom();
             
             try {
                 const response = await fetch('http://localhost:8000/api/v1/chat/completion', {
@@ -573,55 +606,178 @@
                     },
                     body: JSON.stringify({
                         user_input: message,
-                        session_id: sessionId
-                        // 不再需要手动传递user_id，后端会从JWT token中解析
+                        session_id: sessionId,
+                        stream: true
                     })
                 });
                 
                 if (response.ok) {
-                    const responseData = await response.json();
-                    const data = responseData.data;
+                    const contentType = response.headers.get('content-type') || '';
+                    console.log('Response content-type:', contentType, 'stream requested:', true);
                     
-                    // 移除加载中消息
-                    document.getElementById('chatMessages').removeChild(loadingDiv);
-                    
-                    // 添加助手回复
-                    if (data.assistant_output) {
-                        addMessage('assistant', data.assistant_output);
-                    } else if (data.confirmation_message) {
-                        addMessage('assistant', data.confirmation_message);
+                    if (contentType.includes('text/event-stream') || response.body) {
+                        let fullContent = '';
+                        const reader = response.body.getReader();
+                        const decoder = new TextDecoder();
+                        let buffer = '';
+                        
+                        while (true) {
+                            const {done, value} = await reader.read();
+                            if (done) break;
+                            
+                            buffer += decoder.decode(value, {stream: true});
+                            const lines = buffer.split('\n');
+                            buffer = lines.pop() || '';
+                            
+                            for (const line of lines) {
+                                if (!line.startsWith('data: ')) continue;
+                                const jsonStr = line.slice(6).trim();
+                                if (!jsonStr) continue;
+                                
+                                try {
+                                    const evt = JSON.parse(jsonStr);
+                                    console.log('SSE event:', evt.type);
+                                    
+                                    if (evt.type === 'progress') {
+                                        const nodeNames = {
+                                            'input_check': '检查输入',
+                                            'mem_load': '加载记忆',
+                                            'intent_node': '识别意图',
+                                            'entities': '提取实体',
+                                            'knowledge': '检索知识',
+                                            'plan': '制定计划',
+                                        };
+                                        const label = nodeNames[evt.node] || evt.node;
+                                        assistantDiv.innerHTML = '<strong>助手：</strong><span style="color:#888">' + label + '中...</span><span class="streaming-cursor">▍</span>';
+                                    } else if (evt.type === 'intent') {
+                                        updateSystemInfo({
+                                            intent: evt.intent,
+                                            intent_analysis: evt.intent_analysis,
+                                            target_agent: evt.target_agent,
+                                        });
+                                    } else if (evt.type === 'chunk') {
+                                        fullContent += evt.content;
+                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent) + '<span class="streaming-cursor">▍</span>';
+                                        scrollToBottom();
+                                    } else if (evt.type === 'content') {
+                                        fullContent = evt.content;
+                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent) + '<span class="streaming-cursor">▍</span>';
+                                        scrollToBottom();
+                                    } else if (evt.type === 'done') {
+                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
+                                        if (evt.conversation_turns != null) conversationTurns = evt.conversation_turns;
+                                        updateSystemInfo({
+                                            conversation_turns: evt.conversation_turns,
+                                            needs_confirmation: evt.needs_confirmation,
+                                        });
+                                        scrollToBottom();
+                                    } else if (evt.type === 'error') {
+                                        fullContent += evt.content;
+                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
+                                    }
+                                } catch (e) {
+                                    // skip malformed JSON
+                                }
+                            }
+                        }
+                        if (fullContent) {
+                            assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
+                        }
+                    } else {
+                        const responseData = await response.json();
+                        const data = responseData.data;
+                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(data.assistant_output || '暂无回复');
+                        updateSystemInfo(data);
+                        if (data.session_id) sessionId = data.session_id;
+                        if (data.conversation_turns) conversationTurns = data.conversation_turns;
                     }
-                    
-                    // 更新系统信息
-                    updateSystemInfo(data);
-                    
-                    // 滚动到底部
-                    scrollToBottom();
                 } else {
-                    // 移除加载中消息
-                    document.getElementById('chatMessages').removeChild(loadingDiv);
-                    
+                    assistantDiv.innerHTML = '<strong>助手：</strong>抱歉，请求失败';
                     if (response.status === 401) {
-                        // 未授权，跳转到登录界面
                         alert('登录已过期，请重新登录');
                         localStorage.removeItem('accessToken');
                         localStorage.removeItem('currentUser');
                         await checkLoginStatus();
-                    } else {
-                        const error = await response.json();
-                        addMessage('assistant', `抱歉，系统错误: ${error.detail || '未知错误'}`);
                     }
                 }
-                
             } catch (error) {
                 console.error('发送消息失败:', error);
-                
-                // 移除加载中消息
-                document.getElementById('chatMessages').removeChild(loadingDiv);
-                
-                // 显示错误消息
-                addMessage('assistant', '抱歉，系统暂时无法响应，请稍后再试。');
+                assistantDiv.innerHTML = '<strong>助手：</strong>抱歉，系统暂时无法响应，请稍后再试。';
             }
+        }
+
+        function renderMarkdown(text) {
+            if (!text) return '';
+
+            var html = text
+                .replace(/\r\n/g, '\n')
+                .replace(/\r/g, '\n');
+
+            html = html
+                .replace(/([^\n])\s+(?=#{1,3}\s)/g, '$1\n')
+                .replace(/([^\n])\s+(?=\d+\.\s)/g, '$1\n')
+                .replace(/([^\n])\s+(?=[-*]\s)/g, '$1\n');
+
+            html = html
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;');
+
+            html = html
+                .replace(/\*\*(.+?)\*\*/g, function(m, p1) { return '<strong>' + p1 + '</strong>'; })
+                .replace(/\*(.+?)\*/g, function(m, p1) { return '<em>' + p1 + '</em>'; })
+                .replace(/`([^`]+)`/g, function(m, p1) { return '<code>' + p1 + '</code>'; });
+
+            var lines = html.split('\n');
+            var result = [];
+            var inUl = false;
+            var inOl = false;
+
+            var closeLists = function() {
+                if (inUl) { result.push('</ul>'); inUl = false; }
+                if (inOl) { result.push('</ol>'); inOl = false; }
+            };
+
+            for (var i = 0; i < lines.length; i++) {
+                var line = lines[i];
+
+                var h3 = line.match(/^###\s+(.+)$/);
+                var h2 = line.match(/^##\s+(.+)$/);
+                var h1 = line.match(/^#\s+(.+)$/);
+                if (h3 || h2 || h1) {
+                    closeLists();
+                    var hdr = (h3 || h2 || h1)[1];
+                    if (h3) result.push('<h4>' + hdr + '</h4>');
+                    if (h2) result.push('<h3>' + hdr + '</h3>');
+                    if (h1) result.push('<h2>' + hdr + '</h2>');
+                    continue;
+                }
+
+                var ulMatch = line.match(/^[-*]\s+(.+)$/);
+                var olMatch = line.match(/^\d+\.\s+(.+)$/);
+
+                if (ulMatch) {
+                    if (!inUl) { closeLists(); result.push('<ul>'); inUl = true; }
+                    result.push('<li>' + ulMatch[1] + '</li>');
+                    continue;
+                }
+
+                if (olMatch) {
+                    if (!inOl) { closeLists(); result.push('<ol>'); inOl = true; }
+                    result.push('<li>' + olMatch[1] + '</li>');
+                    continue;
+                }
+
+                closeLists();
+                if (line.trim() === '') {
+                    result.push('<br>');
+                } else {
+                    result.push('<p>' + line + '</p>');
+                }
+            }
+
+            closeLists();
+            return result.join('');
         }
 
         // 添加消息到聊天界面
@@ -631,7 +787,11 @@
             messageDiv.className = `message ${role === 'user' ? 'user-message' : 'assistant-message'}`;
             
             const roleText = role === 'user' ? '您：' : '助手：';
-            messageDiv.innerHTML = `<strong>${roleText}</strong>${content}`;
+            if (role === 'assistant') {
+                messageDiv.innerHTML = `<strong>${roleText}</strong>${renderMarkdown(content)}`;
+            } else {
+                messageDiv.innerHTML = `<strong>${roleText}</strong>${content}`;
+            }
             
             messagesDiv.appendChild(messageDiv);
             scrollToBottom();
@@ -645,26 +805,40 @@
 
         // 更新系统信息
         function updateSystemInfo(data) {
-            // 系统信息
-            let systemInfo = `对话轮次: ${data.conversation_history ? data.conversation_history.length : 0}<br>`;
+            if (!data) return;
+
+            let systemInfo = '';
+            systemInfo += `对话轮次: ${data.conversation_turns != null ? data.conversation_turns : conversationTurns}<br>`;
             systemInfo += `是否需要确认: ${data.needs_confirmation ? '是' : '否'}<br>`;
             if (data.error_msg) {
                 systemInfo += `错误信息: ${data.error_msg}`;
             }
             document.getElementById('systemInfo').innerHTML = systemInfo;
-            
-            // 意图分析
+
             if (data.intent_analysis) {
-                const intent = data.intent_analysis;
-                let intentHtml = `<span class="intent-badge intent-${intent.intent_type}">${intent.intent_type}</span><br>`;
-                intentHtml += `置信度: ${(intent.confidence * 100).toFixed(1)}%<br>`;
-                intentHtml += `原因: ${intent.reason}`;
+                const ia = data.intent_analysis;
+                const intentType = ia.intent_type || data.intent || '';
+                let intentHtml = `<span class="intent-badge intent-${intentType}">${intentType || '-'}</span><br>`;
+                if (ia.confidence != null) {
+                    intentHtml += `置信度: ${(ia.confidence * 100).toFixed(1)}%<br>`;
+                }
+                if (ia.reason) {
+                    intentHtml += `原因: ${ia.reason}`;
+                }
                 document.getElementById('intentAnalysis').innerHTML = intentHtml;
+            } else if (data.intent) {
+                document.getElementById('intentAnalysis').innerHTML = `<span class="intent-badge intent-${data.intent}">${data.intent}</span>`;
             }
-            
-            // 目标Agent
-            if (data.target_agent) {
-                document.getElementById('targetAgent').textContent = data.target_agent;
+
+            const agent = data.target_agent || '';
+            if (agent) {
+                const agentNames = {
+                    'main_qa_agent': '通用问答',
+                    'drug_record_agent': '用药记录',
+                    'drug_conflict_agent': '药物冲突',
+                    'lab_report_agent': '化验单解读',
+                };
+                document.getElementById('targetAgent').textContent = agentNames[agent] || agent;
             }
         }
 
