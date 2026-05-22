@@ -613,13 +613,37 @@ async def plan_node(state: dict) -> dict:
 
 
 def _group_steps_by_dependency(steps: list[PlanStep]) -> list[list[PlanStep]]:
+    """按依赖关系拓扑分层：同层步骤可并行，层间必须串行。
+
+    如果某个步骤声明的依赖指向不存在的步骤 ID（孤依赖），
+    将其降级为无依赖步骤并告警，而不是静默打乱执行顺序。
+    """
+    all_ids = {s["step_id"] for s in steps}
     topo: list[list[PlanStep]] = []
     remaining = list(steps)
     completed_ids: set[str] = set()
+
+    for s in remaining:
+        orphans = [d for d in s.get("depends_on", []) if d not in all_ids]
+        if orphans:
+            logger.warning(
+                "_group_steps_by_dependency: step=%s has orphan deps=%s — treating as no deps",
+                s["step_id"], orphans,
+            )
+            s["depends_on"] = [d for d in s.get("depends_on", []) if d not in orphans]
+
     while remaining:
         ready = [s for s in remaining if all(d in completed_ids for d in s.get("depends_on", []))]
         if not ready:
-            ready = [remaining[0]]
+            remaining_ids = [s["step_id"] for s in remaining]
+            logger.error(
+                "_group_steps_by_dependency: circular or unresolvable deps among %s — falling back to serial",
+                remaining_ids,
+            )
+            for s in remaining:
+                topo.append([s])
+                completed_ids.add(s["step_id"])
+            break
         topo.append(ready)
         for s in ready:
             completed_ids.add(s["step_id"])
@@ -644,60 +668,143 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
         sub_state["user_input"] = f"[背景信息：用户原始问题是「{original_input}」]\n{step_query}"
 
     if step_results and step.get("depends_on"):
-        dep_summaries: list[str] = []
-        merged_drug_names: list[str] = []
+        structured_ctx = _build_structured_context(step, step_results, original_input, step_query)
+        sub_state["user_input"] = structured_ctx["prompt"]
+        sub_state["step_context"] = structured_ctx["context"]
+        sub_state["extract_entities"] = structured_ctx["merged_entities"]
+
+    return sub_state
+
+
+def _DEFAULT_TRUNCATE_CHARS() -> int:
+    return 800
+
+
+def _build_structured_context(
+    step: PlanStep,
+    step_results: dict,
+    original_input: str,
+    step_query: str,
+) -> dict:
+    """从依赖步骤结果中提取结构化上下文，供下游步骤使用。
+
+    返回:
+      prompt: 拼接后的 user_input 文本
+      context: 结构化上下文 dict，含 summaries / entities / lab_items / key_findings
+      merged_entities: 合并后的实体 dict（供 extract_entities 使用）
+    """
+    dep_summaries: list[str] = []
+    merged_drug_names: list[str] = []
+    merged_lab_items: list[dict] = []
+    key_findings: list[str] = []
+    max_chars = _DEFAULT_TRUNCATE_CHARS()
+
+    for dep_id in step["depends_on"]:
+        dep_result = step_results.get(dep_id)
+        if not isinstance(dep_result, dict):
+            continue
+
+        dep_response = dep_result.get("final_response", "")
+        if dep_response:
+            truncated = dep_response[:max_chars] + ("...(内容过长已截断)" if len(dep_response) > max_chars else "")
+            dep_summaries.append(f"[步骤{dep_id}的结果]: {truncated}")
+
+            findings = _extract_key_findings(dep_response)
+            if findings:
+                key_findings.extend(findings)
+        elif dep_result.get("tool_result"):
+            tool_res = dep_result["tool_result"]
+            if isinstance(tool_res, dict):
+                tool_text = json.dumps(tool_res, ensure_ascii=False)[:max_chars]
+                dep_summaries.append(f"[步骤{dep_id}的工具结果]: {tool_text}")
+
+        # 合并实体：药品名称
+        dep_entities = dep_result.get("extract_entities") or {}
+        if isinstance(dep_entities, dict):
+            dep_drug_names = dep_entities.get("drug_name_list", [])
+            if isinstance(dep_drug_names, list):
+                merged_drug_names.extend(dep_drug_names)
+
+        # 合并实体：化验指标
+        dep_tool_result = dep_result.get("tool_result") or {}
+        if isinstance(dep_tool_result, dict):
+            tool_drug_list = dep_tool_result.get("drug_list", [])
+            for d in tool_drug_list:
+                dn = d.get("drug_name", "") if isinstance(d, dict) else ""
+                if dn and d.get("match_status") == "匹配成功":
+                    merged_drug_names.append(dn)
+
+            tool_lab_items = dep_tool_result.get("item_list", [])
+            if isinstance(tool_lab_items, list) and tool_lab_items:
+                for item in tool_lab_items:
+                    if isinstance(item, dict):
+                        merged_lab_items.append({
+                            "item_name": item.get("item_name", ""),
+                            "test_value": item.get("test_value", ""),
+                            "reference_range": item.get("reference_range", ""),
+                            "abnormal_flag": item.get("abnormal_flag", ""),
+                        })
+
+    # 如果从结构化结果中没拿到药名，从 final_response 文本中正则兜底提取
+    if not merged_drug_names:
         for dep_id in step["depends_on"]:
             dep_result = step_results.get(dep_id)
             if not isinstance(dep_result, dict):
                 continue
             dep_response = dep_result.get("final_response", "")
             if dep_response:
-                truncated = dep_response[:500] + ("...(内容过长已截断)" if len(dep_response) > 500 else "")
-                dep_summaries.append(f"[步骤{dep_id}的结果]: {truncated}")
-            elif dep_result.get("tool_result"):
-                dep_summaries.append(f"[步骤{dep_id}的工具结果]: {json.dumps(dep_result['tool_result'], ensure_ascii=False)[:300]}")
-            dep_entities = dep_result.get("extract_entities") or {}
-            if isinstance(dep_entities, dict):
-                dep_drug_names = dep_entities.get("drug_name_list", [])
-                if isinstance(dep_drug_names, list):
-                    merged_drug_names.extend(dep_drug_names)
-            dep_tool_result = dep_result.get("tool_result") or {}
-            if isinstance(dep_tool_result, dict):
-                tool_drug_list = dep_tool_result.get("drug_list", [])
-                for d in tool_drug_list:
-                    dn = d.get("drug_name", "") if isinstance(d, dict) else ""
-                    if dn and d.get("match_status") == "匹配成功":
-                        merged_drug_names.append(dn)
-        if dep_summaries:
-            context_parts = []
-            if original_input and step_query and original_input != step_query and step_query not in original_input:
-                context_parts.append(f"[用户原始问题]: {original_input}")
-            context_parts.append(f"[当前需要回答的问题]: {step_query}")
-            context_parts.extend(dep_summaries)
-            context_parts.append("请基于以上前置步骤的结果来回答当前问题。")
-            sub_state["user_input"] = "\n".join(context_parts)
-            sub_state["step_context"] = {"dep_summaries": dep_summaries}
-            if not merged_drug_names:
-                for dep_id in step["depends_on"]:
-                    dep_result = step_results.get(dep_id)
-                    if not isinstance(dep_result, dict):
-                        continue
-                    dep_response = dep_result.get("final_response", "")
-                    if dep_response:
-                        dep_names = DrugEntityExtractor.extract_drug_candidates(dep_response, max_items=10)
-                        merged_drug_names.extend(dep_names)
-        if merged_drug_names:
-            existing_entities = sub_state.get("extract_entities") or {}
-            if not isinstance(existing_entities, dict):
-                existing_entities = {}
-            existing_names = existing_entities.get("drug_name_list", [])
-            if not isinstance(existing_names, list):
-                existing_names = []
-            combined = list(set(existing_names + merged_drug_names))
-            existing_entities["drug_name_list"] = combined
-            sub_state["extract_entities"] = existing_entities
+                dep_names = DrugEntityExtractor.extract_drug_candidates(dep_response, max_items=10)
+                merged_drug_names.extend(dep_names)
 
-    return sub_state
+    # 构建 prompt
+    context_parts: list[str] = []
+    if original_input and step_query and original_input != step_query and step_query not in original_input:
+        context_parts.append(f"[用户原始问题]: {original_input}")
+    context_parts.append(f"[当前需要回答的问题]: {step_query}")
+    context_parts.extend(dep_summaries)
+    if dep_summaries:
+        context_parts.append("请基于以上前置步骤的结果来回答当前问题。")
+    prompt = "\n".join(context_parts)
+
+    # 构建 merged_entities
+    merged_entities: dict = {}
+    if merged_drug_names:
+        merged_entities["drug_name_list"] = list(set(merged_drug_names))
+    if merged_lab_items:
+        merged_entities["lab_items"] = merged_lab_items
+
+    # 结构化上下文
+    structured_ctx: dict = {
+        "dep_summaries": dep_summaries,
+        "key_findings": key_findings,
+        "drug_names": list(set(merged_drug_names)),
+        "lab_items": merged_lab_items,
+    }
+
+    return {
+        "prompt": prompt,
+        "context": structured_ctx,
+        "merged_entities": merged_entities,
+    }
+
+
+def _extract_key_findings(text: str) -> list[str]:
+    """从步骤回答文本中提取关键结论（规则兜底）。"""
+    if not text:
+        return []
+    findings: list[str] = []
+    patterns = [
+        r"(?:总之|综上所述|因此|所以|核心结论[：:]?)\s*(.{10,120}?)(?:[。；]|$)",
+        r"(?:常用\S*?包括|推荐\S*?包括|主要有)\s*(.{10,120}?)(?:[。；]|$)",
+        r"(?:注意|需注意|注意事项)[：:]\s*(.{10,120}?)(?:[。；]|$)",
+    ]
+    import re as _re
+    for pat in patterns:
+        for m in _re.finditer(pat, text):
+            finding = m.group(1).strip()
+            if len(finding) >= 6 and finding not in findings:
+                findings.append(finding)
+    return findings[:5]
 
 
 async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
@@ -748,7 +855,6 @@ async def execute_node(state: dict) -> dict:
 
     plan = state.get("execution_plan", {})
     steps = plan.get("steps", [])
-    strategy = plan.get("strategy", "serial")
     results: dict[str, dict] = state.get("plan_step_results") or {}
 
     if "original_user_input" not in state:
@@ -761,7 +867,7 @@ async def execute_node(state: dict) -> dict:
         log_node_execution(node_name="execute_node", latency_ms=latency_ms, step_count=0)
         return state
 
-    if strategy == "serial" or len(steps) <= 1:
+    if len(steps) <= 1:
         for step in steps:
             if step["step_id"] in results:
                 continue

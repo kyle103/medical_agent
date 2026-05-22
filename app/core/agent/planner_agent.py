@@ -18,6 +18,48 @@ MAX_REPLAN = 2
 AGENT_TARGETS = {"drug_record_agent", "main_qa_agent"}
 TOOL_TARGETS = {"drug_interaction", "lab_report"}
 
+# ---- dependency detection: rule patterns ----
+
+_CONTINUATION_PRONOUNS = [
+    "它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还要", "还用", "还需要",
+    "其中", "哪些", "这些", "那些", "哪种", "第一个", "第二个", "第一种", "第二种",
+]
+
+_EVALUATION_PATTERNS = [
+    "怎么样", "有用吗", "有效吗", "管用吗", "安全吗", "副作用",
+    "哪个更好", "哪个更", "哪种更", "区别", "对比",
+]
+
+_FOLLOWUP_PATTERNS = [
+    "剂量", "怎么吃", "怎么服用", "用量", "吃多少", "多久",
+    "需要注意什么", "有什么注意", "禁忌", "不能和", "不能跟",
+]
+
+_IMPLICIT_RECOMMENDATION = [
+    "可以吃什么药", "吃什么药", "用什么药", "有什么药", "该吃什么", "要吃什么", "吃什么好",
+    "推荐", "建议用什么", "能用什么",
+]
+
+_IMPLICIT_CAUSE = [
+    "原因", "症状", "怎么办", "腹泻", "发烧", "咳嗽", "头痛", "疼痛",
+    "感冒", "炎症", "感染", "什么病", "得了", "患有", "诊断",
+]
+
+_DRUG_CONFLICT_KEYWORDS = [
+    "一起吃", "同服", "相互作用", "配伍", "冲突", "禁忌", "能不能一起", "可以一起",
+    "同时服用", "一起用", "混合", "并用",
+]
+
+_RESULT_REF_KEYWORDS = [
+    "其中哪些药", "这些药", "那些药", "上面的药", "推荐的药", "上面提到的药",
+    "以上", "上述", "前面", "提到的",
+]
+
+_DEPENDENCY_HINT = ";".join(
+    _CONTINUATION_PRONOUNS + _EVALUATION_PATTERNS + _FOLLOWUP_PATTERNS
+    + _RESULT_REF_KEYWORDS + _DRUG_CONFLICT_KEYWORDS
+)
+
 
 def _route_by_intent_and_text(state: dict) -> dict:
     intent = (state.get("intent") or "").strip().lower()
@@ -65,93 +107,101 @@ def _route_by_intent_and_text(state: dict) -> dict:
 
 
 def _detect_dependencies_rule(query: str, previous_queries: list[str]) -> list[str]:
-    deps: list[str] = []
-    pronouns = ["它", "这", "那个", "上面", "刚才", "之前", "继续", "然后", "还有", "其中"]
-    if any(p in query for p in pronouns):
-        for i, _ in enumerate(previous_queries):
-            deps.append(f"s{i + 1}")
-    result_ref_keywords = ["其中哪些药", "这些药", "那些药", "上面的药", "推荐的药", "上面提到的药"]
-    if any(k in query for k in result_ref_keywords) and previous_queries:
+    """规则优先的依赖检测（扩展版）。
+
+    按四个维度检测当前 query 是否依赖前置查询的结果：
+    1. 指代引用 — 代词/序号指向前面提到的内容
+    2. 评估追问 — 询问前文推荐的效果/安全性/对比
+    3. 细节追问 — 询问前文药物的剂量/用法/注意事项
+    4. 隐式因果 — 药物推荐/冲突查询依赖症状分析/药物列表
+    """
+    if not previous_queries:
+        return []
+
+    deps: set[int] = set()
+    prev_count = len(previous_queries)
+
+    # 1) 代词/序号引用 → 依赖所有前置步骤（保守策略）
+    if any(p in query for p in _CONTINUATION_PRONOUNS):
+        deps.update(range(prev_count))
+
+    # 2) "结果引用" → 依赖包含药/症状关键词的前置步骤
+    if any(k in query for k in _RESULT_REF_KEYWORDS):
         for i, prev_q in enumerate(previous_queries):
             if any(kw in prev_q for kw in ["药", "原因", "症状", "治疗", "怎么办", "腹泻", "发烧", "咳嗽", "头痛", "疼痛", "感冒", "炎症", "感染"]):
-                deps.append(f"s{i + 1}")
-    conflict_keywords = ["一起吃", "同服", "相互作用", "配伍", "冲突", "禁忌"]
-    if any(k in query for k in conflict_keywords) and previous_queries:
+                deps.add(i)
+
+    # 3) "评估追问"（XX怎么样？有用吗？哪个更好？）→ 依赖包含药/治疗关键词的前置步骤
+    _eval_hit = any(k in query for k in _EVALUATION_PATTERNS)
+    _detail_hit = any(k in query for k in _FOLLOWUP_PATTERNS)
+    if _eval_hit or _detail_hit:
+        for i, prev_q in enumerate(previous_queries):
+            if any(kw in prev_q for kw in ["药", "推荐", "治疗", "布洛芬", "阿司匹林", "阿莫西林", "头孢"]):
+                deps.add(i)
+
+    # 4) 药物冲突查询 → 依赖提供药名的前置步骤
+    if any(k in query for k in _DRUG_CONFLICT_KEYWORDS):
         for i, prev_q in enumerate(previous_queries):
             if any(kw in prev_q for kw in ["药", "吃什么", "用什么", "推荐"]):
-                if f"s{i + 1}" not in deps:
-                    deps.append(f"s{i + 1}")
-    implicit_dep_keywords = ["可以吃什么药", "吃什么药", "用什么药", "有什么药", "该吃什么", "要吃什么", "吃什么好", "怎么办", "怎么治", "如何治疗", "怎么处理", "怎么缓解", "如何缓解"]
-    if any(k in query for k in implicit_dep_keywords) and previous_queries:
+                deps.add(i)
+
+    # 5) 隐式依赖：药物推荐 → 依赖症状分析
+    if any(k in query for k in _IMPLICIT_RECOMMENDATION):
         for i, prev_q in enumerate(previous_queries):
-            if any(kw in prev_q for kw in ["原因", "症状", "怎么办", "腹泻", "发烧", "咳嗽", "头痛", "疼痛", "感冒", "炎症", "感染", "什么病", "得了", "患有", "诊断"]):
-                if f"s{i + 1}" not in deps:
-                    deps.append(f"s{i + 1}")
-    return list(set(deps))
+            if any(kw in prev_q for kw in _IMPLICIT_CAUSE):
+                deps.add(i)
+
+    # 6) "为什么" / "怎么会" 追问 → 依赖前面有实质内容的步骤
+    if any(k in query for k in ["为什么", "怎么会", "原因是", "是什么原因"]):
+        for i, prev_q in enumerate(previous_queries):
+            if len(prev_q) >= 6:
+                deps.add(i)
+
+    return [f"s{i + 1}" for i in sorted(deps)]
 
 
-async def _detect_dependencies_semantic(query: str, all_queries: list[str], query_index: int) -> list[str]:
-    rule_deps = _detect_dependencies_rule(query, all_queries[:query_index])
-    if rule_deps:
-        return rule_deps
-    if len(all_queries) <= 1:
-        return []
-    if not _llm_enabled():
-        return []
-
-    llm = LLMService()
-    prev = all_queries[:query_index]
-    if not prev:
-        return []
-
-    prompt = (
-        f"分析以下查询之间的依赖关系。\n"
-        f"当前查询：{query}\n"
-        f"之前的查询：{json.dumps(prev, ensure_ascii=False)}\n"
-        f"如果当前查询需要之前某个查询的结果才能回答（例如包含代词引用、需要前文药名等），返回依赖的步骤编号列表。\n"
-        f"步骤编号格式为 s1, s2, ...（对应第1、2...个查询）。\n"
-        f"如果没有依赖，返回空数组 []。\n"
-        f"只输出 JSON 数组，不要其他内容。"
-    )
-    try:
-        raw = await llm.chat_completion(
-            prompt=prompt,
-            system_prompt="你是依赖分析助手，只输出JSON数组。",
-            stream=False,
-            timeout_s=5.0,
-            max_tokens=60,
-        )
-        deps = json.loads(raw.strip())
-        if isinstance(deps, list):
-            valid = [d for d in deps if isinstance(d, str) and d.startswith("s")]
-            return valid
-    except Exception:
-        logger.debug("semantic dependency detection fallback to rule")
-    return []
 
 
 async def _detect_dependencies_batch(queries: list[str]) -> list[list[str]]:
-    """批量检测多个查询之间的依赖关系。规则优先，仅对规则未覆盖的查询做一次LLM调用。"""
-    results: list[list[str]] = []
-    need_llm_indices: list[int] = []
+    """批量检测依赖关系：规则结果与 LLM 结果取并集。
+
+    规则提供高精度快速覆盖，LLM 捕捉规则遗漏的语义依赖。
+    最终每个查询的依赖 = 规则 ∪ LLM。
+    """
+    # 规则层
+    rule_results: list[list[str]] = []
     for i, q in enumerate(queries):
         rule_deps = _detect_dependencies_rule(q, queries[:i])
-        results.append(rule_deps)
-        if not rule_deps and i > 0:
-            need_llm_indices.append(i)
+        rule_results.append(rule_deps)
 
-    if not need_llm_indices or not _llm_enabled() or len(queries) <= 1:
-        return results
+    if len(queries) <= 1:
+        return rule_results
 
+    # LLM 补充层 — 始终运行，作为规则的补充
+    llm_results: list[list[str]] = [[] for _ in queries]
+    if _llm_enabled():
+        llm_results = await _detect_dependencies_llm(queries)
+
+    # 合并：规则 ∪ LLM
+    merged: list[list[str]] = []
+    for i in range(len(queries)):
+        combined = list(set(rule_results[i]) | set(llm_results[i]))
+        merged.append(sorted(combined, key=lambda x: int(x[1:])))
+    return merged
+
+
+async def _detect_dependencies_llm(queries: list[str]) -> list[list[str]]:
+    """单次 LLM 调用检测所有查询间的依赖关系。"""
     llm = LLMService()
     queries_desc = "\n".join(f"s{i+1}: {q}" for i, q in enumerate(queries))
-    need_desc = ", ".join(f"s{i+1}" for i in need_llm_indices)
     prompt = (
-        f"分析以下查询之间的依赖关系。\n"
+        f"分析以下查询之间的依赖关系。如果当前查询需要之前某个查询的结果才能回答，标记为依赖。\n"
+        f"依赖的常见情形：(1) 使用了代词或序号指代前置内容 (2) 需要前置步骤给出的药品名/诊断结果 "
+        f"(3) 对前置推荐结果做进一步追问（效果、副作用、用量、对比等）\n"
         f"所有查询：\n{queries_desc}\n\n"
-        f"请判断 {need_desc} 是否依赖前面的查询结果（如代词引用、需要前文药名等）。\n"
-        f"输出JSON对象，键为步骤编号(s1,s2,...)，值为依赖的步骤编号数组。无依赖则为空数组。\n"
-        f"示例：{{\"s2\": [\"s1\"], \"s3\": [\"s2\"]}}\n"
+        f"输出JSON对象，键为步骤编号(s2,s3,...)，值为依赖的步骤编号数组。s1 不可能有依赖。\n"
+        f"无依赖的步骤省略，或给空数组。\n"
+        f"示例：{{\"s2\": [\"s1\"], \"s3\": [\"s1\", \"s2\"]}}\n"
         f"只输出JSON，不要其他内容。"
     )
     try:
@@ -159,22 +209,28 @@ async def _detect_dependencies_batch(queries: list[str]) -> list[list[str]]:
             prompt=prompt,
             system_prompt="你是依赖分析助手，只输出JSON对象。",
             stream=False,
-            timeout_s=3.0,
-            max_tokens=120,
+            timeout_s=6.0,
+            max_tokens=200,
         )
-        data = json.loads(raw.strip())
-        if isinstance(data, dict):
-            for idx in need_llm_indices:
-                key = f"s{idx + 1}"
-                deps = data.get(key, [])
-                if isinstance(deps, list):
-                    valid = [d for d in deps if isinstance(d, str) and d.startswith("s")]
-                    if valid:
-                        results[idx] = valid
+        import re
+        match = re.search(r"\{.*\}", raw.strip(), re.DOTALL)
+        json_str = match.group(0) if match else raw.strip()
+        data = json.loads(json_str)
+        if not isinstance(data, dict):
+            return [[] for _ in queries]
+        results: list[list[str]] = [[] for _ in queries]
+        all_ids = {f"s{i+1}" for i in range(len(queries))}
+        for key, deps in data.items():
+            if not isinstance(deps, list):
+                continue
+            idx = int(key[1:]) - 1 if key.startswith("s") and key[1:].isdigit() else -1
+            if 0 <= idx < len(queries):
+                valid = [d for d in deps if isinstance(d, str) and d in all_ids]
+                results[idx] = valid
+        return results
     except Exception:
-        logger.debug("batch semantic dependency detection fallback to rule")
-
-    return results
+        logger.debug("LLM dependency detection failed, using rule-only results")
+        return [[] for _ in queries]
 
 
 def _llm_enabled() -> bool:
@@ -282,7 +338,7 @@ class PlannerAgent:
                         depends_on=[],
                         execution_strategy="serial",
                     )],
-                    strategy="serial",
+                    strategy="single",
                     conflict_resolution_policy="none",
                 )
                 state["plan_phase"] = "planning"
@@ -312,7 +368,7 @@ class PlannerAgent:
                     depends_on=[],
                     execution_strategy="serial",
                 )],
-                strategy="serial",
+                strategy="single",
                 conflict_resolution_policy="evidence_priority",
             )
         else:
@@ -339,10 +395,9 @@ class PlannerAgent:
                     execution_strategy="parallel" if not deps else "serial",
                 ))
 
-            has_deps = any(s.get("depends_on") for s in steps)
             plan = ExecutionPlan(
                 steps=steps,
-                strategy="hybrid" if has_deps else "parallel",
+                strategy="topological",
                 conflict_resolution_policy="evidence_priority",
             )
 
@@ -402,7 +457,7 @@ class PlannerAgent:
             revised_steps = existing_steps + retry_steps
             state["execution_plan"] = ExecutionPlan(
                 steps=revised_steps,
-                strategy="serial",
+                strategy="topological",
                 conflict_resolution_policy="evidence_priority",
             )
             state["needs_replan"] = True

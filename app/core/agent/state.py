@@ -17,7 +17,7 @@ class PlanStep(TypedDict, total=False):
 
 class ExecutionPlan(TypedDict, total=False):
     steps: list[PlanStep]
-    strategy: Literal["serial", "parallel", "hybrid"]
+    strategy: Literal["single", "topological"]
     conflict_resolution_policy: str
 
 
