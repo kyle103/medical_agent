@@ -339,6 +339,127 @@ class LLMDecisionService:
             logger.warning("LLMDecisionService.batch_route_queries failed: %s", e)
             return [None] * len(queries)
 
+    async def batch_route_with_deps(self, queries: list[str]) -> tuple[list[dict | None], list[list[str]]]:
+        """一次 LLM 调用同时完成：批量路由 + 依赖关系检测。
+
+        将原来的 batch_route_queries + _detect_dependencies_llm 合并，
+        减少一次 LLM 往返。
+
+        返回:
+          (routes, deps) — routes 格式同 batch_route_queries，
+          deps 为每个查询的依赖步骤编号列表。
+        """
+        default_routes = [None] * len(queries)
+        default_deps: list[list[str]] = [[] for _ in queries]
+        if not _llm_enabled() or not queries:
+            return default_routes, default_deps
+        if len(queries) == 1:
+            result = await self.classify_intent_and_route(queries[0])
+            return [result], [[]]
+
+        capabilities_desc = "\n".join(
+            f"- {c['name']} (类型: {c['type']}): {c['description']}\n  适用场景: {c['when_to_use']}"
+            for c in CAPABILITY_REGISTRY
+        )
+
+        queries_desc = "\n".join(f"s{i+1}: {q}" for i, q in enumerate(queries))
+
+        system_prompt = (
+            "你是一个医疗问答系统的批量路由与依赖分析器。\n"
+            "以下是系统可用的工具和Agent：\n\n"
+            f"{capabilities_desc}\n\n"
+            "请对每个子查询同时完成两项任务：\n"
+            "1. 路由决策：判断意图并选择最合适的工具/Agent\n"
+            "2. 依赖分析：判断该查询是否依赖前面查询的结果才能回答\n\n"
+            "依赖的常见情形：(a) 代词/序号指代前置内容 (b) 需要前置步骤给出的药名/诊断\n"
+            "(c) 对前置推荐结果的追问（效果、用量、对比）\n"
+            "注意：因果叙事的连贯句子（如'因为过敏所以住院'）不应标记为依赖，它们是一个事件的完整叙述。\n\n"
+            "你必须只输出合法JSON对象，不要输出Markdown标记。\n"
+            "JSON格式：\n"
+            "{\n"
+            '  "routes": {\n'
+            '    "s1": {\n'
+            '      "intent": "archive|drug|lab|general",\n'
+            '      "intent_type": "archive|drug_conflict|drug_record|drug_query|lab_report|general",\n'
+            '      "target_type": "agent|tool",\n'
+            '      "target_name": "main_qa_agent|drug_record_agent|drug_interaction|lab_report",\n'
+            '      "confidence": 0.0~1.0,\n'
+            '      "reason": "..."\n'
+            "    }\n"
+            "  },\n"
+            '  "deps": {\n'
+            '    "s2": ["s1"],\n'
+            '    "s3": ["s1"]\n'
+            "  }\n"
+            "}\n"
+            "s1 不可能有依赖，不出现在 deps 中。无依赖的步骤省略。"
+        )
+
+        user_prompt = f"子查询列表：\n{queries_desc}\n\n请输出路由与依赖JSON："
+
+        try:
+            raw = await self.llm.chat_completion(
+                prompt=user_prompt,
+                system_prompt=system_prompt,
+                stream=False,
+                timeout_s=12.0,
+                max_tokens=900,
+            )
+            if not raw:
+                return default_routes, default_deps
+
+            import re
+            match = re.search(r"\{.*\}", raw, re.DOTALL)
+            json_str = match.group(0) if match else raw
+            data = json.loads(json_str)
+
+            # 解析 routes
+            routes_data = data.get("routes", {}) if isinstance(data, dict) else {}
+            valid_intents = {"archive", "drug", "lab", "general"}
+            valid_targets = {c["name"] for c in CAPABILITY_REGISTRY}
+            valid_types = {"agent", "tool"}
+
+            routes: list[dict | None] = [None] * len(queries)
+            for i in range(len(queries)):
+                key = f"s{i+1}"
+                item = routes_data.get(key)
+                if not isinstance(item, dict):
+                    continue
+                intent = item.get("intent", "")
+                target_name = item.get("target_name", "")
+                target_type = item.get("target_type", "")
+                confidence = float(item.get("confidence", 0.0) or 0.0)
+                if intent not in valid_intents or target_name not in valid_targets or target_type not in valid_types:
+                    continue
+                expected_type = next((c["type"] for c in CAPABILITY_REGISTRY if c["name"] == target_name), None)
+                if expected_type and target_type != expected_type:
+                    target_type = expected_type
+                routes[i] = {
+                    "intent": intent,
+                    "intent_type": item.get("intent_type", intent),
+                    "target_type": target_type,
+                    "target_name": target_name,
+                    "confidence": max(min(confidence, 1.0), 0.0),
+                    "reason": item.get("reason", ""),
+                }
+
+            # 解析 dependencies
+            deps_data = data.get("deps", {}) if isinstance(data, dict) else {}
+            all_ids = {f"s{i+1}" for i in range(len(queries))}
+            deps: list[list[str]] = [[] for _ in queries]
+            for key, dep_list in deps_data.items():
+                if not isinstance(dep_list, list):
+                    continue
+                idx = int(key[1:]) - 1 if key.startswith("s") and key[1:].isdigit() else -1
+                if 0 <= idx < len(queries):
+                    valid = [d for d in dep_list if isinstance(d, str) and d in all_ids]
+                    deps[idx] = valid
+
+            return routes, deps
+        except Exception as e:
+            logger.warning("LLMDecisionService.batch_route_with_deps failed: %s", e)
+            return default_routes, default_deps
+
     async def split_queries(self, text: str) -> list[str] | None:
         """LLM 优先：将多意图输入拆分为独立子查询。"""
         if not _llm_enabled():
@@ -347,9 +468,15 @@ class LLMDecisionService:
         system_prompt = (
             "你是一个查询拆分助手。用户可能在一条消息中包含多个独立的意图/问题。\n"
             "请将用户输入拆分为独立的子查询，每个子查询包含一个完整意图。\n"
+            "重要拆分原则：\n"
+            "1. 只有真正独立的问题才拆分——比如不同主题的多个问题。\n"
+            "2. 不要拆分因果/叙事连贯的句子：'因为A所以B'/'A导致B'/'A，结果B' 是整个事件的叙述，不应拆分。\n"
+            "3. 逗号/逗号连接的从句如果是在补充说明同一事件，不要拆开。\n"
+            "4. 当用户陈述一个既有原因又有结果的个人经历时（如'我对X过敏，吃了X住院了'），保持为一个查询。\n"
+            "5. 不确定时，倾向于不拆分（保持原样）。\n"
             "你必须只输出合法JSON数组，不要输出Markdown标记，不要有任何其他解释内容。\n"
-            '示例：["子查询1", "子查询2", "子查询3"]\n'
-            "如果只有一个意图，返回包含单个元素的数组。"
+            '示例：["子查询1", "子查询2"]\n'
+            "如果只有一个意图或无法确定是否应拆分，返回包含单个原始输入的数组。"
         )
 
         user_prompt = f"用户输入：{text}\n\n请输出拆分结果："

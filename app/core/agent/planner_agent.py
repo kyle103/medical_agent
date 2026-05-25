@@ -79,11 +79,17 @@ def _route_by_intent_and_text(state: dict) -> dict:
         record_keywords = ["记录", "添加用药", "我吃了", "我服用", "我用了", "用药记录", "剂量", "频次", "每天", "每次", "mg", "毫克"]
         delete_keywords = ["删除", "移除", "清空"]
         query_drug_keywords = ["可以吃什么药", "吃什么药", "能用什么药", "有什么药", "该吃什么", "要吃什么", "吃什么好"]
+        allergy_keywords = ["过敏"]
 
         is_conflict = any(k in text for k in conflict_keywords) or ("药" in text and "一起" in text)
         is_record = any(k in text for k in record_keywords) and not any(k in text for k in query_drug_keywords)
         is_delete = any(k in text for k in delete_keywords)
         is_query_drug = any(k in text for k in query_drug_keywords)
+        is_allergy = any(k in text for k in allergy_keywords)
+
+        # 过敏声明（如"我对XX过敏"）不是用药记录，路由到通用问答
+        if is_allergy and is_record:
+            return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "allergy_record", "confidence": 0.9, "reason": "route by allergy keywords (not drug record)"}
 
         if is_conflict and not is_record and not is_delete:
             return {"target_type": "tool", "target_name": "drug_interaction", "intent_type": "drug_conflict", "confidence": float(state.get("intent_confidence") or 0.85), "reason": "route by drug conflict keywords"}
@@ -100,6 +106,9 @@ def _route_by_intent_and_text(state: dict) -> dict:
     if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
         return {"target_type": "tool", "target_name": "drug_interaction", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
     if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):
+        # 过敏声明优先——路由到通用问答而非用药记录
+        if any(k in text for k in ["过敏"]):
+            return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "allergy_record", "confidence": 0.78, "reason": "route by text: allergy (not drug record)"}
         return {"target_type": "agent", "target_name": "drug_record_agent", "intent_type": "drug_record", "confidence": 0.7, "reason": "route by text: drug record"}
     if any(k in text for k in ["档案", "病历", "历史记录", "就诊"]):
         return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "archive", "confidence": 0.7, "reason": "route by text: archive"}
@@ -241,6 +250,10 @@ def _llm_enabled() -> bool:
 
 
 def _split_user_queries_rule(text: str) -> list[str]:
+    """规则拆分：仅在明确的句子边界或并列标记处拆分。
+
+    避免在逗号连接的叙事/因果句处拆分（如"我对X过敏，吃了X住院了"）。
+    """
     import re
     raw = (text or "").strip()
     if not raw:
@@ -264,16 +277,51 @@ def _split_user_queries_rule(text: str) -> list[str]:
     return dedup
 
 
+_MULTI_INTENT_MARKERS = [
+    "另外", "还有", "并且", "同时", "顺便", "此外",
+    "第一个问题", "第二个问题", "一是", "二是", "第一", "第二",
+    "？", "?", "！", "!", "。",
+]
+
+
+def _is_likely_single_intent(text: str) -> bool:
+    """快速规则判断一段文本是否很可能是单意图（不需要 LLM 拆分）。"""
+    t = (text or "").strip()
+    if not t:
+        return True
+    # 已含明确分隔标记
+    if any(m in t for m in _MULTI_INTENT_MARKERS):
+        return False
+    # 多个问号
+    if t.count("?") + t.count("？") >= 2:
+        return False
+    # 短文本通常不需要拆分
+    if len(t) <= 50:
+        return True
+    # 中等长度、没有多意图标记 → 倾向不拆分
+    if len(t) <= 120 and t.count("，") <= 2:
+        return True
+    return False
+
+
 async def _split_user_queries(text: str) -> list[str]:
+    """拆分用户输入为独立子查询。规则预检 → LLM 增强。
+
+    如果规则预检判定为单意图，跳过 LLM 调用直接返回规则结果。
+    """
+    rule_result = _split_user_queries_rule(text)
+    if len(rule_result) <= 1 and _is_likely_single_intent(text):
+        logger.info("_split_user_queries: rule pre-check single-intent, skip LLM")
+        return rule_result if rule_result else [text]
+
     if _llm_enabled():
         llm_decision = LLMDecisionService()
         llm_result = await llm_decision.split_queries(text)
         if llm_result and len(llm_result) > 0:
             logger.info("_split_user_queries: LLM split into %d queries", len(llm_result))
             return llm_result
-    rule_result = _split_user_queries_rule(text)
     logger.info("_split_user_queries: rule split into %d queries", len(rule_result))
-    return rule_result
+    return rule_result if rule_result else [text]
 
 
 async def _predict_intent_for_query(query: str) -> dict | None:
@@ -373,9 +421,16 @@ class PlannerAgent:
             )
         else:
             llm_decision = LLMDecisionService()
-            batch_routes = await llm_decision.batch_route_queries(sub_queries)
+            batch_routes, llm_deps = await llm_decision.batch_route_with_deps(sub_queries)
 
-            dep_results = await _detect_dependencies_batch(sub_queries)
+            # 规则层依赖检测 + LLM 结果合并（并集），减少一次 LLM 往返
+            rule_deps: list[list[str]] = []
+            for i, q in enumerate(sub_queries):
+                rule_deps.append(_detect_dependencies_rule(q, sub_queries[:i]))
+            dep_results: list[list[str]] = []
+            for i in range(len(sub_queries)):
+                combined = list(set(rule_deps[i]) | set(llm_deps[i]))
+                dep_results.append(sorted(combined, key=lambda x: int(x[1:])))
 
             steps = []
             for i, q in enumerate(sub_queries):
