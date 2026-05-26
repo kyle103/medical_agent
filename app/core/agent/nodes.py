@@ -116,6 +116,62 @@ def _format_history(history: list[dict], max_chars: int = 1400) -> str:
     return text[-max_chars:]
 
 
+_MEDICAL_QUERY_KEYWORDS = [
+    # 疾病与症状
+    "病", "症", "疼", "痛", "发烧", "发热", "咳嗽", "感冒", "发炎", "感染", "癌", "肿瘤",
+    "高血压", "糖尿病", "哮喘", "过敏", "腹泻", "便秘", "失眠", "抑郁", "焦虑",
+    "恶心", "呕吐", "头晕", "乏力", "胸闷", "心慌", "气短", "水肿", "出血",
+    "皮疹", "瘙痒", "红肿", "溃疡", "结节", "囊肿", "息肉", "结石",
+    # 药物与治疗
+    "药", "用药", "服用", "剂量", "治疗", "手术", "检查", "化验", "检验",
+    "打针", "输液", "吃药", "开药", "处方", "忌口",
+    # 身体部位
+    "心脏", "肝", "肾", "肺", "胃", "肠", "脑", "血管", "血液", "骨骼", "关节", "皮肤",
+    "眼睛", "耳朵", "鼻子", "喉咙", "牙齿", "颈椎", "腰椎", "膝盖",
+    # 医学概念
+    "副作用", "禁忌", "相互作用", "疫苗", "预防", "康复", "护理", "营养",
+    "指标", "血糖", "血压", "血脂", "尿酸", "转氨酶",
+    "CT", "MRI", "X光", "B超", "核磁", "体检", "报告", "化验单",
+    # 就医相关
+    "挂号", "就诊", "就医", "看病", "科室", "医生", "医院", "急诊", "住院",
+    # 健康疑问
+    "什么原因", "怎么办", "怎么回事", "要注意什么", "会不会", "需不需要",
+    "要不要", "能不能", "可以吗",
+]
+
+
+def _is_medical_query(text: str, intent: str, entities: dict | None = None) -> bool:
+    """判断查询是否需要医疗知识检索。
+
+    优先复用上游意图识别 + 实体提取的结果（零额外成本），
+    仅当上游信息不足以判断时才回退到关键词匹配。
+
+    drug/lab/archive 意图始终走 RAG；general 意图根据实体和关键词综合判断。
+    """
+    if intent in ("drug", "lab", "archive"):
+        return True
+    if intent != "general":
+        return True
+    t = (text or "").strip()
+    if not t:
+        return False
+    # 上游已提取到医疗实体 → 走 RAG
+    if entities:
+        if entities.get("drug_name_list"):
+            return True
+        if entities.get("lab_items"):
+            return True
+    # 关键词兜底
+    if any(kw in t for kw in _MEDICAL_QUERY_KEYWORDS):
+        return True
+    # 短文本 → 可能是闲聊
+    if len(t) <= 30:
+        return False
+    if len(t) <= 80 and "?" not in t and "？" not in t:
+        return False
+    return True
+
+
 async def _extract_drug_info_from_text(text: str) -> dict:
     from app.core.agent.llm_decision_service import LLMDecisionService
 
@@ -547,6 +603,13 @@ async def knowledge_retrieve(state: dict) -> dict:
 
     user_input = state.get("user_input", "")
     intent = state.get("intent", "general")
+
+    from app.config.settings import settings
+    if settings.ENABLE_SELECTIVE_RAG and not _is_medical_query(user_input, intent, state.get("extract_entities")):
+        state["retrieved_knowledge"] = {}
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="knowledge_retrieve", latency_ms=latency_ms, skipped=True, reason="non_medical")
+        return state
 
     async def _retrieve_drug_knowledge():
         try:
@@ -1074,13 +1137,13 @@ async def llm_generate(state: dict) -> dict:
         system_prompt = (
             "你是医疗问答助手，需要将多个子问题的回答整合为一个清晰、自然的回复。\n"
             "原则：\n"
-            "1) 必须保留每个子问题的回答要点，不得遗漏或编造。\n"
+            "1) 必须保留每个子问题的回答要点，不得遗漏或添加原文未提及的医学事实。\n"
             "2) 每个子问题用二级标题（##）分隔，标题即为子问题本身。\n"
             "3) 每个子问题的回答要简洁精炼，去除重复和冗余内容。\n"
             "4) 使用**加粗**标记关键信息（如药名、症状、注意事项）。\n"
             "5) 使用项目符号或编号列表组织多条信息，每条之间空一行。\n"
             "6) 语言自然亲切，像一位耐心的家庭医生在和你聊天。\n"
-            "7) 如果某个子问题无法回答（如工具查询失败），用简短一句话说明，不要输出原始错误信息。\n"
+            "7) 如果某个子问题无法回答（如工具查询失败），用简短一句话说明，不要输出原始错误信息或凭空补充。\n"
             "8) 整体回复结尾用一句温馨提示收束。\n"
         )
         sections_text = ""
@@ -1144,11 +1207,12 @@ async def llm_generate(state: dict) -> dict:
     if mode == "llm_format":
         system_prompt = (
             "你是医疗问答助手，任务是把\"工具/数据库查询结果\"用清晰、自然、结构化的中文表达出来。\n"
-            "要求：\n"
-            "1) 只能基于提供的工具结果输出，不得编造任何未给出的事实。\n"
-            "2) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
-            "3) 禁止给出诊断结论或处方/调整用药建议。\n"
-            "4) 回复格式要求：\n"
+            "核心要求：\n"
+            "1) 严格基于提供的工具/检索结果输出，不得添加任何结果中未提及的医学事实、数据或结论。\n"
+            "2) 如果结果中某项信息缺失或无法确定，直接说明\"该信息未在查询结果中体现\"，不要自行补充。\n"
+            "3) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
+            "4) 禁止给出诊断结论或处方/调整用药建议。\n"
+            "5) 回复格式要求：\n"
             "   - 使用**加粗**标记关键信息（如药名、指标名）\n"
             "   - 使用编号列表或项目符号组织多条信息\n"
             "   - 每个要点之间用空行分隔，保持视觉清晰\n"
@@ -1165,11 +1229,13 @@ async def llm_generate(state: dict) -> dict:
     else:
         system_prompt = (
             "你是医疗问答助手，需要用自然的对话方式回答用户。\n"
-            "原则：\n"
-            "1) 如提供了会话记忆/长期记忆或工具结果，你必须优先使用它们来保持上下文一致。\n"
-            "2) 不得编造不存在的个人信息/检查结果/用药记录。\n"
+            "核心原则：\n"
+            "1) 如果提供了知识库检索结果、工具查询结果、或会话/长期记忆，你的回答必须基于这些信息。\n"
+            "   知识库未收录的内容应明确说\"目前知识库中未查到相关信息\"，不得凭训练数据编造医学事实。\n"
+            "2) 不得编造不存在的个人信息/检查结果/用药记录/药物数据。\n"
             "3) 禁止诊断与处方/调整用药建议；可以给出通用科普与就医指引。\n"
-            "4) 回复格式要求：\n"
+            "4) 对于纯闲聊或非医疗问题（如\"你好\"），正常友好回复即可，不需要强行关联医学内容。\n"
+            "5) 回复格式要求：\n"
             "   - 语气亲切自然，像一位耐心的家庭医生在和你聊天\n"
             "   - 使用**加粗**标记关键信息（如药名、症状、注意事项）\n"
             "   - 多条信息用编号列表或项目符号组织，每条之间空一行\n"
@@ -1379,6 +1445,131 @@ def _detect_memory_save_intent(user_input: str) -> bool:
     """检测用户是否有显式要求保存记忆的意图。"""
     text = user_input.strip()
     return any(pat in text for pat in _MEMORY_SAVE_PATTERNS)
+
+
+# ---- fact-checker: medical claim detection patterns ----
+
+_MEDICAL_CLAIM_DRUG_PATTERNS = [
+    r"(?:布洛芬|阿司匹林|阿莫西林|头孢\S{0,3}|青霉素|红霉素|氯霉素|四环素|庆大霉素|链霉素)",
+    r"(?:硝苯地平|卡托普利|依那普利|氯沙坦|氨氯地平|美托洛尔|比索洛尔|普萘洛尔)",
+    r"(?:二甲双胍|格列\S{1,4}|胰岛素|阿卡波糖|罗格列酮|西格列汀)",
+    r"(?:奥美拉唑|雷尼替丁|西咪替丁|吗丁啉|多潘立酮|蒙脱石散)",
+    r"(?:氯雷他定|西替利嗪|扑尔敏|苯海拉明|特非那定)",
+    r"(?:地西泮|艾司唑仑|阿普唑仑|舍曲林|氟西汀|帕罗西汀)",
+    r"[一-鿿]{1,3}(?:素|芬|林|唑|坦|普利|地平|洛尔|他汀|贝特)",
+]
+
+_MEDICAL_CLAIM_DISEASE_PATTERNS = [
+    r"(?:高血压|糖尿病|冠心病|哮喘|COPD|慢阻肺|肝炎|肝硬化|肾炎|肾衰竭)",
+    r"(?:脑梗|心梗|中风|偏瘫|心衰|心律失常|房颤|室颤)",
+    r"(?:胃癌|肺癌|肝癌|乳腺癌|前列腺癌|结肠癌|白血病|淋巴瘤)",
+    r"(?:肺炎|支气管炎|肺结核|肺气肿|肺纤维化|间质性肺炎)",
+    r"(?:胃炎|胃溃疡|十二指肠溃疡|溃疡性结肠炎|克罗恩病|肠易激)",
+    r"(?:甲亢|甲减|桥本|痛风|骨质疏松|类风湿|红斑狼疮|银屑病)",
+    r"(?:抑郁|焦虑|精神分裂|双相|强迫症|恐惧症|惊恐)",
+]
+
+_MEDICAL_CLAIM_TREATMENT_PATTERNS = [
+    r"(?:治疗|治愈|根治|康复|好转|缓解|改善|控制|预防)",
+    r"(?:服用|口服|注射|输液|静脉|外用|涂抹|含服|吞服)",
+    r"(?:每天\d次|每日\d次|\d次/天|\d+mg|\d+g|\d+ml|\d+片|\d+粒|\d+支)",
+    r"(?:剂量|用量|用法|频次|疗程|停药|换药|加量|减量)",
+    r"(?:手术|切除|移植|搭桥|支架|透析|化疗|放疗|靶向|免疫治疗)",
+]
+
+_MEDICAL_CLAIM_STATS_PATTERNS = [
+    r"\d+\.?\d*\s*%",
+    r"\d+/\d+\s*(?:的|人|患者|病例)",
+    r"(?:研究表明|研究显示|据统计|数据表明|临床试验|指南推荐)",
+    r"(?:发病率|死亡率|治愈率|有效率|生存率|五年生存)",
+]
+
+
+def _response_has_medical_claims(text: str) -> bool:
+    """规则检测回答中是否包含医疗相关事实陈述。"""
+    if not text:
+        return False
+    all_patterns = (
+        _MEDICAL_CLAIM_DRUG_PATTERNS
+        + _MEDICAL_CLAIM_DISEASE_PATTERNS
+        + _MEDICAL_CLAIM_TREATMENT_PATTERNS
+        + _MEDICAL_CLAIM_STATS_PATTERNS
+    )
+    for pat in all_patterns:
+        if re.search(pat, text):
+            return True
+    return False
+
+
+def _has_rag_or_tool_context(state: dict) -> bool:
+    """检查 state 中是否存在 RAG 检索结果或工具执行结果可供事实校验参考。"""
+    retrieved = state.get("retrieved_knowledge") or {}
+    if isinstance(retrieved, dict):
+        for key, val in retrieved.items():
+            if key == "public_kb" and isinstance(val, list) and val:
+                return True
+            if key != "public_kb" and val:
+                if isinstance(val, (dict, list)) and val:
+                    return True
+                if isinstance(val, str) and val.strip():
+                    return True
+    tool_result = state.get("tool_result")
+    if isinstance(tool_result, dict) and tool_result:
+        return True
+    plan_results = state.get("plan_step_results")
+    if isinstance(plan_results, dict):
+        for result in plan_results.values():
+            if isinstance(result, dict) and result.get("final_response", "").strip():
+                return True
+    return False
+
+
+async def fact_check(state: dict) -> dict:
+    """事实校验节点：检查 LLM 输出中的医疗声明是否有 RAG/工具上下文支撑。
+
+    插入在 llm_generate 之后、output_check_and_disclaimer 之前。
+    纯规则检查（无额外 LLM 调用），延迟 ~0ms。
+
+    逻辑：
+    - 非医疗回答（如闲聊）→ 跳过
+    - 医疗回答 + 有 RAG/工具上下文 → 信任生成（prompt 已要求 grounding）
+    - 医疗回答 + 无 RAG/工具上下文 → 追加核实建议警告
+    """
+    _t0 = time.perf_counter()
+    from app.config.settings import settings
+
+    if not settings.ENABLE_FACT_CHECK:
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="fact_check", latency_ms=latency_ms, skipped=True, reason="disabled")
+        return state
+
+    llm_output = state.get("llm_output", "") or state.get("final_response", "")
+    if not llm_output or len(llm_output.strip()) < 5:
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="fact_check", latency_ms=latency_ms, skipped=True, reason="empty_output")
+        return state
+
+    if not _response_has_medical_claims(llm_output):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="fact_check", latency_ms=latency_ms, skipped=True, reason="no_medical_claims")
+        return state
+
+    if _has_rag_or_tool_context(state):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(node_name="fact_check", latency_ms=latency_ms, action="pass", reason="context_exists")
+        return state
+
+    logger.warning("fact_check: medical claims detected but no RAG/tool context — appending warning")
+    warn = (
+        "\n\n---\n"
+        "⚠️ 提示：以上部分健康信息未能从当前知识库中充分验证。"
+        "AI回答可能存在不准确之处，建议在采纳前咨询执业医师或查阅权威医学资料。"
+    )
+    state["final_response"] = llm_output + warn
+    state["llm_output"] = state["final_response"]
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="fact_check", latency_ms=latency_ms, action="warn_no_context", output_len=len(state["final_response"]))
+    return state
 
 
 async def error_finalize(state: dict) -> dict:

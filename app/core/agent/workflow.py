@@ -14,6 +14,7 @@ from app.core.agent.nodes import (
     entity_extraction,
     error_finalize,
     execute_node,
+    fact_check,
     input_check,
     intent_recognition,
     knowledge_retrieve,
@@ -48,6 +49,7 @@ class MedicalAgent:
         g.add_node("reconcile", reconcile_node)
         g.add_node("response_plan", response_plan)
         g.add_node("llm", llm_generate)
+        g.add_node("fact_check", fact_check)
         g.add_node("out", output_check_and_disclaimer)
         g.add_node("commit", commit_gate)
         g.add_node("mem", memory_update)
@@ -76,7 +78,8 @@ class MedicalAgent:
         g.add_edge("reconcile", "response_plan")
 
         g.add_edge("response_plan", "llm")
-        g.add_edge("llm", "out")
+        g.add_edge("llm", "fact_check")
+        g.add_edge("fact_check", "out")
 
         def _need_error2(state: dict) -> str:
             return "err" if state.get("error_msg") else "commit"
@@ -202,13 +205,13 @@ class MedicalAgent:
             system_prompt = (
                 "你是医疗问答助手，需要将多个子问题的回答整合为一个清晰、自然的回复。\n"
                 "原则：\n"
-                "1) 必须保留每个子问题的回答要点，不得遗漏或编造。\n"
+                "1) 必须保留每个子问题的回答要点，不得遗漏或添加原文未提及的医学事实。\n"
                 "2) 每个子问题用二级标题（##）分隔，标题即为子问题本身。\n"
                 "3) 每个子问题的回答要简洁精炼，去除重复和冗余内容。\n"
                 "4) 使用**加粗**标记关键信息（如药名、症状、注意事项）。\n"
                 "5) 使用项目符号或编号列表组织多条信息，每条之间空一行。\n"
                 "6) 语言自然亲切，像一位耐心的家庭医生在和你聊天。\n"
-                "7) 如果某个子问题无法回答（如工具查询失败），用简短一句话说明，不要输出原始错误信息。\n"
+                "7) 如果某个子问题无法回答（如工具查询失败），用简短一句话说明，不要输出原始错误信息或凭空补充。\n"
                 "8) 整体回复结尾用一句温馨提示收束。\n"
             )
             sections_text = ""
@@ -279,11 +282,12 @@ class MedicalAgent:
                 if mode == "llm_format":
                     system_prompt = (
                         "你是医疗问答助手，任务是把\"工具/数据库查询结果\"用清晰、自然、结构化的中文表达出来。\n"
-                        "要求：\n"
-                        "1) 只能基于提供的工具结果输出，不得编造任何未给出的事实。\n"
-                        "2) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
-                        "3) 禁止给出诊断结论或处方/调整用药建议。\n"
-                        "4) 回复格式要求：\n"
+                        "核心要求：\n"
+                        "1) 严格基于提供的工具/检索结果输出，不得添加任何结果中未提及的医学事实、数据或结论。\n"
+                        "2) 如果结果中某项信息缺失或无法确定，直接说明\"该信息未在查询结果中体现\"，不要自行补充。\n"
+                        "3) 输出尽量简洁，分点呈现，必要时补充就医建议边界。\n"
+                        "4) 禁止给出诊断结论或处方/调整用药建议。\n"
+                        "5) 回复格式要求：\n"
                         "   - 使用**加粗**标记关键信息（如药名、指标名）\n"
                         "   - 使用编号列表或项目符号组织多条信息\n"
                         "   - 每个要点之间用空行分隔，保持视觉清晰\n"
@@ -300,11 +304,13 @@ class MedicalAgent:
                 else:
                     system_prompt = (
                         "你是医疗问答助手，需要用自然的对话方式回答用户。\n"
-                        "原则：\n"
-                        "1) 如提供了会话记忆/长期记忆或工具结果，你必须优先使用它们来保持上下文一致。\n"
-                        "2) 不得编造不存在的个人信息/检查结果/用药记录。\n"
+                        "核心原则：\n"
+                        "1) 如果提供了知识库检索结果、工具查询结果、或会话/长期记忆，你的回答必须基于这些信息。\n"
+                        "   知识库未收录的内容应明确说\"目前知识库中未查到相关信息\"，不得凭训练数据编造医学事实。\n"
+                        "2) 不得编造不存在的个人信息/检查结果/用药记录/药物数据。\n"
                         "3) 禁止诊断与处方/调整用药建议；可以给出通用科普与就医指引。\n"
-                        "4) 回复格式要求：\n"
+                        "4) 对于纯闲聊或非医疗问题（如\"你好\"），正常友好回复即可，不需要强行关联医学内容。\n"
+                        "5) 回复格式要求：\n"
                         "   - 语气亲切自然，像一位耐心的家庭医生在和你聊天\n"
                         "   - 使用**加粗**标记关键信息（如药名、症状、注意事项）\n"
                         "   - 多条信息用编号列表或项目符号组织，每条之间空一行\n"
@@ -343,6 +349,7 @@ class MedicalAgent:
 
                 state["llm_output"] = full_response
 
+        state = await fact_check(state)
         state = await output_check_and_disclaimer(state)
         state = await commit_gate(state)
 

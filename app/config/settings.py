@@ -95,6 +95,10 @@ class Settings(BaseSettings):
     ENABLE_INPUT_CHECK: bool = False
     ENABLE_OUTPUT_CHECK: bool = False
 
+    # Selective RAG & Fact Check
+    ENABLE_SELECTIVE_RAG: bool = True
+    ENABLE_FACT_CHECK: bool = True
+
     # Misc
     APP_ENV: str = Field(default="local")
     LANGFUSE_PUBLIC_KEY: str = Field(default="")
