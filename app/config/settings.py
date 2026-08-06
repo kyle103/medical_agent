@@ -74,6 +74,13 @@ class Settings(BaseSettings):
     PUBLIC_KB_RRF_K: int = Field(default=60)
     PUBLIC_KB_BM25_CACHE_DIR: str = Field(default="data/bm25_cache")
 
+    # Public KB keyword (BM25-like, 云端 Milvus 仅倒排索引 -> LIKE 模拟)
+    PUBLIC_KB_KEYWORD_TOP_K: int = Field(default=8)          # 抽取关键词上限
+    PUBLIC_KB_KEYWORD_LLM_ENABLED: bool = Field(default=False)  # 长查询是否启用 LLM 抽取（默认关，省延迟）
+    PUBLIC_KB_KEYWORD_MODE: str = Field(default="or")         # and(严) / or(宽召回，靠打分排优)
+    PUBLIC_KB_KEYWORD_VECTOR_WEIGHT: float = Field(default=0.7)  # RRF dense 权重
+    PUBLIC_KB_KEYWORD_WEIGHT: float = Field(default=0.3)      # RRF keyword 权重
+
     # Rerank
     RERANK_API_BASE: str = Field(default="")
     RERANK_API_KEY: str = Field(default="")
@@ -90,8 +97,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     ALLOWED_HOSTS: str = Field(default="{{允许的跨域域名列表}}")
 
-    # Compliance
-    FORCE_DISCLAIMER: bool = False
+    # Compliance（医疗 agent 安全底线：免责声明默认开启）
+    FORCE_DISCLAIMER: bool = True
     ENABLE_INPUT_CHECK: bool = False
     ENABLE_OUTPUT_CHECK: bool = False
 

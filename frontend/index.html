@@ -1,864 +1,202 @@
 <!DOCTYPE html>
 <html lang="zh-CN">
 <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>医疗智能助手 - 前端Demo</title>
-    <style>
-        * {
-            margin: 0;
-            padding: 0;
-            box-sizing: border-box;
-        }
-
-        body {
-            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
-            min-height: 100vh;
-            padding: 20px;
-        }
-
-        .container {
-            max-width: 1200px;
-            margin: 0 auto;
-            background: white;
-            border-radius: 15px;
-            box-shadow: 0 20px 40px rgba(0,0,0,0.1);
-            overflow: hidden;
-        }
-
-        .header {
-            background: linear-gradient(135deg, #4facfe 0%, #00f2fe 100%);
-            color: white;
-            padding: 30px;
-            text-align: center;
-        }
-
-        .header h1 {
-            font-size: 2.5rem;
-            margin-bottom: 10px;
-        }
-
-        .header p {
-            font-size: 1.1rem;
-            opacity: 0.9;
-        }
-
-        .main-content {
-            display: grid;
-            grid-template-columns: 1fr 400px;
-            gap: 20px;
-            padding: 20px;
-        }
-
-        .chat-section {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 20px;
-        }
-
-        .chat-messages {
-            height: 400px;
-            overflow-y: auto;
-            border: 1px solid #e9ecef;
-            border-radius: 10px;
-            padding: 15px;
-            background: white;
-            margin-bottom: 15px;
-        }
-
-        .message {
-            margin-bottom: 15px;
-            padding: 10px 15px;
-            border-radius: 10px;
-            max-width: 80%;
-            word-wrap: break-word;
-        }
-
-        .user-message {
-            background: #007bff;
-            color: white;
-            margin-left: auto;
-            text-align: right;
-        }
-
-        .assistant-message {
-            background: #e9ecef;
-            color: #333;
-            margin-right: auto;
-            line-height: 1.7;
-        }
-
-        .assistant-message h2, .assistant-message h3, .assistant-message h4 {
-            margin: 8px 0 4px 0;
-            color: #007bff;
-        }
-
-        .assistant-message ul {
-            margin: 4px 0 4px 20px;
-            padding: 0;
-        }
-
-        .assistant-message li {
-            margin-bottom: 4px;
-        }
-
-        .assistant-message p {
-            margin: 4px 0;
-        }
-
-        .streaming-cursor {
-            animation: blink 0.8s infinite;
-            color: #007bff;
-        }
-
-        @keyframes blink {
-            0%, 50% { opacity: 1; }
-            51%, 100% { opacity: 0; }
-        }
-
-        .input-section {
-            display: flex;
-            gap: 10px;
-        }
-
-        .input-section input {
-            flex: 1;
-            padding: 12px;
-            border: 1px solid #ddd;
-            border-radius: 8px;
-            font-size: 16px;
-        }
-
-        .input-section button {
-            padding: 12px 24px;
-            background: #007bff;
-            color: white;
-            border: none;
-            border-radius: 8px;
-            cursor: pointer;
-            font-size: 16px;
-            transition: background 0.3s;
-        }
-
-        .input-section button:hover {
-            background: #0056b3;
-        }
-
-        .info-section {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 20px;
-        }
-
-        .info-card {
-            background: white;
-            border-radius: 8px;
-            padding: 15px;
-            margin-bottom: 15px;
-            border-left: 4px solid #007bff;
-            box-shadow: 0 2px 4px rgba(0,0,0,0.1);
-        }
-
-        .info-card h3 {
-            color: #007bff;
-            margin-bottom: 10px;
-        }
-
-        .auth-section {
-            background: #f8f9fa;
-            border-radius: 10px;
-            padding: 15px;
-            margin-bottom: 15px;
-        }
-
-        .auth-form {
-            display: flex;
-            gap: 10px;
-            margin-bottom: 10px;
-        }
-
-        .auth-form input {
-            flex: 1;
-            padding: 8px;
-            border: 1px solid #ddd;
-            border-radius: 5px;
-        }
-
-        .auth-form button {
-            padding: 8px 15px;
-            background: #28a745;
-            color: white;
-            border: none;
-            border-radius: 5px;
-            cursor: pointer;
-        }
-
-        .auth-info {
-            background: #28a745;
-            color: white;
-            padding: 10px;
-            border-radius: 5px;
-            font-size: 14px;
-            margin-bottom: 10px;
-        }
-
-        .intent-badge {
-            display: inline-block;
-            padding: 4px 8px;
-            border-radius: 12px;
-            font-size: 12px;
-            margin-right: 5px;
-            margin-bottom: 5px;
-        }
-
-        .intent-drug { background: #dc3545; color: white; }
-        .intent-lab { background: #fd7e14; color: white; }
-        .intent-archive { background: #6f42c1; color: white; }
-        .intent-general { background: #20c997; color: white; }
-
-        .confirmation {
-            background: #fff3cd;
-            border: 1px solid #ffeaa7;
-            border-radius: 8px;
-            padding: 15px;
-            margin: 10px 0;
-        }
-
-        .loading {
-            text-align: center;
-            color: #6c757d;
-            font-style: italic;
-        }
-
-        @media (max-width: 768px) {
-            .main-content {
-                grid-template-columns: 1fr;
-            }
-            
-            .header h1 {
-                font-size: 2rem;
-            }
-        }
-    </style>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>医疗健康助手</title>
+  <link rel="stylesheet" href="app.css">
 </head>
 <body>
-    <div class="container">
-        <div class="header">
-            <h1>🏥 医疗智能助手</h1>
-            <p>智能对话 | 药物管理 | 化验单解读 | 档案查询</p>
+  <!-- ================= 认证视图 ================= -->
+  <div class="auth-wrap" id="authView">
+    <div class="auth-card">
+      <div class="auth-brand">
+        <span class="auth-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" width="44" height="44">
+            <rect x="2" y="2" width="36" height="36" rx="12" fill="var(--c-accent)"/>
+            <path d="M20 12v16M12 20h16" stroke="var(--c-accent-ink)" stroke-width="4" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <h1 class="auth-title">医疗健康助手</h1>
+        <p class="auth-sub">您的智能健康顾问</p>
+      </div>
+
+      <div class="auth-tabs" role="tablist">
+        <button type="button" class="auth-tab is-active" data-mode="login" role="tab" aria-selected="true">登录</button>
+        <button type="button" class="auth-tab" data-mode="register" role="tab" aria-selected="false">注册</button>
+      </div>
+
+      <form class="auth-form" id="authForm" novalidate>
+        <div class="field">
+          <label class="field-label" for="phone">手机号</label>
+          <input class="field-input" type="tel" id="phone" autocomplete="tel" inputmode="numeric" placeholder="请输入 11 位手机号">
         </div>
-        
-        <div class="main-content">
-            <div class="chat-section">
-                <!-- 认证区域 -->
-                <div class="auth-section" id="authSection">
-                    <div class="auth-form">
-                        <input type="text" id="phone" placeholder="手机号" value="13800000000">
-                        <input type="password" id="password" placeholder="密码" value="demo123">
-                        <button onclick="login()">登录</button>
-                        <button onclick="register()">注册</button>
-                    </div>
-                </div>
-                
-                <!-- 登录信息 -->
-                <div id="authInfo" style="display: none;" class="auth-info">
-                    用户: <span id="userName"></span> | 令牌: <span id="tokenPreview"></span>
-                    <button onclick="logout()" style="margin-left: 10px; padding: 4px 8px; background: #dc3545; color: white; border: none; border-radius: 3px; cursor: pointer; font-size: 12px;">退出登录</button>
-                </div>
-                
-                <!-- 会话信息 -->
-                <div class="auth-info" id="sessionInfo" style="display: none;">
-                    会话ID: <span id="sessionId">正在创建...</span>
-                </div>
-                
-                <!-- 聊天区域 -->
-                <div class="chat-messages" id="chatMessages" style="display: none;">
-                    <div class="message assistant-message">
-                        <strong>助手：</strong>您好！我是医疗智能助手，可以帮您进行健康咨询、药物管理、化验单解读等。请问有什么可以帮您的？
-                    </div>
-                </div>
-                
-                <div class="input-section" style="display: none;">
-                    <input type="text" id="userInput" placeholder="请输入您的问题..." autocomplete="off">
-                    <button onclick="sendMessage()">发送</button>
-                </div>
-                
-                <div style="margin-top: 15px; text-align: center;">
-                    <small>提示：您可以尝试"记录用药"、"检查药物冲突"、"解读化验单"等功能</small>
-                </div>
-            </div>
-            
-            <div class="info-section" style="display: none;">
-                <div class="info-card">
-                    <h3>📊 系统信息</h3>
-                    <div id="systemInfo">等待用户输入...</div>
-                </div>
-                
-                <div class="info-card">
-                    <h3>🎯 意图分析</h3>
-                    <div id="intentAnalysis">-</div>
-                </div>
-                
-                <div class="info-card">
-                    <h3>🤖 目标Agent</h3>
-                    <div id="targetAgent">-</div>
-                </div>
-                
-                <div class="info-card">
-                    <h3>💡 测试用例</h3>
-                    <div style="display: flex; flex-direction: column; gap: 5px;">
-                        <button onclick="setExample('我想记录阿司匹林，每天一次，每次100mg')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">💊 记录用药</button>
-                        <button onclick="setExample('阿司匹林和布洛芬一起吃有冲突吗？')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">⚠️ 药物冲突检查</button>
-                        <button onclick="setExample('帮我解读一下血常规化验单')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">🔬 化验单解读</button>
-                        <button onclick="setExample('还记得我之前吃的药吗？')" style="padding: 8px; background: #e9ecef; border: none; border-radius: 5px; cursor: pointer;">📋 记忆查询</button>
-                    </div>
-                </div>
-            </div>
+        <div class="field" id="nicknameField" hidden>
+          <label class="field-label" for="nickname">昵称</label>
+          <input class="field-input" type="text" id="nickname" autocomplete="nickname" placeholder="怎么称呼你？">
         </div>
+        <div class="field">
+          <label class="field-label" for="password">密码</label>
+          <input class="field-input" type="password" id="password" autocomplete="current-password" placeholder="请输入密码">
+        </div>
+
+        <p class="auth-error" id="authError" role="alert" hidden></p>
+
+        <button class="btn btn--primary btn--block" type="submit" id="authSubmit">登 录</button>
+      </form>
+
+      <p class="auth-note">演示账号：13900000001 / Passw0rd!</p>
     </div>
+  </div>
 
-    <script>
-        let sessionId = null;
-        let conversationHistory = [];
-        let accessToken = localStorage.getItem('accessToken');
-        let currentUser = localStorage.getItem('currentUser');
-        
-        // 检查登录状态并更新界面
-        async function checkLoginStatus() {
-            // 重新从localStorage读取最新的登录状态
-            const latestAccessToken = localStorage.getItem('accessToken');
-            const latestCurrentUser = localStorage.getItem('currentUser');
-            
-            console.log('检查登录状态，从localStorage获取:', {latestAccessToken, latestCurrentUser});
-            
-            // 检查是否有有效的登录信息
-            if (latestAccessToken && latestCurrentUser && latestAccessToken.length > 10) {
-                // 验证token是否有效
-                try {
-                    const response = await fetch('http://localhost:8000/api/v1/user/me', {
-                        method: 'GET',
-                        headers: {
-                            'Authorization': `Bearer ${latestAccessToken}`
-                        }
-                    });
-                    
-                    if (response.ok) {
-                        console.log('登录状态验证成功');
-                        // token有效，更新全局变量
-                        accessToken = latestAccessToken;
-                        currentUser = latestCurrentUser;
-                        
-                        // 已登录，显示聊天界面
-                        document.getElementById('authSection').style.display = 'none';
-                        document.getElementById('authInfo').style.display = 'block';
-                        document.getElementById('sessionInfo').style.display = 'block';
-                        document.getElementById('chatMessages').style.display = 'block';
-                        document.querySelector('.input-section').style.display = 'flex';
-                        document.querySelector('.info-section').style.display = 'block';
-                        
-                        document.getElementById('userName').textContent = currentUser;
-                        document.getElementById('tokenPreview').textContent = accessToken.substring(0, 10) + '...';
-                        
-                        // 初始化会话
-                        initializeSession();
-                        return;
-                    } else if (response.status === 401) {
-                        // 未授权，清除登录信息
-                        console.error('登录已过期');
-                    }
-                } catch (error) {
-                    console.error('验证登录状态失败:', error);
-                    // 网络错误，保留登录信息，不清除
-                    // 显示登录界面，但不清除localStorage
-                    document.getElementById('authSection').style.display = 'block';
-                    document.getElementById('authInfo').style.display = 'none';
-                    document.getElementById('sessionInfo').style.display = 'none';
-                    document.getElementById('chatMessages').style.display = 'none';
-                    document.querySelector('.input-section').style.display = 'none';
-                    document.querySelector('.info-section').style.display = 'none';
-                    return;
-                }
-            }
-            
-            // 清除无效的登录信息
-            localStorage.removeItem('accessToken');
-            localStorage.removeItem('currentUser');
-            accessToken = null;
-            currentUser = null;
-            
-            console.log('未登录或token无效，显示登录界面');
-            // 未登录，显示登录界面
-            document.getElementById('authSection').style.display = 'block';
-            document.getElementById('authInfo').style.display = 'none';
-            document.getElementById('sessionInfo').style.display = 'none';
-            document.getElementById('chatMessages').style.display = 'none';
-            document.querySelector('.input-section').style.display = 'none';
-            document.querySelector('.info-section').style.display = 'none';
-        }
+  <!-- ================= 应用视图 ================= -->
+  <div class="app" id="appView" hidden>
 
-        // 退出登录
-        function logout() {
-            // 清除登录信息
-            localStorage.removeItem('accessToken');
-            localStorage.removeItem('currentUser');
-            accessToken = null;
-            currentUser = null;
-            sessionId = null;
-            
-            // 更新界面
-            checkLoginStatus();
-            
-            alert('已退出登录');
-        }
+    <!-- 侧边栏 -->
+    <aside class="sidebar" id="sidebar">
+      <div class="side-brand">
+        <span class="side-mark" aria-hidden="true">
+          <svg viewBox="0 0 40 40" width="30" height="30">
+            <rect x="2" y="2" width="36" height="36" rx="10" fill="var(--c-accent)"/>
+            <path d="M20 12v16M12 20h16" stroke="var(--c-accent-ink)" stroke-width="4" stroke-linecap="round"/>
+          </svg>
+        </span>
+        <span class="side-title">医疗健康助手</span>
+      </div>
 
-        // 用户注册
-        async function register() {
-            const phone = document.getElementById('phone').value;
-            const password = document.getElementById('password').value;
-            
-            if (!phone || !password) {
-                alert('请输入手机号和密码');
-                return;
-            }
-            
-            try {
-                const response = await fetch('http://localhost:8000/api/v1/user/register', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        phone: phone,
-                        password: password,
-                        user_nickname: `用户${phone}`
-                    })
-                });
-                
-                if (response.ok) {
-                    const responseData = await response.json();
-                    
-                    // 修复API响应数据结构解析错误
-                    if (!responseData.data || !responseData.data.user_id) {
-                        console.error('注册API响应格式错误:', responseData);
-                        alert('注册失败：服务器响应格式错误');
-                        return;
-                    }
-                    
-                    alert('注册成功！');
-                    // 自动登录
-                    await login();
-                } else {
-                    const errorData = await response.json();
-                    console.error('注册失败:', errorData);
-                    alert(`注册失败: ${errorData.detail || '请检查输入信息'}`);
-                }
-            } catch (error) {
-                console.error('注册错误:', error);
-                alert('注册失败，请检查网络连接');
-            }
-        }
+      <button class="btn-newchat" id="newChatBtn" type="button">
+        <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+          <path d="M12 5v14M5 12h14" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"/>
+        </svg>
+        新对话
+      </button>
 
-        // 用户登录
-        async function login() {
-            const phone = document.getElementById('phone').value;
-            const password = document.getElementById('password').value;
-            
-            if (!phone || !password) {
-                alert('请输入手机号和密码');
-                return;
-            }
-            
-            try {
-                const response = await fetch('http://localhost:8000/api/v1/user/login', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                    },
-                    body: JSON.stringify({
-                        phone: phone,
-                        password: password
-                    })
-                });
-                
-                if (response.ok) {
-                    const responseData = await response.json();
-                    
-                    // 修复API响应数据结构解析错误
-                    if (!responseData.data || !responseData.data.access_token) {
-                        console.error('API响应格式错误:', responseData);
-                        alert('登录失败：服务器响应格式错误');
-                        return;
-                    }
-                    
-                    // 正确解析API响应结构
-                    const userData = responseData.data;
-                    accessToken = userData.access_token;
-                    currentUser = userData.user_id;  // 使用user_id而不是phone
-                    
-                    // 保存到localStorage
-                    localStorage.setItem('accessToken', accessToken);
-                    localStorage.setItem('currentUser', currentUser);
-                    
-                    console.log('登录成功，保存到localStorage:', {accessToken, currentUser});
-                    
-                    // 更新界面
-                    checkLoginStatus();
-                    
-                    // 添加延迟确保界面更新完成
-                    setTimeout(() => {
-                        alert('登录成功！界面已更新');
-                    }, 100);
-                    
-                } else {
-                    const errorData = await response.json();
-                    console.error('登录失败:', errorData);
-                    alert(`登录失败: ${errorData.detail || '请检查用户名或密码'}`);
-                }
-                
-            } catch (error) {
-                console.error('登录失败:', error);
-                alert('登录失败，请检查网络连接');
-            }
-        }
+      <div class="side-section-label">对话</div>
+      <nav class="session-list" id="sessionList" aria-label="会话列表">
+        <button class="session-item is-active" type="button">
+          <svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h10" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+          <span class="session-name">当前对话</span>
+        </button>
+      </nav>
 
-        // 初始化会话
-        async function initializeSession() {
-            if (!accessToken || !currentUser) {
-                console.log('未登录，跳过会话初始化');
-                document.getElementById('sessionId').textContent = '请先登录';
-                return;
-            }
-            
-            try {
-                const response = await fetch('http://localhost:8000/api/v1/chat/completion', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${accessToken}`
-                    },
-                    body: JSON.stringify({
-                        user_input: '初始化会话',
-                        session_id: ''  // 传递空字符串，让后端自动生成会话ID
-                        // 不再需要手动传递user_id，后端会从JWT token中解析
-                    })
-                });
-                
-                if (response.ok) {
-                    const responseData = await response.json();
-                    const data = responseData.data;
-                    sessionId = data.session_id;
-                    document.getElementById('sessionId').textContent = sessionId;
-                    
-                    // 更新系统信息
-                    updateSystemInfo(data);
-                } else {
-                    console.error('会话初始化失败:', response.status);
-                    if (response.status === 401) {
-                        // 未授权，跳转到登录界面
-                        alert('登录已过期，请重新登录');
-                        localStorage.removeItem('accessToken');
-                        localStorage.removeItem('currentUser');
-                        await checkLoginStatus();
-                    } else {
-                        document.getElementById('sessionId').textContent = '创建失败';
-                    }
-                }
-                
-            } catch (error) {
-                console.error('初始化会话失败:', error);
-                document.getElementById('sessionId').textContent = '创建失败';
-            }
-        }
+      <div class="side-footer">
+        <div class="side-user">
+          <span class="avatar avatar--user" id="sideAvatar">我</span>
+          <span class="side-username" id="sideUserName">—</span>
+        </div>
+        <button class="btn-ghost btn-ghost--sm" id="logoutBtn" type="button">退出登录</button>
+      </div>
+    </aside>
+    <div class="side-overlay" id="sideOverlay" hidden></div>
 
-        let conversationTurns = 0;
+    <!-- 主区 -->
+    <main class="main">
+      <header class="main-header">
+        <button class="hamburger" id="menuBtn" type="button" aria-label="打开菜单" aria-expanded="false">
+          <svg viewBox="0 0 24 24" width="20" height="20" aria-hidden="true">
+            <path d="M4 6h16M4 12h16M4 18h16" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+          </svg>
+        </button>
 
-        // 发送消息
-        async function sendMessage() {
-            if (!accessToken || !currentUser) {
-                alert('请先登录');
-                return;
-            }
-            
-            const input = document.getElementById('userInput');
-            const message = input.value.trim();
-            
-            if (!message) return;
-            
-            addMessage('user', message);
-            input.value = '';
-            
-            conversationTurns++;
-            updateSystemInfo({conversation_turns: conversationTurns, needs_confirmation: false});
-            
-            const assistantDiv = document.createElement('div');
-            assistantDiv.className = 'message assistant-message';
-            assistantDiv.innerHTML = '<strong>助手：</strong><span class="streaming-cursor">▍</span>';
-            document.getElementById('chatMessages').appendChild(assistantDiv);
-            scrollToBottom();
-            
-            try {
-                const response = await fetch('http://localhost:8000/api/v1/chat/completion', {
-                    method: 'POST',
-                    headers: {
-                        'Content-Type': 'application/json',
-                        'Authorization': `Bearer ${accessToken}`
-                    },
-                    body: JSON.stringify({
-                        user_input: message,
-                        session_id: sessionId,
-                        stream: true
-                    })
-                });
-                
-                if (response.ok) {
-                    const contentType = response.headers.get('content-type') || '';
-                    console.log('Response content-type:', contentType, 'stream requested:', true);
-                    
-                    if (contentType.includes('text/event-stream') || response.body) {
-                        let fullContent = '';
-                        const reader = response.body.getReader();
-                        const decoder = new TextDecoder();
-                        let buffer = '';
-                        
-                        while (true) {
-                            const {done, value} = await reader.read();
-                            if (done) break;
-                            
-                            buffer += decoder.decode(value, {stream: true});
-                            const lines = buffer.split('\n');
-                            buffer = lines.pop() || '';
-                            
-                            for (const line of lines) {
-                                if (!line.startsWith('data: ')) continue;
-                                const jsonStr = line.slice(6).trim();
-                                if (!jsonStr) continue;
-                                
-                                try {
-                                    const evt = JSON.parse(jsonStr);
-                                    console.log('SSE event:', evt.type);
-                                    
-                                    if (evt.type === 'progress') {
-                                        const nodeNames = {
-                                            'input_check': '检查输入',
-                                            'mem_load': '加载记忆',
-                                            'intent_node': '识别意图',
-                                            'entities': '提取实体',
-                                            'knowledge': '检索知识',
-                                            'plan': '制定计划',
-                                        };
-                                        const label = nodeNames[evt.node] || evt.node;
-                                        assistantDiv.innerHTML = '<strong>助手：</strong><span style="color:#888">' + label + '中...</span><span class="streaming-cursor">▍</span>';
-                                    } else if (evt.type === 'intent') {
-                                        updateSystemInfo({
-                                            intent: evt.intent,
-                                            intent_analysis: evt.intent_analysis,
-                                            target_agent: evt.target_agent,
-                                        });
-                                    } else if (evt.type === 'chunk') {
-                                        fullContent += evt.content;
-                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent) + '<span class="streaming-cursor">▍</span>';
-                                        scrollToBottom();
-                                    } else if (evt.type === 'content') {
-                                        fullContent = evt.content;
-                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent) + '<span class="streaming-cursor">▍</span>';
-                                        scrollToBottom();
-                                    } else if (evt.type === 'done') {
-                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
-                                        if (evt.conversation_turns != null) conversationTurns = evt.conversation_turns;
-                                        updateSystemInfo({
-                                            conversation_turns: evt.conversation_turns,
-                                            needs_confirmation: evt.needs_confirmation,
-                                        });
-                                        scrollToBottom();
-                                    } else if (evt.type === 'error') {
-                                        fullContent += evt.content;
-                                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
-                                    }
-                                } catch (e) {
-                                    // skip malformed JSON
-                                }
-                            }
-                        }
-                        if (fullContent) {
-                            assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(fullContent);
-                        }
-                    } else {
-                        const responseData = await response.json();
-                        const data = responseData.data;
-                        assistantDiv.innerHTML = '<strong>助手：</strong>' + renderMarkdown(data.assistant_output || '暂无回复');
-                        updateSystemInfo(data);
-                        if (data.session_id) sessionId = data.session_id;
-                        if (data.conversation_turns) conversationTurns = data.conversation_turns;
-                    }
-                } else {
-                    assistantDiv.innerHTML = '<strong>助手：</strong>抱歉，请求失败';
-                    if (response.status === 401) {
-                        alert('登录已过期，请重新登录');
-                        localStorage.removeItem('accessToken');
-                        localStorage.removeItem('currentUser');
-                        await checkLoginStatus();
-                    }
-                }
-            } catch (error) {
-                console.error('发送消息失败:', error);
-                assistantDiv.innerHTML = '<strong>助手：</strong>抱歉，系统暂时无法响应，请稍后再试。';
-            }
-        }
+        <div class="header-title">
+          <h1 class="header-name">医疗健康助手</h1>
+          <p class="header-sub" id="headerSub">智能问答 · 用药记录 · 化验解读</p>
+        </div>
 
-        function renderMarkdown(text) {
-            if (!text) return '';
+        <div class="header-right">
+          <span class="status-pill" title="服务状态"><span class="status-dot"></span>在线</span>
+          <span class="header-session" id="sessionId">新会话</span>
+        </div>
+      </header>
 
-            var html = text
-                .replace(/\r\n/g, '\n')
-                .replace(/\r/g, '\n');
+      <div class="thread" id="chatScroll">
+        <div class="thread-inner">
 
-            html = html
-                .replace(/([^\n])\s+(?=#{1,3}\s)/g, '$1\n')
-                .replace(/([^\n])\s+(?=\d+\.\s)/g, '$1\n')
-                .replace(/([^\n])\s+(?=[-*]\s)/g, '$1\n');
+          <!-- 空态 -->
+          <div class="empty" id="emptyState">
+            <div class="empty-hero">
+              <span class="empty-mark" aria-hidden="true">
+                <svg viewBox="0 0 64 64" width="56" height="56">
+                  <circle cx="32" cy="32" r="30" fill="var(--c-accent-soft)" stroke="var(--c-rule)"/>
+                  <path d="M32 22v20M22 32h20" stroke="var(--c-accent)" stroke-width="4" stroke-linecap="round"/>
+                </svg>
+              </span>
+              <h2 class="empty-title">您好，我是您的医疗健康助手</h2>
+              <p class="empty-desc">可以帮您做健康咨询、用药记录、药物相互作用检查、化验单解读。所有回复仅供参考，不构成医疗诊断或处方建议。</p>
+            </div>
 
-            html = html
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
+            <div class="cap-grid" id="suggestions">
+              <button class="cap-card" type="button" data-example="帮我记录一下我今天吃了布洛芬">
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                  <rect x="3" y="5" width="14" height="14" rx="4" fill="none" stroke="currentColor" stroke-width="1.8"/>
+                  <path d="M8 12h6M11 9v6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+                <span class="cap-title">记录用药</span>
+                <span class="cap-desc">记下今天吃了什么药</span>
+              </button>
+              <button class="cap-card" type="button" data-example="布洛芬和阿司匹林能一起吃吗？">
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                  <path d="M12 3 3 8v5c0 5 3.8 8 9 8s9-3 9-8V8l-9-5Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                  <path d="M12 8v6M9 11h6" stroke="currentColor" stroke-width="1.8" stroke-linecap="round"/>
+                </svg>
+                <span class="cap-title">检查药物冲突</span>
+                <span class="cap-desc">两种药能不能一起吃</span>
+              </button>
+              <button class="cap-card" type="button" data-example="帮我解读一下血常规化验单">
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                  <path d="M9 3h6M10 3v6l-4 9a2 2 0 0 0 1.8 3h8.4A2 2 0 0 0 18 18l-4-9V3" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+                <span class="cap-title">解读化验单</span>
+                <span class="cap-desc">看懂指标含义</span>
+              </button>
+              <button class="cap-card" type="button" data-example="高血压患者日常饮食应该注意什么？">
+                <svg viewBox="0 0 24 24" width="22" height="22" aria-hidden="true">
+                  <path d="M12 20s-7-4.6-7-10a4 4 0 0 1 7-2.6A4 4 0 0 1 19 10c0 5.4-7 10-7 10Z" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round"/>
+                </svg>
+                <span class="cap-title">健康咨询</span>
+                <span class="cap-desc">日常饮食与健康建议</span>
+              </button>
+            </div>
+          </div>
 
-            html = html
-                .replace(/\*\*(.+?)\*\*/g, function(m, p1) { return '<strong>' + p1 + '</strong>'; })
-                .replace(/\*(.+?)\*/g, function(m, p1) { return '<em>' + p1 + '</em>'; })
-                .replace(/`([^`]+)`/g, function(m, p1) { return '<code>' + p1 + '</code>'; });
+          <!-- 消息列表 -->
+          <div class="messages" id="messageList" aria-live="polite"></div>
 
-            var lines = html.split('\n');
-            var result = [];
-            var inUl = false;
-            var inOl = false;
+          <!-- 运行详情（可折叠） -->
+          <details class="diagnostics" id="diagnostics">
+            <summary><span class="diag-caret"></span>运行详情</summary>
+            <dl class="diag-grid">
+              <div class="diag-item"><dt>会话 ID</dt><dd id="diagSession">—</dd></div>
+              <div class="diag-item"><dt>对话轮次</dt><dd id="diagTurns">0</dd></div>
+              <div class="diag-item"><dt>需确认</dt><dd id="diagConfirm">否</dd></div>
+              <div class="diag-item"><dt>意图</dt><dd id="diagIntent">—</dd></div>
+              <div class="diag-item"><dt>目标</dt><dd id="diagTarget">—</dd></div>
+              <div class="diag-item"><dt>置信度</dt><dd id="diagConfidence">—</dd></div>
+              <div class="diag-item diag-item--wide"><dt>原因</dt><dd id="diagReason">—</dd></div>
+            </dl>
+          </details>
 
-            var closeLists = function() {
-                if (inUl) { result.push('</ul>'); inUl = false; }
-                if (inOl) { result.push('</ol>'); inOl = false; }
-            };
+        </div>
+      </div>
 
-            for (var i = 0; i < lines.length; i++) {
-                var line = lines[i];
+      <footer class="composer-wrap">
+        <div class="composer-inner">
+          <div class="composer-box">
+            <textarea class="composer-input" id="userInput" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
+            <button class="send-btn" id="sendBtn" type="button" aria-label="发送" title="发送">
+              <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
+                <path d="M5 12 20 5l-5 14-3-7-7-1Z" fill="currentColor" stroke="currentColor" stroke-width="1" stroke-linejoin="round"/>
+              </svg>
+            </button>
+          </div>
+          <p class="composer-hint">内容由 AI 生成，仅供参考，不构成医疗诊断或处方建议 · 如有不适请及时就医</p>
+        </div>
+      </footer>
+    </main>
+  </div>
 
-                var h3 = line.match(/^###\s+(.+)$/);
-                var h2 = line.match(/^##\s+(.+)$/);
-                var h1 = line.match(/^#\s+(.+)$/);
-                if (h3 || h2 || h1) {
-                    closeLists();
-                    var hdr = (h3 || h2 || h1)[1];
-                    if (h3) result.push('<h4>' + hdr + '</h4>');
-                    if (h2) result.push('<h3>' + hdr + '</h3>');
-                    if (h1) result.push('<h2>' + hdr + '</h2>');
-                    continue;
-                }
-
-                var ulMatch = line.match(/^[-*]\s+(.+)$/);
-                var olMatch = line.match(/^\d+\.\s+(.+)$/);
-
-                if (ulMatch) {
-                    if (!inUl) { closeLists(); result.push('<ul>'); inUl = true; }
-                    result.push('<li>' + ulMatch[1] + '</li>');
-                    continue;
-                }
-
-                if (olMatch) {
-                    if (!inOl) { closeLists(); result.push('<ol>'); inOl = true; }
-                    result.push('<li>' + olMatch[1] + '</li>');
-                    continue;
-                }
-
-                closeLists();
-                if (line.trim() === '') {
-                    result.push('<br>');
-                } else {
-                    result.push('<p>' + line + '</p>');
-                }
-            }
-
-            closeLists();
-            return result.join('');
-        }
-
-        // 添加消息到聊天界面
-        function addMessage(role, content) {
-            const messagesDiv = document.getElementById('chatMessages');
-            const messageDiv = document.createElement('div');
-            messageDiv.className = `message ${role === 'user' ? 'user-message' : 'assistant-message'}`;
-            
-            const roleText = role === 'user' ? '您：' : '助手：';
-            if (role === 'assistant') {
-                messageDiv.innerHTML = `<strong>${roleText}</strong>${renderMarkdown(content)}`;
-            } else {
-                messageDiv.innerHTML = `<strong>${roleText}</strong>${content}`;
-            }
-            
-            messagesDiv.appendChild(messageDiv);
-            scrollToBottom();
-        }
-
-        // 滚动到底部
-        function scrollToBottom() {
-            const messagesDiv = document.getElementById('chatMessages');
-            messagesDiv.scrollTop = messagesDiv.scrollHeight;
-        }
-
-        // 更新系统信息
-        function updateSystemInfo(data) {
-            if (!data) return;
-
-            let systemInfo = '';
-            systemInfo += `对话轮次: ${data.conversation_turns != null ? data.conversation_turns : conversationTurns}<br>`;
-            systemInfo += `是否需要确认: ${data.needs_confirmation ? '是' : '否'}<br>`;
-            if (data.error_msg) {
-                systemInfo += `错误信息: ${data.error_msg}`;
-            }
-            document.getElementById('systemInfo').innerHTML = systemInfo;
-
-            if (data.intent_analysis) {
-                const ia = data.intent_analysis;
-                const intentType = ia.intent_type || data.intent || '';
-                let intentHtml = `<span class="intent-badge intent-${intentType}">${intentType || '-'}</span><br>`;
-                if (ia.confidence != null) {
-                    intentHtml += `置信度: ${(ia.confidence * 100).toFixed(1)}%<br>`;
-                }
-                if (ia.reason) {
-                    intentHtml += `原因: ${ia.reason}`;
-                }
-                document.getElementById('intentAnalysis').innerHTML = intentHtml;
-            } else if (data.intent) {
-                document.getElementById('intentAnalysis').innerHTML = `<span class="intent-badge intent-${data.intent}">${data.intent}</span>`;
-            }
-
-            const agent = data.target_agent || '';
-            if (agent) {
-                const agentNames = {
-                    'main_qa_agent': '通用问答',
-                    'drug_record_agent': '用药记录',
-                    'drug_conflict_agent': '药物冲突',
-                    'lab_report_agent': '化验单解读',
-                };
-                document.getElementById('targetAgent').textContent = agentNames[agent] || agent;
-            }
-        }
-
-        // 设置测试用例
-        function setExample(text) {
-            document.getElementById('userInput').value = text;
-            document.getElementById('userInput').focus();
-        }
-
-        // 回车发送消息
-        document.getElementById('userInput').addEventListener('keypress', function(e) {
-            if (e.key === 'Enter') {
-                sendMessage();
-            }
-        });
-
-        // 初始化
-        (async function() {
-            await checkLoginStatus();
-        })();
-    </script>
+  <script src="app.js"></script>
 </body>
 </html>

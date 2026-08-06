@@ -12,9 +12,9 @@ from app.common.exceptions import ServiceUnavailableException
 from app.core.llm.llm_service import LLMService
 from app.core.prompts import Prompts
 from app.core.llm.embedding_service import EmbeddingService
-from app.db.milvus_store import (
+from app.db.chroma_store import (
     ensure_long_memory_collection,
-    get_milvus_client,
+    get_chroma_client,
     insert_long_memory,
     parse_metadata,
     vector_search,
@@ -73,8 +73,8 @@ class LongMemoryService:
 
     def is_enabled(self) -> bool:
         try:
-            # 使用 Milvus 作为长期记忆向量库
-            _ = get_milvus_client()
+            # 使用本地 Chroma 作为长期记忆向量库
+            _ = get_chroma_client()
             return True
         except ServiceUnavailableException:
             return False
@@ -344,7 +344,7 @@ class LongMemoryService:
                     query_vectors=vectors,
                     limit=5,
                     output_fields=["document", "metadata", "user_id"],
-                    filter_expr=f'user_id == "{expr_user}"',
+                    where={"user_id": expr_user},
                 )
             except ServiceUnavailableException:
                 return False
@@ -450,7 +450,7 @@ class LongMemoryService:
                 query_vectors=vectors,
                 limit=max(1, int(top_k)),
                 output_fields=["document", "metadata", "user_id"],
-                filter_expr=f'user_id == "{expr_user}"',
+                where={"user_id": expr_user},
             )
         except ServiceUnavailableException:
             return []
@@ -503,7 +503,7 @@ class LongMemoryService:
                         query_vectors=vectors,
                         limit=5,
                         output_fields=["document", "metadata", "user_id"],
-                        filter_expr=f'user_id == "{expr_user}"',
+                        where={"user_id": expr_user},
                     )
                 except ServiceUnavailableException:
                     continue

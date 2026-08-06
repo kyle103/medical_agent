@@ -2,15 +2,17 @@ from __future__ import annotations
 
 from typing import Any
 
+from app.common.exceptions import ServiceUnavailableException
 from app.common.langfuse_helper import elapsed_ms, time_block, track_rag_retrieval
 from app.common.logger import get_logger, log_rag_retrieval as _log_rag
 from app.config.settings import settings
 from app.core.llm.embedding_service import EmbeddingService
-from app.db.milvus_store import (
+from app.core.rag.keyword_extractor import KeywordExtractor
+from app.db.chroma_store import (
     build_metadata_like,
+    keyword_search,
     parse_metadata,
     query_by_filter,
-    query_like,
     vector_search,
 )
 
@@ -18,6 +20,57 @@ from app.db.milvus_store import (
 DEFAULT_COLLECTION = "kb_general"
 
 logger = get_logger(__name__)
+
+
+def _escape_like_value(value: str) -> str:
+    """LIKE 表达式转义：Milvus 中单引号需双写。"""
+    return (value or "").replace("'", "''")
+
+
+def build_keyword_like_expr(
+    keywords: list[str],
+    mode: str = "or",
+    core_top: int = 3,
+    max_kw: int = 6,
+) -> str | None:
+    """按关键词构建 Milvus LIKE 过滤表达式（伪 BM25 的稀疏检索腿）。
+
+    - mode="and": 取前 core_top 个关键词 AND（严，精度高）
+    - mode="or" : 取前 max_kw 个关键词 OR（宽召回，靠 score 排优）
+    """
+    if not keywords:
+        return None
+    kws = keywords[: max_kw if mode == "or" else core_top]
+    if not kws:
+        return None
+
+    def like(k: str) -> str:
+        return f"document LIKE '%{_escape_like_value(k)}%'"
+
+    joiner = " OR " if mode == "or" else " AND "
+    return "(" + joiner.join(like(k) for k in kws) + ")"
+
+
+def score_keyword_hits(
+    items: list[dict[str, Any]], keywords: list[str]
+) -> list[dict[str, Any]]:
+    """位置加权关键词命中打分（BM25 简化代理）。
+
+    每个关键词权重 1/(rank+1)（越靠前的词越重要），命中计数封顶 3。
+    结果写入 item["kw_score"]，供排序与 RRF 排名使用。
+    """
+    for it in items:
+        text = str(it.get("text") or "").lower()
+        score = 0.0
+        for i, kw in enumerate(keywords):
+            kwl = kw.lower()
+            if not kwl:
+                continue
+            count = text.count(kwl)
+            if count > 0:
+                score += (1.0 / (i + 1)) * min(count, 3)
+        it["kw_score"] = round(score, 4)
+    return items
 
 
 class PublicKnowledgeService:
@@ -50,10 +103,12 @@ class PublicKnowledgeService:
                 build_metadata_like("source_name", source_name),
                 build_metadata_like("record_line", int(record_line)),
             ]
-            expr = " AND ".join(filters)
+            where: dict = {}
+            for f in filters:
+                where.update(f)
             rows = query_by_filter(
                 collection_name=self.collection_name,
-                filter_expr=expr,
+                filter_expr=where,
                 limit=512,
                 output_fields=["document", "metadata"],
             )
@@ -81,6 +136,44 @@ class PublicKnowledgeService:
         name = collection_name or getattr(settings, "MILVUS_PUBLIC_KB_COLLECTION", DEFAULT_COLLECTION)
         logger.info("public_kb cache refresh noop for Milvus collection=%s", name)
         return 0
+
+    async def _keyword_like_search(
+        self, keywords: list[str], limit: int
+    ) -> list[dict[str, Any]]:
+        """伪 BM25 稀疏检索：关键词子串匹配（Chroma where_document $contains）。
+
+        复用 KeywordExtractor 抽取关键词，交给 chroma_store.keyword_search
+        做 $or / $and 匹配，返回统一记录再映射为检索项。
+        """
+        if not keywords:
+            return []
+        mode = str(getattr(settings, "PUBLIC_KB_KEYWORD_MODE", "or"))
+        try:
+            rows = keyword_search(
+                collection_name=self.collection_name,
+                keywords=keywords,
+                limit=max(1, int(limit)),
+                mode=mode,
+            )
+        except ServiceUnavailableException:
+            return []
+
+        items: list[dict[str, Any]] = []
+        for row in rows:
+            doc_id = str(row.get("id") or "")
+            md = parse_metadata(row.get("metadata"))
+            items.append(
+                {
+                    "id": doc_id,
+                    "text": str(row.get("document") or ""),
+                    "score": 0.0,
+                    "source_name": str(md.get("source_name") or ""),
+                    "source_type": str(md.get("source_type") or ""),
+                    "record_line": int(md.get("record_line") or 0),
+                    "chunk_index": int(md.get("chunk_index") or 0),
+                }
+            )
+        return items
 
     async def retrieve(
         self,
@@ -164,31 +257,21 @@ class PublicKnowledgeService:
                 )
                 return final
 
-            like_rows = query_like(
-                collection_name=self.collection_name,
-                field="document",
-                text=q,
-                limit=bm25_top_k,
-                output_fields=["document", "metadata"],
+            # 稀疏腿：关键词 LIKE 检索（伪 BM25 —— 云端 Milvus 仅倒排索引）
+            keywords = await KeywordExtractor().extract(
+                q, top_k=int(getattr(settings, "PUBLIC_KB_KEYWORD_TOP_K", 8))
             )
+            keyword_rows = await self._keyword_like_search(keywords, limit=bm25_top_k)
+            keyword_items = score_keyword_hits(keyword_rows, keywords)
+            # 按关键词打分排序后再赋 RRF 排名（分越高排名越靠前）
+            keyword_items.sort(key=lambda x: float(x.get("kw_score") or 0.0), reverse=True)
 
             bm25_rank: dict[str, int] = {}
             bm25_items: list[dict[str, Any]] = []
-            for rank, row in enumerate(like_rows, 1):
-                doc_id = str(row.get("id") or "")
-                bm25_rank[doc_id] = rank
-                md = parse_metadata(row.get("metadata"))
-                bm25_items.append(
-                    {
-                        "id": doc_id,
-                        "text": str(row.get("document") or ""),
-                        "bm25_score": None,
-                        "source_name": str(md.get("source_name") or ""),
-                        "source_type": str(md.get("source_type") or ""),
-                        "record_line": int(md.get("record_line") or 0),
-                        "chunk_index": int(md.get("chunk_index") or 0),
-                    }
-                )
+            for rank, it in enumerate(keyword_items, 1):
+                bm25_rank[it["id"]] = rank
+                it["bm25_score"] = it.get("kw_score")
+                bm25_items.append(it)
 
             merged: dict[str, dict[str, Any]] = {it["id"]: it for it in items}
             for it in bm25_items:
@@ -198,15 +281,18 @@ class PublicKnowledgeService:
             def _rrf(rank: int) -> float:
                 return 1.0 / (rrf_k + rank)
 
+            vector_w = float(getattr(settings, "PUBLIC_KB_KEYWORD_VECTOR_WEIGHT", 0.7))
+            keyword_w = float(getattr(settings, "PUBLIC_KB_KEYWORD_WEIGHT", 0.3))
+
             out: list[dict[str, Any]] = []
             for doc_id, it in merged.items():
                 d_rank = dense_rank.get(doc_id)
                 b_rank = bm25_rank.get(doc_id)
                 score = 0.0
                 if d_rank:
-                    score += _rrf(d_rank)
+                    score += vector_w * _rrf(d_rank)
                 if b_rank:
-                    score += _rrf(b_rank)
+                    score += keyword_w * _rrf(b_rank)
                 it["rrf_score"] = score
                 it["dense_rank"] = d_rank
                 it["bm25_rank"] = b_rank
@@ -229,7 +315,7 @@ class PublicKnowledgeService:
                 count=len(final),
                 latency_ms=latency,
                 success=True,
-                extra={"mode": "hybrid", "dense_hits": len(items), "bm25_hits": len(bm25_items)},
+                extra={"mode": "hybrid", "dense_hits": len(items), "bm25_hits": len(bm25_items), "keywords": len(keywords)},
             )
             _log_rag(
                 source="public_kb",

@@ -39,3 +39,8 @@ ENV/
 
 # logs
 /logs/
+
+# 旧版本 / 设计文档归档
+/old_version/
+
+CLAUDE.md

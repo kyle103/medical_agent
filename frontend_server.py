@@ -5,10 +5,15 @@
 """
 
 import os
+import sys
 from http.server import HTTPServer, SimpleHTTPRequestHandler
-import webbrowser
-import threading
-import time
+
+# Windows 控制台默认 GBK，emoji/中文 print 会 UnicodeEncodeError
+try:
+    sys.stdout.reconfigure(encoding="utf-8", errors="replace")
+    sys.stderr.reconfigure(encoding="utf-8", errors="replace")
+except Exception:
+    pass
 
 class FrontendHandler(SimpleHTTPRequestHandler):
     """自定义HTTP处理器，支持SPA路由"""
@@ -106,25 +111,19 @@ class FrontendHandler(SimpleHTTPRequestHandler):
         print(f"[前端服务器] {format % args}")
 
 def start_frontend_server(port=3000):
-    """启动前端服务器"""
-    server = HTTPServer(('localhost', port), FrontendHandler)
-    
-    print(f"🚀 前端Demo服务器启动成功!")
-    print(f"📱 访问地址: http://localhost:{port}")
-    print(f"🔗 后端API: http://localhost:8000")
+    """启动前端服务器（浏览器由一键启动脚本负责打开，这里不做）"""
+    # 绑定 0.0.0.0 避免 localhost 解析到 IPv6 ::1 导致 127.0.0.1 访问不到
+    server = HTTPServer(('0.0.0.0', port), FrontendHandler)
+
+    print(f"前端Demo服务器启动成功!")
+    print(f"访问地址: http://localhost:{port}")
+    print(f"后端API: http://localhost:8000")
     print("按 Ctrl+C 停止服务器")
-    
-    # 自动打开浏览器
-    def open_browser():
-        time.sleep(1)
-        webbrowser.open(f'http://localhost:{port}')
-    
-    threading.Thread(target=open_browser, daemon=True).start()
-    
+
     try:
         server.serve_forever()
     except KeyboardInterrupt:
-        print("\n👋 服务器已停止")
+        print("服务器已停止")
     finally:
         server.server_close()
 

@@ -344,8 +344,16 @@ async def _process_drug_record_state_machine(state: dict) -> dict:
 
 async def input_check(state: dict) -> dict:
     _t0 = time.perf_counter()
+    from app.core.compliance.compliance_service import ComplianceService
+
+    user_input = state.get("user_input", "")
+    ok, msg = ComplianceService().input_compliance_check(user_input)
+    if not ok:
+        state["error_msg"] = msg
+        logger.warning("input_check compliance blocked: %s", msg)
+
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="input_check", latency_ms=latency_ms)
+    log_node_execution(node_name="input_check", latency_ms=latency_ms, blocked=bool(state.get("error_msg")))
     return state
 
 
@@ -613,7 +621,7 @@ async def knowledge_retrieve(state: dict) -> dict:
 
     async def _retrieve_drug_knowledge():
         try:
-            from app.db.milvus_store import is_milvus_configured
+            from app.db.chroma_store import is_milvus_configured
             if is_milvus_configured():
                 svc = MedicalKnowledgeService()
                 return await svc.retrieve(user_input=user_input, intent=intent)
@@ -623,7 +631,7 @@ async def knowledge_retrieve(state: dict) -> dict:
 
     async def _retrieve_public_kb():
         try:
-            from app.db.milvus_store import is_milvus_configured
+            from app.db.chroma_store import is_milvus_configured
             if is_milvus_configured():
                 public_kb = PublicKnowledgeService()
                 return await public_kb.retrieve(query=user_input)
@@ -727,8 +735,8 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
     step_query = step.get("query", "")
     has_deps = step.get("depends_on") and step_results
 
-    if not has_deps and original_input and step_query and original_input != step_query and step_query not in original_input:
-        sub_state["user_input"] = f"[背景信息：用户原始问题是「{original_input}」]\n{step_query}"
+    if not has_deps and original_input and step_query and original_input != step_query:
+        sub_state["user_input"] = f"[背景信息：用户原始问题是「{original_input}」]\n当前需要回答的部分：{step_query}"
 
     if step_results and step.get("depends_on"):
         structured_ctx = _build_structured_context(step, step_results, original_input, step_query)
@@ -1274,6 +1282,14 @@ async def output_check_and_disclaimer(state: dict) -> dict:
     state["final_response"] = state.get("llm_output", "") or state.get("final_response", "")
 
     compliance = ComplianceService()
+    ok, msg = compliance.output_compliance_check(state["final_response"])
+    if not ok:
+        # 统一输出合规：任何路径（工具/多意图/Agent）产出的 final_response 都过闸
+        logger.warning("output_check compliance blocked: %s", msg)
+        state["final_response"] = (
+            "抱歉，该回答涉及医疗红线内容，无法提供具体建议。"
+            "如有健康问题，请及时就医，并在医生指导下用药。"
+        )
     state["final_response"] = compliance.add_disclaimer(state["final_response"])
 
     proposed = state.get("proposed_updates") or []
@@ -1281,7 +1297,7 @@ async def output_check_and_disclaimer(state: dict) -> dict:
     state["proposed_updates"] = proposed
 
     latency_ms = int((time.perf_counter() - _t0) * 1000)
-    log_node_execution(node_name="output_check_and_disclaimer", latency_ms=latency_ms)
+    log_node_execution(node_name="output_check_and_disclaimer", latency_ms=latency_ms, blocked=not ok)
     return state
 
 
@@ -1502,25 +1518,36 @@ def _response_has_medical_claims(text: str) -> bool:
 
 
 def _has_rag_or_tool_context(state: dict) -> bool:
-    """检查 state 中是否存在 RAG 检索结果或工具执行结果可供事实校验参考。"""
+    """检查是否存在可用于事实校验的实质性知识上下文。
+
+    注意：SQL 药物名称匹配（drug_knowledge）仅表示"该药名在数据库中存在"，
+    不提供可用于校验 LLM 输出的医学知识。实质性上下文必须是：
+    - Milvus RAG 检索结果（public_kb），或
+    - 工具执行结果（drug_interaction / lab_report 等）
+    """
     retrieved = state.get("retrieved_knowledge") or {}
+
     if isinstance(retrieved, dict):
-        for key, val in retrieved.items():
-            if key == "public_kb" and isinstance(val, list) and val:
-                return True
-            if key != "public_kb" and val:
-                if isinstance(val, (dict, list)) and val:
-                    return True
-                if isinstance(val, str) and val.strip():
-                    return True
+        # public_kb: Milvus 向量/BM25 检索 → 实质性医学知识
+        public_kb = retrieved.get("public_kb")
+        if isinstance(public_kb, list) and len(public_kb) > 0:
+            return True
+
+    # 工具执行结果 → 实质性上下文
     tool_result = state.get("tool_result")
-    if isinstance(tool_result, dict) and tool_result:
-        return True
+    if isinstance(tool_result, dict):
+        if tool_result.get("final_desc") or tool_result.get("interaction_result"):
+            return True
+
+    # 多步骤执行结果中的工具输出
     plan_results = state.get("plan_step_results")
     if isinstance(plan_results, dict):
         for result in plan_results.values():
-            if isinstance(result, dict) and result.get("final_response", "").strip():
-                return True
+            if isinstance(result, dict):
+                tr = result.get("tool_result")
+                if isinstance(tr, dict) and (tr.get("final_desc") or tr.get("interaction_result")):
+                    return True
+
     return False
 
 

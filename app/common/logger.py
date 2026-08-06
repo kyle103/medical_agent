@@ -186,6 +186,66 @@ def log_step_execution(
     )
 
 
+_SESSION_BOUNDARY_CHAR = "═"
+_SESSION_BOUNDARY_WIDTH = 120
+
+
+def _emit_raw_separator() -> None:
+    """向所有 FileHandler 直接写入全宽分隔线 + 空行，制造视觉间隔。
+
+    不经过 logging Formatter，因此写出的就是纯字符组成的醒目分隔，
+    不会被时间戳等前缀冲淡。
+    """
+    sep = _SESSION_BOUNDARY_CHAR * _SESSION_BOUNDARY_WIDTH
+    block = f"\n{sep}\n{sep}\n\n"
+    for handler in logging.getLogger().handlers:
+        if isinstance(handler, logging.FileHandler):
+            try:
+                handler.stream.write(block)
+                handler.stream.flush()
+            except Exception:
+                pass
+
+
+def log_session_start(
+    *,
+    session_id: str,
+    user_id: str = "",
+    user_input: str = "",
+    stream: bool = False,
+) -> None:
+    """在日志中插入醒目的会话开始分隔线，便于按对话定位日志。"""
+    _emit_raw_separator()
+    _logger = get_logger("medical_agent.session")
+    preview = (user_input[:60] + "...") if len(user_input) > 60 else user_input
+    label = f" SESSION START | session={session_id} | user={user_id[:12]}... | stream={stream} | input=\"{preview}\" "
+    pad = max(0, _SESSION_BOUNDARY_WIDTH - len(label) - 1)
+    line = _SESSION_BOUNDARY_CHAR * 4 + label + _SESSION_BOUNDARY_CHAR * pad
+    _logger.info(line)
+
+
+def log_session_end(
+    *,
+    session_id: str,
+    total_ms: int = 0,
+    intent: str = "",
+    error: str = "",
+) -> None:
+    """在日志中插入醒目的会话结束分隔线。"""
+    _logger = get_logger("medical_agent.session")
+    parts = [f"session={session_id}"]
+    if total_ms:
+        parts.append(f"total_ms={total_ms}")
+    if intent:
+        parts.append(f"intent={intent}")
+    if error:
+        parts.append(f"error={error}")
+    label = f" SESSION END   | {' | '.join(parts)} "
+    pad = max(0, _SESSION_BOUNDARY_WIDTH - len(label) - 1)
+    line = _SESSION_BOUNDARY_CHAR * 4 + label + _SESSION_BOUNDARY_CHAR * pad
+    _logger.info(line)
+
+
 class NodeTimer:
     def __init__(self, node_name: str, **detail: Any):
         self.node_name = node_name

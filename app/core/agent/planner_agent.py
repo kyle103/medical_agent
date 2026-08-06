@@ -25,6 +25,11 @@ _CONTINUATION_PRONOUNS = [
     "其中", "哪些", "这些", "那些", "哪种", "第一个", "第二个", "第一种", "第二种",
 ]
 
+_CONDITIONAL_REF_PATTERNS = [
+    "如果是", "如果这样", "这样的话", "那这样的话", "如果是这样",
+    "那就是说", "那么", "那样的话", "如果是真的",
+]
+
 _EVALUATION_PATTERNS = [
     "怎么样", "有用吗", "有效吗", "管用吗", "安全吗", "副作用",
     "哪个更好", "哪个更", "哪种更", "区别", "对比",
@@ -59,6 +64,66 @@ _DEPENDENCY_HINT = ";".join(
     _CONTINUATION_PRONOUNS + _EVALUATION_PATTERNS + _FOLLOWUP_PATTERNS
     + _RESULT_REF_KEYWORDS + _DRUG_CONFLICT_KEYWORDS
 )
+
+
+def _quick_intent_classify(text: str) -> str:
+    """快速规则意图分类：用于 LLM 超时后的兜底路由。
+
+    仅依赖关键词匹配，不需要 LLM 调用。
+    返回 intent 值：drug / lab / archive / general
+
+    重要：如果查询混合了医学症状描述和用药问题，返回 general
+    （由 main_qa_agent 统一处理），避免单一工具丢失其他信息。
+    """
+    t = (text or "").strip()
+
+    _DRUG_SIGNALS = [
+        "冲突", "相互作用", "一起吃", "同服", "配伍", "禁忌",
+        "能不能一起", "可以一起", "同时服用",
+        "吃什么药", "用什么药", "止痛药", "退烧药", "消炎药",
+        "降压药", "降糖药", "能吃什么", "该吃什么", "要吃什么",
+        "吃了", "服用", "用药记录", "添加", "剂量", "mg", "毫克",
+        "用药", "处方", "忌口", "副作用", "药",
+    ]
+    _MEDICAL_SYMPTOM_SIGNALS = [
+        "病", "症", "疼", "痛", "头痛", "发烧", "发热", "咳嗽", "感冒",
+        "发炎", "感染", "恶心", "呕吐", "头晕", "乏力", "胸闷", "心慌",
+        "气短", "水肿", "出血", "皮疹", "瘙痒", "红肿", "溃疡",
+        "是不是", "可能是", "请问", "会不会是", "需不需要",
+        "高血压", "糖尿病", "哮喘", "过敏", "腹泻", "便秘",
+    ]
+    _LAB_SIGNALS = [
+        "检查", "化验", "检验", "指标", "CT", "MRI", "X光", "B超",
+        "报告", "化验单", "体检", "血常规", "尿常规",
+    ]
+    _ARCHIVE_SIGNALS = ["档案", "病历", "历史记录", "就诊记录"]
+
+    has_drug = any(k in t for k in _DRUG_SIGNALS)
+    has_medical = any(k in t for k in _MEDICAL_SYMPTOM_SIGNALS)
+    has_lab = any(k in t for k in _LAB_SIGNALS)
+    has_archive = any(k in t for k in _ARCHIVE_SIGNALS)
+
+    # 混合查询：既有症状描述又有用药问题 → general（避免单一工具丢失信息）
+    if has_drug and has_medical:
+        return "general"
+
+    # 纯药物查询或冲突检查
+    if has_drug:
+        return "drug"
+
+    # 化验/检查
+    if has_lab:
+        return "lab"
+
+    # 档案查询
+    if has_archive:
+        return "archive"
+
+    # 有医学症状但无用药/检查 → general
+    if has_medical:
+        return "general"
+
+    return "general"
 
 
 def _route_by_intent_and_text(state: dict) -> dict:
@@ -166,6 +231,20 @@ def _detect_dependencies_rule(query: str, previous_queries: list[str]) -> list[s
             if len(prev_q) >= 6:
                 deps.add(i)
 
+    # 7) 条件引用（"如果是"、"如果这样"）→ 依赖最近的结论性前置步骤
+    if any(query.startswith(k) or k in query for k in _CONDITIONAL_REF_PATTERNS):
+        for i in range(prev_count - 1, -1, -1):
+            prev_q = previous_queries[i]
+            if any(kw in prev_q for kw in ["可能", "是不是", "是否", "请问", "吗", "吧"]):
+                deps.add(i)
+                break
+
+    # 8) "还" / "也" 位于句首 → 补充描述，依赖前一步
+    _stripped = query.strip()
+    if _stripped.startswith("还") or _stripped.startswith("也"):
+        if prev_count > 0:
+            deps.add(prev_count - 1)
+
     return [f"s{i + 1}" for i in sorted(deps)]
 
 
@@ -250,37 +329,51 @@ def _llm_enabled() -> bool:
 
 
 def _split_user_queries_rule(text: str) -> list[str]:
-    """规则拆分：仅在明确的句子边界或并列标记处拆分。
+    """规则拆分：仅在明确的多意图转换标记处拆分。
 
-    避免在逗号连接的叙事/因果句处拆分（如"我对X过敏，吃了X住院了"）。
+    保守策略——宁可少拆也不误拆：
+    - 只在显式标记处拆分（"另外"、"此外"、"顺便问" 等）
+    - 不按句号/问号等标点拆分，避免将背景陈述和补充描述切成碎片
+    - 如果拆分后只有 1 段，返回原文本
     """
     import re
     raw = (text or "").strip()
     if not raw:
         return []
-    parts = re.split(r"[。！？!?；;]+", raw)
-    parts = [p.strip(" ，,") for p in parts if p and p.strip(" ，,")]
+
+    # 显式多意图标记：这些词明确表示"我要问另一个问题了"
+    _EXPLICIT_MARKERS = [
+        "另外", "此外", "顺便问", "还想问", "还想知道", "再问", "再请教",
+        "第一个问题", "第二个问题", "第三个问题",
+        "一是", "二是", "三是", "第一", "第二", "第三",
+        "问题一", "问题二", "问题三",
+    ]
+
+    # 用这些标记拆分
+    marker_pattern = "|".join(re.escape(m) for m in _EXPLICIT_MARKERS)
+    parts = re.split(rf"(?={marker_pattern})", raw)
+
     out: list[str] = []
-    for p in parts:
-        sub = re.split(r"(?=帮我|请帮我|另外|还有|并且|同时|我是否|我有|顺便)", p)
-        for s in sub:
-            s = s.strip(" ，,")
-            if s:
-                out.append(s)
+    for part in parts:
+        part = part.strip(" ，,;；。！？!?\n\r")
+        if part:
+            out.append(part)
+
+    # 去重
+    seen: set[str] = set()
     dedup: list[str] = []
-    seen = set()
     for q in out:
         if q in seen:
             continue
         seen.add(q)
         dedup.append(q)
-    return dedup
+
+    return dedup if dedup else [raw]
 
 
 _MULTI_INTENT_MARKERS = [
     "另外", "还有", "并且", "同时", "顺便", "此外",
     "第一个问题", "第二个问题", "一是", "二是", "第一", "第二",
-    "？", "?", "！", "!", "。",
 ]
 
 
@@ -436,7 +529,12 @@ class PlannerAgent:
             for i, q in enumerate(sub_queries):
                 route_result = batch_routes[i]
                 if not route_result or not isinstance(route_result, dict):
-                    route_result = _route_by_intent_and_text({"user_input": q, "intent": "general", "intent_confidence": 0.5, "extract_entities": {}})
+                    route_result = _route_by_intent_and_text({
+                        "user_input": q,
+                        "intent": _quick_intent_classify(q),
+                        "intent_confidence": 0.5,
+                        "extract_entities": {},
+                    })
 
                 deps = dep_results[i]
 

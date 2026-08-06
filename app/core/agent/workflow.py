@@ -365,6 +365,8 @@ class MedicalAgent:
         history = state.get("history") or []
         yield json.dumps({
             "type": "done",
+            "session_id": session_id,
+            "intent": state.get("intent", "general"),
             "needs_confirmation": bool(state.get("needs_confirmation")),
             "conversation_turns": len(history) // 2 if history else 0,
         }, ensure_ascii=False) + "\n"
