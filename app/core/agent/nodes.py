@@ -226,6 +226,106 @@ def _is_medical_query(text: str, intent: str, entities: dict | None = None) -> b
 
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# turn_reset：每轮入口重置「语义上是单轮」的字段
+#
+# 背景（Step 4.5 引入，治 BUG-1 / BUG-3）：
+#   - error_msg / final_response / intent* / execution_plan / plan_phase 等都是 tracked 字段
+#     （state.py 中无 UntrackedValue 标注），checkpointer 写入快照；
+#   - 但它们的**语义**是「本轮产出」，不该跨轮继承；
+#   - 否则上轮的 final_response / error_msg 会污染下轮的入口——表现为：
+#       BUG-1：合规拦截留下的 error_msg 让后续每轮都在 _need_error 条件边跳到 err
+#       BUG-3：上轮的 final_response 触发 build_generation_prompt 短路分支，
+#              本轮生成阶段 LLM 调用次数 = 0，直接复读上轮答案
+#       同类：force_long_memory_write 等信号字段若跨轮残留，会让 memory_update 误触发
+#
+# 哪些字段**不**重置：
+#   - 请求级输入（user_id / session_id / user_input / stream / enable_archive_link）：
+#     这些由 chat_router.py 重新赋值，残留无意义但也无害
+#   - 跨轮业务态（pending_confirmation / last_decision / session_runtime_state）：
+#     已是 UntrackedValue，且由 AgentStateStore / memory_load 维护
+#   - 已是 UntrackedValue 的中间产物（history / retrieved_knowledge / plan_step_results /
+#     shared_facts / private_scratchpads / decision_context / 等）：
+#     不进快照，不需要"重置"
+# ─────────────────────────────────────────────────────────────────────────────
+_TURN_LOCAL_FIELDS: tuple[str, ...] = (
+    # 拦截/错误（BUG-1 根因）
+    "error_msg",
+    # 最终产出（BUG-3 根因）
+    "final_response",
+    # 意图识别（每轮由 intent_node 重算）
+    "intent", "intent_type", "intent_confidence", "intent_reason", "intent_analysis",
+    "target_agent", "is_multi_intent",
+    # 实体抽取（每轮重算）
+    "extract_entities",
+    # 工具调用
+    "tool_name", "tool_result",
+    # 生成原文（仅本轮 out/fact_check 消费）
+    "llm_output",
+    # 确认/合规（每轮由 input_check / out 节点重算）
+    "needs_confirmation", "confirmation_message", "compliance_check_result",
+    # 计划（每轮由 plan_node 重算）
+    "execution_plan",
+    "is_multi_section", "plan_phase",
+    "replan_count", "replan_reason", "needs_replan",
+    "replan_context", "cross_step_conflict",
+    # 药物事件（每轮重算）
+    "candidate_drug_events",
+    # 长期记忆写入信号（每轮由 intent_node 判定；不重置会让上轮的"记住"无限触发）
+    "force_long_memory_write", "long_memory_write_source",
+)
+
+
+# 各字段 reset 时的**类型正确的空值**。
+#
+# ⚠️ 绝不能统一置 `None`：`None` 与「键不存在」对 `state.get(k, 默认值)` **不等价**。
+# 写成 None 之后键仍然存在，下游 `.get(k, 默认值)` 拿到的是 None 而不是默认值——
+#   - `state.get("replan_count", 0)` → None，紧接着 `None >= MAX_REPLAN` 抛 TypeError
+#     （planner_agent.py:700→702，凡有步骤的轮次必过）
+#   - `state.get("execution_plan", {})` → None，紧接着 `.get("steps")` 抛 AttributeError
+#     （nodes.py:847，目前被 plan_node 先行覆盖掩盖，属于侥幸）
+# 所以按 `state.py` 的**声明类型**给空值，保持「已重置」与「本轮尚未产生」在语义上一致。
+_TURN_LOCAL_DEFAULTS: dict[str, object] = {
+    # str
+    "error_msg": "", "final_response": "", "llm_output": "",
+    "intent": "", "intent_type": "", "intent_reason": "",
+    "target_agent": "", "tool_name": "",
+    "confirmation_message": "", "replan_reason": "", "long_memory_write_source": "",
+    # Literal["planning", "executing", "reconciling", "responding"]
+    "plan_phase": "planning",
+    # bool（含已无消费者的 compliance_check_result，仍按声明类型给 False）
+    "is_multi_intent": False, "needs_confirmation": False, "compliance_check_result": False,
+    "is_multi_section": False, "needs_replan": False, "force_long_memory_write": False,
+    # int / float
+    "replan_count": 0, "intent_confidence": 0.0,
+    # dict
+    "intent_analysis": {}, "extract_entities": {}, "tool_result": {},
+    "execution_plan": {}, "replan_context": {}, "cross_step_conflict": {},
+    # list[dict]
+    "candidate_drug_events": [],
+}
+
+# 导入期自检：新增 _TURN_LOCAL_FIELDS 却忘了给默认值时，在这里直接失败，
+# 而不是静默退化成 None 再到运行期炸在某个 `.get(k, 默认值)` 上。
+_MISSING_DEFAULTS = [k for k in _TURN_LOCAL_FIELDS if k not in _TURN_LOCAL_DEFAULTS]
+if _MISSING_DEFAULTS:  # pragma: no cover - 导入期不变量
+    raise RuntimeError(f"turn_reset 缺少默认值: {_MISSING_DEFAULTS}")
+
+
+async def turn_reset(state: dict) -> dict:
+    _t0 = time.perf_counter()
+    # ⚠️ langgraph 的节点合并语义是 `state.update(returned)`——只覆盖、不删除。
+    # 所以不能 `state.pop()` 或返回不含这些键的 dict：merge 之后旧键依旧残留。
+    # 正确做法是**显式 overwrite 成空/默认值**，让合并后的 state 持有这些「被清掉」的值。
+    # 然后下游节点（如 `_need_error` 的 `state.get("error_msg")`）看到的就是空/默认。
+    for k in _TURN_LOCAL_FIELDS:
+        if k in state:
+            state[k] = _TURN_LOCAL_DEFAULTS[k]
+    latency_ms = int((time.perf_counter() - _t0) * 1000)
+    log_node_execution(node_name="turn_reset", latency_ms=latency_ms)
+    return state
+
+
 async def input_check(state: dict) -> dict:
     _t0 = time.perf_counter()
     from app.core.compliance.compliance_service import ComplianceService
@@ -574,7 +674,16 @@ def _build_sub_state(state: dict, step: PlanStep, step_results: dict | None = No
 
     # 单步（无并行/依赖）路径保留顶层实体：跨轮指代已被 intent 依据决策上下文
     # 解析成药名，需原样带给工具，避免工具只能从当前句正则回退丢失被指代药名。
-    drop_keys = ["final_response", "error_msg", "intent_analysis", "tool_result", "llm_output"]
+    # `plan_step_results` 必须剥掉——`dict(state)` 是浅拷贝，`sub_state["plan_step_results"]`
+    # 与 `execute_node` 手里的 `results` **是同一个对象**；而 `_execute_single_step` 又把
+    # `sub_state` 本身当步骤结果返回，于是 `results[sid]["plan_step_results"] is results`
+    # 构成**真循环引用**。后果：checkpointer 的 writes 元数据序列化栈溢出
+    # （实测 `ormsgpack.packb` → TypeError: Recursion limit reached，整轮请求失败）。
+    # 依赖步骤的结果不从这里读——`_build_structured_context` 走的是 `step_results` 形参。
+    drop_keys = [
+        "final_response", "error_msg", "intent_analysis", "tool_result", "llm_output",
+        "plan_step_results",
+    ]
     if not preserve_entities:
         drop_keys.append("extract_entities")
     for key in drop_keys:
@@ -727,6 +836,31 @@ def _extract_key_findings(text: str) -> list[str]:
     return findings[:5]
 
 
+#: 步骤结果里**下游真正会读**的键——穷举自全部消费点：
+#:   reconcile_node（final_response / error_msg / tool_result / intent_type）
+#:   _build_structured_context / _detect_cross_step_conflict（final_response / extract_entities / tool_result）
+#:   execute_node 的 state.update 回填（final_response / error_msg / tool_result / llm_output / extract_entities）
+#:   _has_substantive_context（tool_result）
+#: 其余键一律剥掉：`_execute_single_step` 返回的是 sub_state 本身，原样存进
+#: `plan_step_results` 会让每个步骤结果里嵌一份近乎完整的 state 副本，
+#: 随重规划轮次逐层嵌套（体积 = 步骤数 × 整份状态）。
+_STEP_RESULT_KEYS: tuple[str, ...] = (
+    "final_response",
+    "error_msg",
+    "tool_result",
+    "llm_output",
+    "extract_entities",
+    "intent_type",
+)
+
+
+def _project_step_result(result: dict) -> dict:
+    """把步骤结果裁剪成只含下游真正读取的键，切断对整份 state 的引用。"""
+    if not isinstance(result, dict):
+        return {"error_msg": str(result), "final_response": "步骤执行返回了非预期结构。"}
+    return {k: result[k] for k in _STEP_RESULT_KEYS if k in result}
+
+
 async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
     target_type = step.get("target_type", "agent")
     target_name = step.get("target_name", "")
@@ -741,24 +875,24 @@ async def _execute_single_step(sub_state: dict, step: PlanStep) -> dict:
                 sub_state["intent_type"] = tool_result["intent_type"]
             if tool_result.get("error_msg"):
                 sub_state["error_msg"] = tool_result["error_msg"]
-            return sub_state
+            return _project_step_result(sub_state)
         except Exception as e:
             logger.error("_execute_single_step tool=%s failed: %s", target_name, e)
             sub_state["error_msg"] = str(e)
-            return sub_state
+            return _project_step_result(sub_state)
 
     from app.core.agent.agent_router import AgentRouter
     router = AgentRouter()
     try:
         result_state = await router.route_and_execute(sub_state)
         result_state["intent_type"] = step.get("intent_type", "general")
-        return result_state
+        return _project_step_result(result_state)
     except Exception as e:
         logger.error("execute_single_step failed step=%s error=%s", step["step_id"], e)
         sub_state["error_msg"] = f"Agent执行失败: {str(e)}"
         sub_state["final_response"] = f"处理'{step['query']}'时出现错误，请稍后重试。"
         sub_state["intent_type"] = step.get("intent_type", "general")
-        return sub_state
+        return _project_step_result(sub_state)
 
 
 async def execute_node(state: dict) -> dict:

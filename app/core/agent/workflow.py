@@ -3,6 +3,8 @@ from __future__ import annotations
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
+from langgraph.checkpoint.base import BaseCheckpointSaver
+from langgraph.checkpoint.memory import InMemorySaver
 from langgraph.graph import END, StateGraph
 
 from app.common.exceptions import UserAuthException
@@ -20,6 +22,7 @@ from app.core.agent.nodes import (
     output_check_and_disclaimer,
     plan_node,
     reconcile_node,
+    turn_reset,
 )
 from app.core.agent.state import AgentState
 from app.core.agent.stream_events import (
@@ -34,13 +37,44 @@ from app.core.agent.stream_events import (
 from app.core.llm.llm_service import begin_usage_tracking, end_usage_tracking
 
 
+def _thread_id(user_id: str, session_id: str) -> str:
+    """组合 `thread_id` = f"{user_id}:{session_id}"——治 BUG-2 跨用户串话。
+
+    背景：langgraph checkpointer 按 `thread_id` 索引状态；`session_id` 是客户端可控的
+    （chat_router.py:25 仅在空时生成 uuid），同一 `session_id` 在两个不同 `user_id`
+    下若直接用作 `thread_id`，会让 user-B 的运行读到 user-A 留下的快照——
+    表现为上轮的 `final_response` / `error_msg` 跨用户残留（严重情形还会因
+    `plan_step_results` 自引用触发 msgpack 递归深度爆炸）。
+
+    `run()` / `run_stream()` 已要求非空 user_id（`UserAuthException`）；
+    缺失时退到 `anon:` 前缀，避免空键混淆。
+    """
+    prefix = user_id if user_id else "anon"
+    return f"{prefix}:{session_id}"
+
+
 class MedicalAgent:
-    def __init__(self):
+    def __init__(self, *, checkpointer: BaseCheckpointSaver | None = None):
+        """默认挂 `InMemorySaver`；显式传 `None` 表示不加 checkpointer（仅供特殊测试场景）。
+
+        选 InMemorySaver 作为 Step 4 的冒烟载体，理由：
+          1. 零新增依赖；
+          2. 不写盘，与现有 `AgentStateStore`（DB 行）职责不交叠；
+          3. 接口形态与 Step 5 的 `langgraph-checkpoint-sqlite` 完全一致，换持久化只需改构造函数参数。
+
+        checkpointer 的职责被刻意收窄为「执行进度」（见方案 §3.3）：
+          - checkpointer：图执行位置、节点间传递的小标量、控制流
+          - `AgentStateStore`：跨轮业务态（`pending_confirmation` / `last_decision`）
+          - `MemoryService`：对话历史与长期记忆
+        互不重叠；`AgentState` 上 23 个 `UntrackedValue` 字段（Step 3.5）保证业务态与大对象不进快照。
+        """
+        self.checkpointer = checkpointer if checkpointer is not None else InMemorySaver()
         self.graph = self._build()
 
     def _build(self):
         g = StateGraph(AgentState)
 
+        g.add_node("turn_reset", turn_reset)
         g.add_node("input_check", input_check)
         g.add_node("mem_load", memory_load)
         g.add_node("intent_node", intent_recognition)
@@ -55,7 +89,10 @@ class MedicalAgent:
         g.add_node("mem", memory_update)
         g.add_node("err", error_finalize)
 
-        g.set_entry_point("input_check")
+        # turn_reset 是图入口：每轮先重置语义单轮字段，
+        # 再走 input_check 的合规检查。详见 nodes.py::turn_reset 的注释。
+        g.set_entry_point("turn_reset")
+        g.add_edge("turn_reset", "input_check")
 
         def _need_error(state: dict) -> str:
             return "err" if state.get("error_msg") else "mem_load"
@@ -88,7 +125,7 @@ class MedicalAgent:
         g.add_edge("mem", END)
         g.add_edge("err", END)
 
-        return g.compile()
+        return g.compile(checkpointer=self.checkpointer)
 
     async def run(
         self,
@@ -110,7 +147,10 @@ class MedicalAgent:
             "enable_archive_link": enable_archive_link,
         }
         begin_usage_tracking()
-        out = await self.graph.ainvoke(state, config={"callbacks": None})
+        out = await self.graph.ainvoke(
+            state,
+            config={"callbacks": None, "configurable": {"thread_id": _thread_id(user_id, session_id)}},
+        )
         cache_stats = end_usage_tracking()
 
         intent_analysis_raw = out.get("intent_analysis") or {}
@@ -184,7 +224,7 @@ class MedicalAgent:
         try:
             async for mode, payload in self.graph.astream(
                 state,
-                config={"callbacks": None},
+                config={"callbacks": None, "configurable": {"thread_id": _thread_id(user_id, session_id)}},
                 stream_mode=["updates", "custom"],
             ):
                 # ---------- 节点内 writer 推来的事件 ----------

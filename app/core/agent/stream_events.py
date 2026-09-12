@@ -51,7 +51,9 @@ _SENTENCE_SPLIT_RE = re.compile(r"([。！？\n])")
 #: - `err`：错误路径单独发 error 事件，再发 progress 会让前端状态错乱
 #: - `mem`：记忆落库是收尾副作用，此时回答已经吐完，发 progress 会把前端气泡
 #:   从"回答正文"覆盖成"正在…"（app.js 的 progress 分支是直接 innerHTML 覆写）
-PROGRESS_EXCLUDED_NODES = frozenset({"err", "mem"})
+#: - `turn_reset`：轮次开头的字段重置，是内部记账而非"正在做什么"。app.js 的节点名映射
+#:   里没有它，发出去会在每轮开头把原始字符串 `turn_reset` 闪给用户。
+PROGRESS_EXCLUDED_NODES = frozenset({"err", "mem", "turn_reset"})
 
 
 def serialize(payload: dict[str, Any]) -> str:

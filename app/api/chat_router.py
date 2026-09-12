@@ -148,14 +148,16 @@ async def end_session(req: SessionEndRequest, request: Request):
         else:
             result = {"written": 0, "skipped": 0, "replaced": 0}
 
-        try:
-            from app.core.session.agent_state_store import AgentStateStore
-            rt_state = await AgentStateStore().get_state(user_id=user_id, session_id=session_id)
-            if isinstance(rt_state, dict):
-                rt_state["long_memory_flushed"] = True
-                await AgentStateStore().upsert_state(user_id=user_id, session_id=session_id, state=rt_state)
-        except Exception:
-            pass
+        # Step 3.5：此处原有一段「get_state() 读整行 → 写 long_memory_flushed=True → upsert_state() 整行回写」，
+        # 已整段删除，原因有三：
+        #   1. 该标记全仓库**零处读取**（已 grep 确认；agent_session_state 也没有对应列，它只活在 state_json 里）。
+        #   2. 它与 `nodes.py::memory_update` 构成同一行的**两个无协调写者**：后者每轮写
+        #      pending_confirmation / private_scratchpads / last_decision，一旦与本段的「读—改—写回」交错，
+        #      就会把刚写进去的新一轮 last_decision 覆盖成旧值（后写者胜）。
+        #   3. 长期记忆的幂等去重由 `batch_write_session` 的游标（source_chat_id）负责，不依赖该标记；
+        #      本次刷写结果也已通过下方 APIResponse.long_memory_result 直接返回给调用方。
+        # 删除后 `agent_session_state` 的唯一写者收敛为 memory_update 节点，为 Step 4 引入 checkpointer 扫清
+        # 「同一份业务态多个 owner」的不一致面。
 
         return APIResponse(
             data={"session_id": session_id, "long_memory_result": result},
