@@ -26,6 +26,8 @@ class DrugRecordAgent(BaseAgent):
 
         if operation_type == "add":
             result = await self._handle_add_operation(user_id, user_input, state)
+        elif operation_type == "update":
+            result = await self._handle_update_operation(user_id, user_input, state)
         elif operation_type == "query":
             result = await self._handle_query_operation(user_id, user_input, state)
         elif operation_type == "delete":
@@ -50,9 +52,13 @@ class DrugRecordAgent(BaseAgent):
         add_keywords = ["记录", "添加", "我吃了", "我服用", "我用了", "昨天", "今天", "两片", "一片", "mg", "毫克"]
         query_keywords = ["查询", "查看", "历史", "最近", "用药记录", "吃过什么药"]
         delete_keywords = ["删除", "移除", "清空"]
+        update_keywords = ["补一下", "补充", "更新", "改成", "改为", "改一下", "修改", "加上", "补上"]
 
         if any(k in t for k in delete_keywords):
             return "delete"
+        # update 优先于 add："改成/补一下/更新" 是修改已有记录，而非记录新药
+        if any(k in t for k in update_keywords):
+            return "update"
         if any(k in t for k in query_keywords):
             return "query"
         if any(k in t for k in add_keywords):
@@ -78,10 +84,26 @@ class DrugRecordAgent(BaseAgent):
                 return f"保存用药记录失败：{out.get('message', '未知错误')}"
             if not out.get("created", False):
                 return out.get("message", "用药记录已存在，无需重复添加。")
-            return (
-                f"已为您记录用药信息：{drug_info['drug_name']}，{drug_info.get('frequency','未指定')}，{drug_info.get('dosage','未指定')}。"
-                "如需修改或添加其他用药信息，请随时告诉我。"
-            )
+            # 只在有值时才展示字段，避免"布洛芬，，"的空段标点
+            info = []
+            if drug_info.get("dosage"):
+                info.append(f"剂量：{drug_info['dosage']}")
+            if drug_info.get("frequency"):
+                info.append(f"频次：{drug_info['frequency']}")
+            body = f"已为您记录用药信息：{drug_info['drug_name']}"
+            if info:
+                body += "（" + "、".join(info) + "）"
+            body += "。"
+
+            # 缺省字段提醒：补不全也能记录，但告知用户可后续补充
+            missing = []
+            if not drug_info.get("dosage"):
+                missing.append("剂量")
+            if not drug_info.get("frequency"):
+                missing.append("频次")
+            if missing:
+                body += f"（注：{'、'.join(missing)}未指定，需要补充可随时告诉我，例如'布洛芬每天两次'。）"
+            return body
         except Exception as e:
             return f"保存用药记录时出现错误：{str(e)}"
 
@@ -93,8 +115,10 @@ class DrugRecordAgent(BaseAgent):
 
             lines = ["您最近的用药记录如下："]
             for r in records:
+                # start_time 优先（含时刻），其次 start_date
+                time_display = r.get("start_time") or r.get("start_date") or "未记录"
                 lines.append(
-                    f"- {r.get('drug_name')} | 频次：{r.get('frequency') or '未指定'} | 剂量：{r.get('dosage') or '未指定'} | 时间：{r.get('start_date') or '未记录'}"
+                    f"- {r.get('drug_name')} | 频次：{r.get('frequency') or '未指定'} | 剂量：{r.get('dosage') or '未指定'} | 时间：{time_display}"
                 )
             return "\n".join(lines)
         except Exception as e:
@@ -109,6 +133,31 @@ class DrugRecordAgent(BaseAgent):
         if out.get("ok"):
             return out.get("message", "已删除记录。")
         return out.get("message", "删除失败，请稍后重试。")
+
+    # 用户输入里出现这些词才算"提到了时间"，否则不更新时间字段
+    _TIME_KEYWORDS = ["今天", "昨天", "前天", "凌晨", "早上", "上午", "中午", "下午", "晚上", "半夜", "点", "时", "月", "日"]
+
+    async def _handle_update_operation(self, user_id: str, user_input: str, state: Dict[str, Any]) -> str:
+        drug_info = await self._parse_drug_info(user_input, state)
+        drug_name = drug_info.get("drug_name", "")
+        if not drug_name:
+            return "请告诉我需要更新哪种药的记录，例如：布洛芬的剂量改成100mg"
+
+        # 只更新用户明确提到的字段：_parse_drug_info 会把缺失时间默认成"现在"，这里过滤掉
+        time_text = ""
+        if any(kw in user_input for kw in self._TIME_KEYWORDS):
+            time_text = drug_info.get("time", "")
+
+        out = await self.drug_record_tool.update_by_name(
+            user_id=user_id,
+            drug_name=drug_name,
+            dosage=drug_info.get("dosage", ""),
+            frequency=drug_info.get("frequency", ""),
+            time_text=time_text,
+        )
+        if out.get("ok"):
+            return out.get("message", "已更新。")
+        return out.get("message", "更新失败，请稍后重试。")
 
     async def _handle_general_operation(self, user_id: str, user_input: str, state: Dict[str, Any]) -> str:
         system_prompt = self.get_system_prompt()

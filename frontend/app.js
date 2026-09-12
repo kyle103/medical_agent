@@ -193,6 +193,17 @@ function updateDiagnostics(d) {
   }
 }
 
+/* ---------- 缓存命中统计（来自 done 事件） ---------- */
+function updateCacheStats(cache) {
+  if (!cache || cache.calls == null) return;
+  const rate = cache.hit_rate != null ? Math.round(cache.hit_rate * 100) + '%' : '—';
+  $('diagCacheRate').textContent = rate;
+  $('diagCacheDetail').textContent =
+    '命中 ' + (cache.cached_tokens ?? 0) + ' / 输入 ' + (cache.prompt_tokens ?? 0) +
+    ' token · ' + cache.calls + ' 次调用' +
+    (cache.hit_rate > 0.5 ? '' : '（缓存预热中，随对话推进上升）');
+}
+
 /* ---------- 输入区 ---------- */
 function autogrow() {
   const ta = $('userInput');
@@ -250,6 +261,8 @@ function leaveApp() {
   $('diagIntent').textContent = '—';
   $('diagTarget').textContent = '—';
   $('diagConfidence').textContent = '—';
+  $('diagCacheRate').textContent = '—';
+  $('diagCacheDetail').textContent = '—';
   $('diagReason').textContent = '—';
   refreshSessionDisplay();
   hide($('appView'));
@@ -265,6 +278,8 @@ function startNewChat() {
   $('diagIntent').textContent = '—';
   $('diagTarget').textContent = '—';
   $('diagConfidence').textContent = '—';
+  $('diagCacheRate').textContent = '—';
+  $('diagCacheDetail').textContent = '—';
   $('diagReason').textContent = '—';
   refreshSessionDisplay();
   closeSidebar();
@@ -329,12 +344,14 @@ async function validateSession() {
     const res = await fetch(API_BASE + '/api/v1/user/me', {
       headers: { Authorization: 'Bearer ' + tok },
     });
-    if (!res.ok) return false;
+    if (!res.ok) return false; // token 无效/过期 → 回登录页
     state.token = tok;
     state.userId = uid;
     return true;
   } catch (err) {
-    return true; // 网络错误：保留登录状态，先进入界面
+    // 网络错误（后端不可达）时不再盲目自动登录：只有验证通过才进入应用，
+    // 否则会用过期 token 进入聊天页再撞 401，造成"自动登录后又报错"的困惑。
+    return false;
   }
 }
 
@@ -356,6 +373,7 @@ function handleSSEEvent(evt, full) {
   if (evt.type === 'done') {
     if (evt.session_id) state.sessionId = evt.session_id;
     updateDiagnostics({ conversation_turns: evt.conversation_turns, needs_confirmation: evt.needs_confirmation });
+    if (evt.cache) updateCacheStats(evt.cache);
     refreshSessionDisplay();
     return { kind: 'done' };
   }
@@ -442,6 +460,7 @@ async function sendMessage() {
       if (data.session_id) state.sessionId = data.session_id;
       full.content = data.assistant_output || '暂无回复';
       updateDiagnostics(data);
+      if (data.cache_stats) updateCacheStats(data.cache_stats);
       refreshSessionDisplay();
       paint(false);
     }

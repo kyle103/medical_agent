@@ -14,7 +14,9 @@ logger = get_logger(__name__)
 
 
 class DrugRecordDeduplicator:
-    FUZZY_MATCH_THRESHOLD_DAYS = 3
+    # 精确到"同日期"去重：有了 start_time（精确时刻）后，同一药品不同日期的独立服药
+    # 记录不应被 3 天模糊窗口误判为重复。窗口=0 即 start_date 精确相等。
+    FUZZY_MATCH_THRESHOLD_DAYS = 0
 
     @staticmethod
     def compute_idempotent_key(

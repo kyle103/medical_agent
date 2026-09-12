@@ -6,17 +6,61 @@ from typing import Any
 from app.common.logger import get_logger
 from app.config.settings import settings
 from app.core.agent.intent_classifier import IntentClassifier
-from app.core.agent.llm_decision_service import LLMDecisionService
+from app.core.agent.llm_decision_service import CAPABILITY_REGISTRY, LLMDecisionService
 from app.core.agent.state import ExecutionPlan, PlanStep
 from app.core.llm.llm_service import LLMService
-from app.core.skills.drug_record_state_machine import DrugRecordPhase, DrugRecordStateMachine
 
 logger = get_logger(__name__)
 
 MAX_REPLAN = 2
 
+# ---- 跨轮冲突检测：档案用药的分层判据与容量上限 ----
+_ARCHIVE_RECENT_DAYS = 7          # 近期记录：纳入检查
+_ARCHIVE_LONGTERM_MIN_COUNT = 2   # 重复记录 ≥2 次视为长期在用，与时间无关
+_MAX_CONFLICT_DRUGS = 6           # 单次补检最多带入的药味数
+_MIN_ARCHIVE_SLOTS = 2            # 档案药至少占的坑位，避免被本轮药全挤掉
+
 AGENT_TARGETS = {"drug_record_agent", "main_qa_agent"}
 TOOL_TARGETS = {"drug_interaction", "lab_report"}
+
+
+def _describe_archive_drug(entry: dict) -> str:
+    """把档案用药渲染成带来源与时间的描述：阿司匹林（2026-09-05 记录，共 3 次）。"""
+    seg = entry.get("name", "")
+    detail = []
+    if entry.get("record_date"):
+        detail.append(f"{entry['record_date']} 记录")
+    if int(entry.get("record_count") or 1) > 1:
+        detail.append(f"共 {entry['record_count']} 次")
+    if detail:
+        seg += "（" + "，".join(detail) + "）"
+    return seg
+
+
+def _build_conflict_query(
+    names: list[str], current: list[str], archive: list[dict], truncated_current: int = 0
+) -> str:
+    """构造补检步骤的 query：**明确区分药物来源**，不让档案药与本轮药混为一谈。"""
+    parts: list[str] = []
+    if current:
+        parts.append("本轮对话中提到的药物：" + "、".join(current))
+    if archive:
+        used = [e for e in archive if e.get("name") in names]
+        if used:
+            parts.append("用户用药档案中记录的药物：" + "、".join(_describe_archive_drug(e) for e in used))
+    if not parts:
+        parts.append("涉及药物：" + "、".join(names))
+    tail = "请检查【本轮提到的药物】与【档案中记录的药物】之间的相互作用或配伍禁忌。"
+    if truncated_current > 0:
+        tail += f"（本轮药物较多，仅取前 {len(current) - truncated_current} 种）"
+    if len(names) >= _MAX_CONFLICT_DRUGS:
+        tail += f"（药物较多，本次仅核查其中 {len(names)} 种）"
+    return "。".join(parts) + "。" + tail
+
+
+def _target_type_of(target_name: str) -> str | None:
+    """按能力注册表裁定 target 是 tool 还是 agent；未知返回 None（由调用方沿用原值）。"""
+    return next((c["type"] for c in CAPABILITY_REGISTRY if c["name"] == target_name), None)
 
 # ---- dependency detection: rule patterns ----
 
@@ -248,6 +292,59 @@ def _detect_dependencies_rule(query: str, previous_queries: list[str]) -> list[s
     return [f"s{i + 1}" for i in sorted(deps)]
 
 
+# ---- target-aware 依赖修正：按「前置步骤实际会产出什么」裁决依赖边 ----
+
+# 只写库、不产出可被后续步骤引用的可读结论
+_NON_PRODUCING_TARGETS = {"drug_record_agent"}
+# 会产出药品名/推荐结论，可被「这些药/怎么样/怎么吃」类追问引用
+_PRODUCING_DRUG_TARGETS = {"drug_interaction", "main_qa_agent"}
+# 引用/追问前步结论的强信号（不含泛指代词——代词已由规则层按"依赖全部前置"处理）
+_RESULT_REF_ALL = list(dict.fromkeys(_RESULT_REF_KEYWORDS + _EVALUATION_PATTERNS + _FOLLOWUP_PATTERNS))
+# 明确在问「记录/档案有没有存下」，此时写库步骤才可被依赖
+_RECORD_REF_KEYWORDS = ["记录", "记下", "存了", "存起来", "档案里", "有没有记"]
+
+
+def _refine_deps_by_target(
+    query: str,
+    previous_queries: list[str],
+    previous_routes: list[dict | None] | None,
+    deps: list[str],
+) -> list[str]:
+    """用前置步骤的路由结果修正依赖边（target-aware）。
+
+    两层作用：
+    1. **否决**：前置步骤只写库不产出可读结论（如 drug_record_agent）时，
+       除非本句明确在问记录本身，否则移除该边——LLM 常把写库步骤当成普通前置连上。
+    2. **补强**：前置步骤会产出药名/推荐且本句出现引用/评估/细节追问信号时，确保连边。
+    """
+    if not previous_routes:
+        return deps
+
+    def _target_of(idx: int) -> str | None:
+        if 0 <= idx < len(previous_routes):
+            route = previous_routes[idx]
+            if isinstance(route, dict):
+                return route.get("target_name")
+        return None
+
+    asks_about_record = any(k in query for k in _RECORD_REF_KEYWORDS)
+    kept: set[str] = set()
+    for d in deps:
+        if not (d.startswith("s") and d[1:].isdigit()):
+            continue
+        idx = int(d[1:]) - 1
+        target = _target_of(idx)
+        if target in _NON_PRODUCING_TARGETS and not asks_about_record:
+            continue  # 否决：写库步骤不产出可引用结论
+        kept.add(d)
+
+    # 补强：前步产出药名/推荐且本句在引用或追问其结论
+    if any(k in query for k in _RESULT_REF_ALL):
+        for i in range(len(previous_queries)):
+            if _target_of(i) in _PRODUCING_DRUG_TARGETS:
+                kept.add(f"s{i + 1}")
+
+    return sorted(kept, key=lambda x: int(x[1:]))
 
 
 async def _detect_dependencies_batch(queries: list[str]) -> list[list[str]]:
@@ -377,6 +474,25 @@ _MULTI_INTENT_MARKERS = [
 ]
 
 
+# 只有「需要不同 target 处理」的域组合才算真·多意图；
+# 症状词与药物词同现并不算——它们都归 main_qa_agent，拆了反而丢上下文。
+_LAB_SIGNALS = ["化验", "检验", "指标", "血常规", "尿常规", "报告", "体检", "血糖", "血压", "血脂"]
+_ARCHIVE_SIGNALS = ["档案", "病历", "历史记录", "就诊记录", "用药记录"]
+_DRUG_SIGNALS = ["一起吃", "同服", "相互作用", "冲突", "禁忌", "配伍", "吃了", "服用", "剂量", "mg", "毫克"]
+
+
+def _has_multi_target_signals(text: str) -> bool:
+    """跨域信号检测：出现两个需要不同 target 的域 → 很可能是多意图。
+
+    比单纯"加严长度/标点阈值"更精准：不会因为「头痛吃什么药」这种单意图句
+    （症状词+药物词都归 main_qa_agent）而误判成多意图，白白多付一次 LLM 往返。
+    """
+    has_lab = any(k in text for k in _LAB_SIGNALS)
+    has_archive = any(k in text for k in _ARCHIVE_SIGNALS)
+    has_drug = any(k in text for k in _DRUG_SIGNALS)
+    return (has_lab and has_drug) or (has_lab and has_archive) or (has_archive and has_drug)
+
+
 def _is_likely_single_intent(text: str) -> bool:
     """快速规则判断一段文本是否很可能是单意图（不需要 LLM 拆分）。"""
     t = (text or "").strip()
@@ -387,6 +503,9 @@ def _is_likely_single_intent(text: str) -> bool:
         return False
     # 多个问号
     if t.count("?") + t.count("？") >= 2:
+        return False
+    # 跨域信号：需要不同工具分别处理的意图同现
+    if _has_multi_target_signals(t):
         return False
     # 短文本通常不需要拆分
     if len(t) <= 50:
@@ -429,7 +548,8 @@ async def _predict_intent_for_query(query: str) -> dict | None:
 async def _route_single_query(query: str, state: dict) -> dict:
     if _llm_enabled():
         llm_decision = LLMDecisionService()
-        llm_route = await llm_decision.classify_intent_and_route(query)
+        ctx = (state.get("decision_context") or "") if isinstance(state, dict) else ""
+        llm_route = await llm_decision.classify_intent_and_route(query, ctx=ctx)
         if llm_route and llm_route.get("confidence", 0) >= 0.5:
             logger.info("_route_single_query: LLM route query=%s -> %s", query[:20], llm_route.get("target_name"))
             return llm_route
@@ -464,71 +584,50 @@ class PlannerAgent:
             return state
 
         user_input = state.get("user_input", "")
+        ctx = state.get("decision_context") or ""
 
-        sm_data = (state.get("private_scratchpads") or {}).get("drug_record_sm")
-        if sm_data:
-            sm = DrugRecordStateMachine.from_dict(sm_data)
-            if sm.is_active():
-                state["execution_plan"] = ExecutionPlan(
-                    steps=[PlanStep(
-                        step_id="s1",
-                        query=user_input,
-                        target_type="agent",
-                        target_name="drug_record_agent",
-                        intent_type="drug_record_sm",
-                        depends_on=[],
-                        execution_strategy="serial",
-                    )],
-                    strategy="single",
-                    conflict_resolution_policy="none",
-                )
-                state["plan_phase"] = "planning"
-                logger.info("PlannerAgent plan: active state machine -> drug_record_agent")
-                return state
+        # ---- 1. 是否需要拆分：规则预检 ∪ intent 节点的零成本多意图标记 ----
+        # 规则漏判（把多意图判成单意图）原本不可逆——跳过拆分后没有任何环节再检查；
+        # 这里用 intent 那次必调 LLM 顺带产出的 is_multi_intent 兜底，不增加任何往返。
+        rule_split = _split_user_queries_rule(user_input)
+        rule_says_multi = len(rule_split) > 1 or not _is_likely_single_intent(user_input)
+        llm_says_multi = bool(state.get("is_multi_intent"))
 
-        sub_queries = await _split_user_queries(user_input)
+        if not (rule_says_multi or llm_says_multi):
+            logger.info("generate_plan: single-intent path, skip split LLM (rule_multi=%s)", rule_says_multi)
+            return await self._build_single_step_plan(state, user_input)
+
+        # ---- 2. 多意图：一次调用同时完成 拆分 + 路由 + 依赖 ----
+        llm_decision = LLMDecisionService()
+        sub_queries, routes, deps = await llm_decision.split_route_deps(user_input, ctx=ctx)
+
+        # ---- 3. 一次调用失败 → 回落旧的「拆分 + 批量路由」两步链路 ----
+        if not sub_queries:
+            logger.info("generate_plan: split_route_deps unavailable, fallback to two-step")
+            sub_queries = await _split_user_queries(user_input)
+            if len(sub_queries) <= 1:
+                return await self._build_single_step_plan(state, user_input)
+            routes, deps = await llm_decision.batch_route_with_deps(sub_queries, ctx=ctx)
 
         if len(sub_queries) <= 1:
-            existing_route = state.get("intent_analysis")
-            if existing_route and isinstance(existing_route, dict) and existing_route.get("target_name"):
-                route_result = existing_route
-                logger.info("generate_plan: reuse intent_analysis route=%s", route_result.get("target_name"))
-            else:
-                route_result = await _route_single_query(user_input, state)
-            state["intent_analysis"] = route_result
-            state["target_agent"] = route_result["target_name"]
-            state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))
+            return await self._build_single_step_plan(state, user_input)
 
-            plan = ExecutionPlan(
-                steps=[PlanStep(
-                    step_id="s1",
-                    query=user_input,
-                    target_type=route_result.get("target_type", "agent"),
-                    target_name=route_result["target_name"],
-                    intent_type=route_result.get("intent_type", "general"),
-                    depends_on=[],
-                    execution_strategy="serial",
-                )],
-                strategy="single",
-                conflict_resolution_policy="evidence_priority",
-            )
-        else:
-            llm_decision = LLMDecisionService()
-            batch_routes, llm_deps = await llm_decision.batch_route_with_deps(sub_queries)
+        # ---- 4. 依赖 = 规则 ∪ LLM，再按前置步骤的 target 修正（可加边也可减边）----
+        dep_results: list[list[str]] = []
+        for i, q in enumerate(sub_queries):
+            rule_deps = _detect_dependencies_rule(q, sub_queries[:i])
+            llm_deps_i = (deps[i] if deps and i < len(deps) else []) or []
+            combined = sorted(set(rule_deps) | set(llm_deps_i), key=lambda x: int(x[1:]))
+            dep_results.append(_refine_deps_by_target(q, sub_queries[:i], routes, combined))
 
-            # 规则层依赖检测 + LLM 结果合并（并集），减少一次 LLM 往返
-            rule_deps: list[list[str]] = []
-            for i, q in enumerate(sub_queries):
-                rule_deps.append(_detect_dependencies_rule(q, sub_queries[:i]))
-            dep_results: list[list[str]] = []
-            for i in range(len(sub_queries)):
-                combined = list(set(rule_deps[i]) | set(llm_deps[i]))
-                dep_results.append(sorted(combined, key=lambda x: int(x[1:])))
-
-            steps = []
-            for i, q in enumerate(sub_queries):
-                route_result = batch_routes[i]
-                if not route_result or not isinstance(route_result, dict):
+        steps = []
+        for i, q in enumerate(sub_queries):
+            route_result = routes[i] if routes and i < len(routes) else None
+            if not route_result or not isinstance(route_result, dict):
+                # 首个子查询优先复用 intent 节点在完整原句上算出的路由，语义最接近
+                if i == 0 and isinstance(state.get("intent_analysis"), dict) and state["intent_analysis"].get("target_name"):
+                    route_result = state["intent_analysis"]
+                else:
                     route_result = _route_by_intent_and_text({
                         "user_input": q,
                         "intent": _quick_intent_classify(q),
@@ -536,108 +635,417 @@ class PlannerAgent:
                         "extract_entities": {},
                     })
 
-                deps = dep_results[i]
+            step_deps = dep_results[i]
+            steps.append(PlanStep(
+                step_id=f"s{i + 1}",
+                query=q,
+                target_type=route_result.get("target_type", "agent"),
+                target_name=route_result.get("target_name", "main_qa_agent"),
+                intent_type=route_result.get("intent_type", "general"),
+                depends_on=step_deps,
+                execution_strategy="parallel" if not step_deps else "serial",
+            ))
 
-                steps.append(PlanStep(
-                    step_id=f"s{i + 1}",
-                    query=q,
-                    target_type=route_result.get("target_type", "agent"),
-                    target_name=route_result["target_name"],
-                    intent_type=route_result.get("intent_type", "general"),
-                    depends_on=deps,
-                    execution_strategy="parallel" if not deps else "serial",
-                ))
-
-            plan = ExecutionPlan(
-                steps=steps,
-                strategy="topological",
-                conflict_resolution_policy="evidence_priority",
-            )
+        plan = ExecutionPlan(
+            steps=steps,
+            strategy="topological",
+            conflict_resolution_policy="evidence_priority",
+        )
 
         state["execution_plan"] = plan
         state["plan_phase"] = "planning"
-        logger.info("PlannerAgent plan=%s", json.dumps({k: v for k, v in plan.items()}, ensure_ascii=False, default=str))
+        # 主链路仍取首个步骤的路由，供下游 target_agent 等字段使用
+        state.setdefault("target_agent", steps[0]["target_name"])
+        logger.info("PlannerAgent multi-step plan steps=%s deps=%s", len(steps), [s["depends_on"] for s in steps])
+        return state
+
+    async def _build_single_step_plan(self, state: dict, user_input: str) -> dict:
+        """单意图路径：复用 intent 节点的路由结果，0 次额外 LLM 往返。"""
+        existing_route = state.get("intent_analysis")
+        if isinstance(existing_route, dict) and existing_route.get("target_name"):
+            route_result = existing_route
+        else:
+            route_result = await _route_single_query(user_input, state)
+
+        state["intent_analysis"] = route_result
+        state["target_agent"] = route_result["target_name"]
+        state["intent_type"] = route_result.get("intent_type", state.get("intent", "general"))
+
+        state["execution_plan"] = ExecutionPlan(
+            steps=[PlanStep(
+                step_id="s1",
+                query=user_input,
+                target_type=route_result.get("target_type", "agent"),
+                target_name=route_result["target_name"],
+                intent_type=route_result.get("intent_type", "general"),
+                depends_on=[],
+                execution_strategy="serial",
+            )],
+            strategy="single",
+            conflict_resolution_policy="evidence_priority",
+        )
+        state["plan_phase"] = "planning"
         return state
 
     async def evaluate_for_replan(self, state: dict) -> dict:
+        """只做【判定 + 上下文收集】，不再自行拼接重试计划。
+
+        生成修正计划的职责交给 build_revised_plan：失败原因多样，需要判断是
+        原样重试、改写问题还是换执行体，直接重放对确定性失败（药名匹配不到、
+        参数缺失）必然再次失败。
+        """
         results = state.get("plan_step_results", {})
         plan = state.get("execution_plan", {})
         steps = plan.get("steps", [])
         replan_count = state.get("replan_count", 0)
 
         if replan_count >= MAX_REPLAN:
-            logger.info("PlannerAgent evaluate: replan_count=%s >= MAX_REPLAN, skip", replan_count)
             state["needs_replan"] = False
             return state
 
-        failed_steps = []
-        for step_id, result in results.items():
-            if isinstance(result, dict) and result.get("error_msg"):
-                failed_steps.append(step_id)
+        step_ids = [s["step_id"] for s in steps]
+        failed_ids = [
+            sid for sid in step_ids
+            if isinstance(results.get(sid), dict) and results[sid].get("error_msg")
+        ]
 
-        if not failed_steps:
-            cross_conflict = self._detect_cross_step_conflict(results, steps)
-            if cross_conflict:
-                state["needs_replan"] = True
-                state["replan_reason"] = f"跨步骤药物冲突: {cross_conflict}"
-                state["replan_count"] = replan_count + 1
-                logger.info("PlannerAgent evaluate: needs_replan=True reason=%s", cross_conflict)
+        # 1) 有失败步骤 → 收集失败原因与已完成结果，交给 LLM 重规划
+        if failed_ids:
+            if len(failed_ids) >= len(steps):
+                # 全失败：重试拿不到任何新信息
+                state["needs_replan"] = False
                 return state
-
-            state["needs_replan"] = False
-            return state
-
-        if len(failed_steps) == len(steps):
-            state["needs_replan"] = False
-            logger.info("PlannerAgent evaluate: all steps failed, no replan")
-            return state
-
-        retry_steps = []
-        for step in steps:
-            if step["step_id"] in failed_steps:
-                retry_steps.append(PlanStep(
-                    step_id=f"{step['step_id']}_retry",
-                    query=step["query"],
-                    target_type=step.get("target_type", "agent"),
-                    target_name=step.get("target_name", ""),
-                    intent_type=step.get("intent_type", "general"),
-                    depends_on=[],
-                    execution_strategy="serial",
-                ))
-
-        if retry_steps:
-            existing_steps = [s for s in steps if s["step_id"] not in failed_steps]
-            revised_steps = existing_steps + retry_steps
-            state["execution_plan"] = ExecutionPlan(
-                steps=revised_steps,
-                strategy="topological",
-                conflict_resolution_policy="evidence_priority",
-            )
+            state["replan_context"] = await self._build_replan_context(steps, results, failed_ids)
             state["needs_replan"] = True
-            state["replan_reason"] = f"重试失败步骤: {failed_steps}"
+            state["replan_reason"] = f"步骤执行失败: {failed_ids}"
             state["replan_count"] = replan_count + 1
-            logger.info("PlannerAgent evaluate: needs_replan=True retry_steps=%s", [s["step_id"] for s in retry_steps])
+            return state
+
+        # 2) 无失败 → 检查跨步骤冲突（含跨轮：本轮药物 vs 档案中在服药物）
+        conflict = await self._detect_cross_step_conflict(results, steps, state)
+        if conflict:
+            state["cross_step_conflict"] = conflict
+            if conflict.get("needs_check"):
+                state["needs_replan"] = True
+                state["replan_reason"] = conflict.get("reason", "")
+                state["replan_count"] = replan_count + 1
+                return state
+            # 某一步已经查出冲突：不需要再补一步，结论留给下游呈现
+            state["needs_replan"] = False
             return state
 
         state["needs_replan"] = False
         return state
 
-    def _detect_cross_step_conflict(self, results: dict, steps: list[PlanStep]) -> str | None:
-        drug_names_from_steps: list[str] = []
+    async def _build_replan_context(
+        self, steps: list[PlanStep], results: dict, failed_ids: list[str]
+    ) -> dict:
+        """组装给重规划 LLM 的上下文：失败步骤的错误 + 已完成步骤的结果摘要。"""
+        failed_desc: list[dict] = []
+        completed_desc: list[dict] = []
+
+        for step in steps:
+            sid = step["step_id"]
+            result = results.get(sid) or {}
+            if not isinstance(result, dict):
+                continue
+            if sid in failed_ids:
+                failed_desc.append({
+                    "step_id": sid,
+                    "query": step.get("query", ""),
+                    "target_name": step.get("target_name", ""),
+                    "error_msg": str(result.get("error_msg", "未知错误"))[:300],
+                })
+                continue
+            summary = result.get("final_response") or ""
+            if not summary and isinstance(result.get("tool_result"), dict):
+                summary = json.dumps(result["tool_result"], ensure_ascii=False)
+            completed_desc.append({
+                "step_id": sid,
+                "query": step.get("query", ""),
+                "target_name": step.get("target_name", ""),
+                "summary": str(summary)[:400],
+            })
+
+        return {"failed_steps": failed_desc, "completed_steps": completed_desc}
+
+    async def build_revised_plan(self, state: dict) -> dict:
+        """重规划分支：按「能确定处理就确定处理」的原则分两条路。
+
+        - 跨步骤冲突 → **确定性补一个 drug_interaction 步骤**（不调 LLM，
+          因为该做什么完全确定，交给 LLM 只会增加延迟与不确定性）
+        - 步骤失败 → **交给 LLM 判断**（retry/rewrite/reroute/drop），
+          失败原因多样，需要判断换策略；LLM 不可用时回落为原样重放
+        """
+        plan = state.get("execution_plan") or {}
+        steps = list(plan.get("steps", []))
+        attempts = int(state.get("replan_count", 1) or 1)
+
+        # --- 路径 A：跨步骤冲突 → 确定性补步 ---
+        conflict = state.get("cross_step_conflict") or {}
+        if conflict.get("needs_check"):
+            current = [n for n in (conflict.get("current_drugs") or []) if n]
+            archive = [e for e in (conflict.get("archive_drugs") or []) if isinstance(e, dict) and e.get("name")]
+            # 本轮药物优先，同时给档案药预留坑位——本轮药很多时若直接截断，
+            # 档案药会被静默丢掉，跨轮检测等于失效
+            archive_names_all = [e["name"] for e in archive]
+            slots_for_archive = 0
+            if archive_names_all:
+                slots_for_archive = min(
+                    max(_MIN_ARCHIVE_SLOTS, _MAX_CONFLICT_DRUGS - len(current)),
+                    _MAX_CONFLICT_DRUGS,
+                )
+            current_cap = _MAX_CONFLICT_DRUGS - slots_for_archive
+            names = current[:current_cap] + archive_names_all[:slots_for_archive]
+            truncated_current = len(current) - min(len(current), current_cap)
+            if len(names) >= 2:
+                steps.append(PlanStep(
+                    step_id=f"s_conflict_check_{attempts}",
+                    query=_build_conflict_query(names, current, archive, truncated_current),
+                    target_type="tool",
+                    target_name="drug_interaction",
+                    intent_type="drug_conflict",
+                    depends_on=[],
+                    execution_strategy="serial",
+                ))
+                state["execution_plan"] = ExecutionPlan(
+                    steps=steps, strategy="topological", conflict_resolution_policy="evidence_priority",
+                )
+                state["plan_phase"] = "planning"
+                logger.info("build_revised_plan: append conflict-check step drugs=%s", names)
+                return state
+
+        # --- 路径 B：步骤失败 → LLM 修正 ---
+        replan_ctx = state.get("replan_context") or {}
+        failed = replan_ctx.get("failed_steps") or []
+        if not failed:
+            return state
+
+        by_id = {s["step_id"]: s for s in steps if isinstance(s, dict)}
+        actions: list[dict] | None = None
+        if _llm_enabled():
+            try:
+                actions = await LLMDecisionService().replan_failed_steps(
+                    original_input=state.get("original_user_input") or state.get("user_input", ""),
+                    failed_steps=failed,
+                    completed_steps=replan_ctx.get("completed_steps") or [],
+                    ctx=state.get("decision_context") or "",
+                )
+            except Exception as e:
+                logger.warning("build_revised_plan: replan LLM failed: %s", e)
+                actions = None
+
+        new_steps: list[PlanStep] = []
+        if actions:
+            for a in actions:
+                orig = by_id.get(a.get("step_id", ""))
+                if not orig:
+                    continue
+                action = a.get("action", "retry")
+                if action == "drop":
+                    logger.info("build_revised_plan: drop step=%s reason=%s", a.get("step_id"), a.get("reason"))
+                    continue
+                # rewrite 用 LLM 改写后的问句；reroute 换目标；retry 保持原样
+                query = a.get("query") or orig.get("query", "")
+                if action != "rewrite":
+                    query = orig.get("query", "")
+                target_name = a.get("target_name") or orig.get("target_name", "")
+                new_steps.append(PlanStep(
+                    step_id=f"{a['step_id']}_r{attempts}",
+                    query=query,
+                    target_type=_target_type_of(target_name) or orig.get("target_type", "agent"),
+                    target_name=target_name,
+                    intent_type=orig.get("intent_type", "general"),
+                    depends_on=[],   # 重试步骤改串行，避免再被上游结果污染
+                    execution_strategy="serial",
+                ))
+        else:
+            # 回落：LLM 不可用/输出非法时保持原样重放，保证仍有一次重试机会
+            for f in failed:
+                orig = by_id.get(f.get("step_id", ""))
+                if not orig:
+                    continue
+                new_steps.append(PlanStep(
+                    step_id=f"{f['step_id']}_r{attempts}",
+                    query=orig.get("query", ""),
+                    target_type=orig.get("target_type", "agent"),
+                    target_name=orig.get("target_name", ""),
+                    intent_type=orig.get("intent_type", "general"),
+                    depends_on=[],
+                    execution_strategy="serial",
+                ))
+
+        if new_steps:
+            state["execution_plan"] = ExecutionPlan(
+                steps=steps + new_steps,
+                strategy="topological",
+                conflict_resolution_policy="evidence_priority",
+            )
+            state["plan_phase"] = "planning"
+            logger.info("build_revised_plan: llm_actions=%s new_steps=%s", bool(actions), len(new_steps))
+        return state
+
+    async def _detect_cross_step_conflict(
+        self, results: dict, steps: list[PlanStep], state: dict | None = None
+    ) -> dict | None:
+        """跨步骤 / 跨轮药物冲突检测。
+
+        - **跨步骤（同轮）**：药名分散在多个步骤、且没有任何一步查过相互作用
+        - **跨轮（跨会话）**：本轮提到的药 + 用户档案中在服的药物。
+          现实里用户极少一句话说完所有在吃的药，跨轮累积才是常态，
+          所以这条比同轮检测更有价值。
+
+        返回:
+          {"needs_check": True, ...}  —— 需要补一个 drug_interaction 步骤
+          {"needs_check": False, ...} —— 某步已查出冲突，结论交给下游呈现
+          None —— 无冲突迹象
+        """
+        drug_names: list[str] = []
+        already_checked_detail: list[dict] = []
+        archive_drugs: list[str] = []
+
         for step in steps:
             result = results.get(step["step_id"], {})
             if not isinstance(result, dict):
                 continue
+
             if step.get("intent_type") == "drug_conflict":
                 interactions = (result.get("tool_result") or {}).get("interaction_result", [])
                 if interactions:
-                    return f"步骤{step['step_id']}已检测到药物冲突"
-            if step.get("intent_type") == "drug_record":
-                entities = result.get("extract_entities") or {}
-                if isinstance(entities, dict):
-                    names = entities.get("drug_name_list", [])
-                    drug_names_from_steps.extend(names)
+                    already_checked_detail.extend(interactions)
 
-        if len(drug_names_from_steps) >= 2:
-            return f"多步骤涉及药物{drug_names_from_steps}，需补充冲突检查"
+            # 结构化来源优先（已经是标准名）
+            entities = result.get("extract_entities") or {}
+            if isinstance(entities, dict):
+                names = entities.get("drug_name_list", [])
+                if isinstance(names, list):
+                    drug_names.extend(str(n).strip() for n in names if str(n).strip())
+
+            tool_result = result.get("tool_result") or {}
+            if isinstance(tool_result, dict):
+                for d in tool_result.get("drug_list", []) or []:
+                    if isinstance(d, dict) and d.get("match_status") == "匹配成功":
+                        dn = str(d.get("drug_name", "")).strip()
+                        if dn:
+                            drug_names.append(dn)
+
+        # 结构化没拿到足够的药名时，用实体词典扫回答文本补召回
+        if len(drug_names) < 2:
+            drug_names.extend(await self._scan_drug_names_from_responses(results, steps))
+
+        # 跨轮：纳入档案中在服的药物（仅在本轮确实涉及用药/冲突意图时才查，避免无谓开销与噪音）
+        archive_entries: list[dict] = []
+        if state and self._should_include_archive(steps):
+            archive_entries = await self._load_archive_drugs(state)
+
+        current_names = list(dict.fromkeys(drug_names))
+        # 档案药只保留本轮未提及的，避免自比对；分层判据见 _load_archive_drugs
+        ongoing = [e for e in archive_entries if e.get("ongoing") and e["name"] not in current_names]
+        stale = [e for e in archive_entries if not e.get("ongoing") and e["name"] not in current_names]
+        archive_names = [e["name"] for e in ongoing]
+        all_names = current_names + archive_names
+
+        if already_checked_detail:
+            return {
+                "needs_check": False,
+                "current_drugs": current_names,
+                "archive_drugs": ongoing,
+                "stale_drugs": stale,
+                "drug_names": all_names,
+                "detail": already_checked_detail,
+                "reason": "已在计划内步骤中检测到药物相互作用",
+            }
+
+        if len(all_names) >= 2:
+            scope = "本轮药物 + 档案记录药物" if archive_names else "本轮多步骤"
+            return {
+                "needs_check": True,
+                "current_drugs": current_names,
+                "archive_drugs": ongoing,
+                "stale_drugs": stale,
+                "drug_names": all_names,
+                "reason": f"{scope}涉及药物{all_names}，但没有任何步骤做过相互作用检查",
+            }
         return None
+
+    @staticmethod
+    def _should_include_archive(steps: list[PlanStep]) -> bool:
+        """只有本轮确实在【记录用药】或【查冲突】时才纳入档案药物。
+
+        否则用户随便问一句"感冒吃什么药"都会被拉去和历史用药做全组合比对，
+        既浪费一次查表又容易产生无关告警。
+        """
+        trigger_types = {"drug_record", "drug_conflict"}
+        for s in steps:
+            if isinstance(s, dict) and (
+                s.get("intent_type") in trigger_types or s.get("target_name") == "drug_record_agent"
+            ):
+                return True
+        return False
+
+    @staticmethod
+    async def _load_archive_drugs(state: dict) -> list[dict]:
+        """读取用户档案中的用药记录（已归一），并按分层判据标注是否在服。
+
+        不用单一时间窗——药物相互作用的风险窗口不是固定的几天：
+        长期在服药（降压/降糖/抗凝）与新药的冲突恰恰是跨周跨月才出现。
+        判据：
+        - 硬排除：end_date 已过（在 SQL 层完成）
+        - ongoing：最近 _ARCHIVE_RECENT_DAYS 天内记录 **或** 该药被记录过 ≥2 次
+          （重复记录 = 长期在用，这个判据与时间无关，最可靠）
+        """
+        user_id = state.get("user_id")
+        if not user_id:
+            return []
+        try:
+            from app.db.crud.archive_crud import ArchiveCRUD
+            entries = await ArchiveCRUD().list_drug_entries(user_id=user_id)
+        except Exception as e:
+            logger.debug("cross-turn archive drugs load skipped: %s", e)
+            return []
+        if not entries:
+            return []
+
+        names = [e["name"] for e in entries]
+        try:
+            from app.core.rag.drug_knowledge_service import DrugKnowledgeService
+            canon = await DrugKnowledgeService().canonicalize_names(names)
+        except Exception as e:
+            logger.debug("cross-turn archive drugs normalize skipped: %s", e)
+            canon = names
+
+        out: list[dict] = []
+        seen: set[str] = set()
+        for entry, cname in zip(entries, canon):
+            name = cname or entry["name"]
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            days = entry.get("days_ago")
+            count = int(entry.get("record_count") or 1)
+            ongoing = (days is not None and days <= _ARCHIVE_RECENT_DAYS) or count >= _ARCHIVE_LONGTERM_MIN_COUNT
+            out.append({**entry, "name": name, "ongoing": ongoing})
+        return out
+
+    @staticmethod
+    async def _scan_drug_names_from_responses(results: dict, steps: list[PlanStep]) -> list[str]:
+        """用实体词典从步骤回答文本中扫药名（应对推荐类步骤没回写结构化实体的情况）。"""
+        texts = []
+        for step in steps:
+            result = results.get(step["step_id"], {})
+            if isinstance(result, dict):
+                resp = result.get("final_response")
+                if resp:
+                    texts.append(str(resp)[:1200])
+        if not texts:
+            return []
+        try:
+            from app.core.rag.drug_knowledge_service import DrugKnowledgeService
+            svc = DrugKnowledgeService()
+            found: list[str] = []
+            for t in texts:
+                found.extend(await svc.resolve_text(t))
+            return found
+        except Exception as e:
+            logger.debug("cross-step drug scan skipped: %s", e)
+            return []

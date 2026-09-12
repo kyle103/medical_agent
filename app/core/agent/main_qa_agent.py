@@ -114,6 +114,9 @@ class MainQAAgent(BaseAgent):
 4. 不涉及疾病诊断或治疗建议
 """
                 response = await self._call_llm(user_prompt, system_prompt, state)
+            elif recall.get("source") == "long_memory":
+                names = [it.get("drug_name", "") for it in recall.get("records", []) if it.get("drug_name")]
+                response = f"根据我们的交流记忆，您提到过：{', '.join(names)}。这些是对话中提及的用药信息，尚未正式录入档案。如需记录，请告诉我具体的药品名称、用法用量，我帮您添加到档案中。"
             elif recall.get("source") == "history":
                 names = [it.get("drug_name", "") for it in recall.get("records", []) if it.get("drug_name")]
                 response = f"在我们的对话中，您提到过以下药品：{', '.join(names)}。这些信息尚未写入您的用药档案，如需记录，请告诉我具体的用药信息，我将帮您添加到档案中。"

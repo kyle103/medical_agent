@@ -4,6 +4,7 @@ import re
 import time
 
 from app.common.logger import get_logger
+from app.core.rag.drug_knowledge_service import DrugKnowledgeService
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
 from app.core.tools.lab_report_tool import LabReportTool
@@ -67,6 +68,26 @@ class ToolExecutor:
                 dep_names = DrugEntityExtractor.extract_drug_candidates(combined_text, max_items=10)
                 if dep_names:
                     drug_names = dep_names
+
+        # 词典归一 + 前向最大匹配补充：先把已有候选归一到标准名（避免“泰诺”与
+        # “对乙酰氨基酚”这类同药异名重复进查询），再补回规则漏掉的无分隔符药名
+        try:
+            svc = DrugKnowledgeService()
+            merged: list[str] = await svc.canonicalize_names(drug_names)
+            seen = set(merged)
+            source_texts = [user_input]
+            step_context = state.get("step_context") or {}
+            source_texts.extend(step_context.get("dep_summaries") or [])
+            for src in source_texts:
+                if not src or not src.strip():
+                    continue
+                for canon in await svc.resolve_text(src):
+                    if canon not in seen:
+                        seen.add(canon)
+                        merged.append(canon)
+            drug_names = merged[:12]
+        except Exception:  # noqa: BLE001 - 词典为增强层，失败沿用既有候选
+            pass
 
         if not drug_names:
             return {

@@ -33,8 +33,8 @@ MedAgent 是一个面向医疗健康领域的智能问答系统，核心设计�
 │              LangGraph 多 Agent 工作流                 │
 │                                                      │
 │  input_check → memory_load → intent_recognition      │
-│       → entity_extraction → knowledge_retrieve       │
-│       → plan → execute → reconcile → response_plan   │
+│       → knowledge_retrieve → plan → execute          │
+│       → reconcile → response_plan                    │
 │       → llm_generate → output_check → commit         │
 │       → memory_update                                │
 └──────────────────────────────────────────────────────┘

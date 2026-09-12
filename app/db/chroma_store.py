@@ -75,6 +75,32 @@ def _get_collection(collection_name: str):
     return client.get_or_create_collection(name=collection_name)
 
 
+def has_collection(collection_name: str) -> bool:
+    """集合是否已存在（不创建）。用于按用户隔离时判断是否已有记忆。"""
+    client = get_chroma_client()
+    try:
+        existing = client.list_collections()
+        names = {getattr(c, "name", str(c)) for c in existing}
+        return collection_name in names
+    except Exception:
+        try:
+            client.get_collection(name=collection_name)
+            return True
+        except Exception:
+            return False
+
+
+def delete_long_memory(*, collection_name: str, where: dict) -> int:
+    """按 metadata 过滤删除（merge-then-replace / 覆盖时用）。返回删除条数。"""
+    if not has_collection(collection_name):
+        return 0
+    col = _get_collection(collection_name)
+    res = col.delete(where=where)
+    if isinstance(res, dict) and res.get("deleted") is not None:
+        return int(res.get("deleted", 0))
+    return 0
+
+
 def parse_metadata(raw: Any) -> dict[str, Any]:
     """兼容旧逻辑：dict（含 json_meta）或 JSON 字符串均可解析。"""
     if isinstance(raw, dict):

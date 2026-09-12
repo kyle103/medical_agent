@@ -12,13 +12,18 @@ from app.common.exceptions import ServiceUnavailableException
 from app.core.llm.llm_service import LLMService
 from app.core.prompts import Prompts
 from app.core.llm.embedding_service import EmbeddingService
+from app.db.database import get_sessionmaker
 from app.db.chroma_store import (
+    delete_long_memory,
     ensure_long_memory_collection,
     get_chroma_client,
+    has_collection,
     insert_long_memory,
     parse_metadata,
     vector_search,
 )
+from app.core.session.agent_state_store import AgentStateStore
+from app.core.tools.drug_record_tool import DrugRecordTool
 
 logger = get_logger(__name__)
 
@@ -31,19 +36,20 @@ MIN_CONFIDENCE = 0.7  # 最低置信度阈值
 class LongMemoryItem:
     """长期记忆条目。
 
-    为后续“进阶版”（结构化 facts 表、可更新/可删除、多类型召回）预留字段。
+    source_chat_id: 来源对话消息 id，用于"每条消息只提取一次"的游标去重。
     """
 
     memory_id: str
     text: str
-    memory_type: str = "fact"  # fact/preference/profile/summary
+    memory_type: str = "fact"  # fact/preference/profile/summary/drug_event
     source: str = "chat"
     session_id: str | None = None
+    source_chat_id: int | None = None
     created_at: int = 0
     confidence: float = 1.0  # 记忆置信度，0-1之间
 
     def to_metadata(self, *, user_id: str) -> dict:
-        return {
+        meta = {
             "user_id": user_id,
             "memory_id": self.memory_id,
             "memory_type": self.memory_type,
@@ -52,6 +58,9 @@ class LongMemoryItem:
             "created_at": int(self.created_at or 0),
             "confidence": float(self.confidence or 0),
         }
+        if self.source_chat_id is not None:
+            meta["source_chat_id"] = int(self.source_chat_id)
+        return meta
 
 
 class LongMemoryService:
@@ -68,6 +77,10 @@ class LongMemoryService:
         self.llm_service = LLMService()
         self.embedder = EmbeddingService()
 
+    def _coll(self, user_id: str) -> str:
+        """按用户物理隔离的长期记忆集合名（每用户一个集合，杜绝跨用户泄露）。"""
+        return f"user_long_memory_{user_id}"
+
     def _escape_expr_value(self, text: str) -> str:
         return (text or "").replace("\\", "\\\\").replace('"', '\\"')
 
@@ -82,9 +95,10 @@ class LongMemoryService:
             # 初始化失败也视为不可用（不阻塞主流程）
             return False
 
-    async def extract_candidates(self, *, user_input: str) -> list[LongMemoryItem]:
+    async def extract_candidates(self, *, user_input: str, source_chat_id: int | None = None) -> list[LongMemoryItem]:
         """从用户输入中抽取可写入长期记忆的候选条目（LLM版），包括用药事件。
 
+        source_chat_id: 来源消息 id，供游标去重使用。
         策略：
         - 使用LLM提取记忆，提高准确性和覆盖面
         - 增加置信度评估，过滤低质量记忆
@@ -97,17 +111,21 @@ class LongMemoryService:
             return []
 
         now = int(time.time())
-        
+
         # 尝试使用LLM提取记忆
         try:
             llm_items = await self._extract_with_llm(user_input=text)
             # 过滤低置信度记忆
             filtered_items = [item for item in llm_items if item.confidence >= MIN_CONFIDENCE]
             # 控制数量
-            return filtered_items[:3]
+            items = filtered_items[:3]
         except Exception:
             # LLM提取失败时，回退到规则提取
-            return self._extract_with_rules(user_input=text)
+            items = self._extract_with_rules(user_input=text)
+
+        for it in items:
+            it.source_chat_id = source_chat_id
+        return items
 
     async def _extract_with_llm(self, *, user_input: str) -> list[LongMemoryItem]:
         """使用LLM提取记忆。"""
@@ -278,15 +296,16 @@ class LongMemoryService:
             if not embeddings:
                 return 0
 
+            coll = self._coll(user_id)
             ensure_long_memory_collection(
-                collection_name=self.collection_name,
+                collection_name=coll,
                 dim=len(embeddings[0]),
             )
 
             json_metas = [json.dumps(m, ensure_ascii=False) for m in metas]
             user_ids = [user_id for _ in ids]
             insert_long_memory(
-                collection_name=self.collection_name,
+                collection_name=coll,
                 ids=ids,
                 user_ids=user_ids,
                 documents=docs,
@@ -331,16 +350,19 @@ class LongMemoryService:
 
     async def _is_duplicate(self, *, user_id: str, text: str) -> bool:
         """检查文本是否与已有记忆重复。"""
-        
+
         try:
             vectors = await self.embedder.embed_documents([text])
             if not vectors:
                 return False
 
+            coll = self._coll(user_id)
+            if not has_collection(coll):
+                return False
             expr_user = self._escape_expr_value(user_id)
             try:
                 hits = vector_search(
-                    collection_name=self.collection_name,
+                    collection_name=coll,
                     query_vectors=vectors,
                     limit=5,
                     output_fields=["document", "metadata", "user_id"],
@@ -443,10 +465,13 @@ class LongMemoryService:
         if not vectors:
             return []
 
+        coll = self._coll(user_id)
+        if not has_collection(coll):
+            return []
         expr_user = self._escape_expr_value(user_id)
         try:
             hits = vector_search(
-                collection_name=self.collection_name,
+                collection_name=coll,
                 query_vectors=vectors,
                 limit=max(1, int(top_k)),
                 output_fields=["document", "metadata", "user_id"],
@@ -468,6 +493,7 @@ class LongMemoryService:
                     memory_type=str(md.get("memory_type") or "fact"),
                     source=str(md.get("source") or "chat"),
                     session_id=str(md.get("session_id") or "") or None,
+                    source_chat_id=int(md["source_chat_id"]) if md.get("source_chat_id") is not None else None,
                     created_at=int(md.get("created_at") or 0),
                     confidence=float(md.get("confidence") or 1.0),
                 )
@@ -490,6 +516,9 @@ class LongMemoryService:
             return []
 
         conflicts = []
+        coll = self._coll(user_id)
+        if not has_collection(coll):
+            return []
         for item in items:
             try:
                 vectors = await self.embedder.embed_documents([item.text])
@@ -499,7 +528,7 @@ class LongMemoryService:
                 expr_user = self._escape_expr_value(user_id)
                 try:
                     hits = vector_search(
-                        collection_name=self.collection_name,
+                        collection_name=coll,
                         query_vectors=vectors,
                         limit=5,
                         output_fields=["document", "metadata", "user_id"],
@@ -581,11 +610,30 @@ class LongMemoryService:
         return "skip"
 
     async def write_with_conflict_check(self, *, user_id: str, session_id: str, items: list[LongMemoryItem], source: str = "chat") -> dict:
-        """带冲突检测的写入，返回写入结果摘要。"""
+        """带冲突检测的写入，返回写入结果摘要。
+
+        分流：
+        - drug_event 类型 → SQL（UserDrugRecord，结构化档案）
+        - 其余（fact/profile/preference/summary）→ 向量库（带冲突检测）
+        """
         if not items:
             return {"written": 0, "skipped": 0, "replaced": 0}
 
-        conflicts = await self.detect_conflicts(user_id=user_id, items=items)
+        # 1) drug_event 走 SQL，不进向量库
+        drug_events = [it for it in items if it.memory_type == "drug_event"]
+        others = [it for it in items if it.memory_type != "drug_event"]
+
+        result = {"written": 0, "skipped": 0, "replaced": 0}
+        if drug_events:
+            sql_written = await self._write_drug_events_to_sql(user_id=user_id, items=drug_events)
+            result["written"] += sql_written
+            result["skipped"] += len(drug_events) - sql_written
+
+        if not others:
+            return result
+
+        # 2) 其余类型走向量库（冲突检测）
+        conflicts = await self.detect_conflicts(user_id=user_id, items=others)
         conflict_map = {}
         for c in conflicts:
             conflict_map[c["candidate"].memory_id] = c
@@ -594,7 +642,7 @@ class LongMemoryService:
         skipped = 0
         replaced = 0
 
-        for item in items:
+        for item in others:
             conflict = conflict_map.get(item.memory_id)
             if not conflict:
                 to_write.append(item)
@@ -616,37 +664,145 @@ class LongMemoryService:
             item.source = source
 
         written = await self.add_items(user_id=user_id, session_id=session_id, items=to_write)
+        result["written"] += written
+        result["skipped"] += skipped
+        result["replaced"] += replaced
 
         logger.info(
             "long_memory write_with_conflict_check: source=%s total=%d written=%d skipped=%d replaced=%d",
-            source, len(items), written, skipped, replaced,
+            source, len(items), result["written"], result["skipped"], result["replaced"],
         )
-        return {"written": written, "skipped": skipped, "replaced": replaced}
+        return result
+
+    async def _write_drug_events_to_sql(self, *, user_id: str, items: list[LongMemoryItem]) -> int:
+        """drug_event 写入 SQL（UserDrugRecord），用 add_record 的幂等去重防重复。"""
+        written = 0
+        tool = DrugRecordTool()
+        for it in items:
+            original = (it.text or "").replace("用户", "我")
+            drug_name = await self._extract_drug_name(original)
+            if not drug_name:
+                continue
+            time_text = self._extract_time_text(original)
+            try:
+                res = await tool.add_record(user_id=user_id, drug_name=drug_name, time_text=time_text)
+                if res.get("created"):
+                    written += 1
+                    logger.info("drug_event -> SQL: user=%s drug=%s", user_id, drug_name)
+                elif not res.get("ok"):
+                    logger.warning("drug_event SQL write failed: %s", res.get("message"))
+            except Exception as e:
+                logger.error("drug_event SQL write error: %s", e)
+        return written
+
+    @staticmethod
+    def _extract_time_text(text: str) -> str:
+        """从用药事件文本粗提取时间描述（"今天"/"昨天下午"等），无则空串。"""
+        for kw in ["今天晚上", "昨天晚上", "今天中午", "昨天下午", "昨天早上", "前天晚上",
+                   "前天", "昨天", "今天", "晚上", "下午", "上午", "早上", "中午", "凌晨", "半夜"]:
+            if kw in (text or ""):
+                return kw
+        return ""
+
+    async def _extract_drug_name(self, text: str) -> str | None:
+        """从用药事件文本提取药名。
+
+        正则优先（确定性，避开"用户"里的"用"误匹配），LLM 兜底（处理非"吃了X"句式）。
+        """
+        m = re.search(r"(?:吃了|服用了|服用过|使用了|使用过|服用)([^，。！？\s：:，]{1,12})", text)
+        if m:
+            candidate = m.group(1).strip().strip("了")
+            if 2 <= len(candidate) <= 24:
+                return candidate
+        try:
+            from app.core.agent.llm_decision_service import LLMDecisionService
+            name = await LLMDecisionService().extract_drug_name_from_event(text)
+            if name:
+                return name
+        except Exception:
+            pass
+        return None
+
+    async def get_cursor(self, *, user_id: str, session_id: str) -> int:
+        from sqlalchemy import select
+        from app.db.models import UserLongMemoryCursor
+        async_session = get_sessionmaker()
+        async with async_session() as session:
+            res = await session.execute(
+                select(UserLongMemoryCursor.chat_id)
+                .where(
+                    UserLongMemoryCursor.user_id == user_id,
+                    UserLongMemoryCursor.session_id == session_id,
+                )
+                .order_by(UserLongMemoryCursor.id.desc())
+                .limit(1)
+            )
+            return res.scalar() or 0
+
+    async def update_cursor(self, *, user_id: str, session_id: str, chat_id: int) -> None:
+        from sqlalchemy import select
+        from app.db.models import UserLongMemoryCursor
+        if not user_id or not session_id or not chat_id:
+            return
+        async_session = get_sessionmaker()
+        async with async_session() as session:
+            res = await session.execute(
+                select(UserLongMemoryCursor)
+                .where(
+                    UserLongMemoryCursor.user_id == user_id,
+                    UserLongMemoryCursor.session_id == session_id,
+                )
+                .order_by(UserLongMemoryCursor.id.desc())
+                .limit(1)
+            )
+            rec = res.scalar_one_or_none()
+            if rec:
+                rec.chat_id = max(rec.chat_id, int(chat_id))
+            else:
+                session.add(
+                    UserLongMemoryCursor(user_id=user_id, session_id=session_id, chat_id=int(chat_id))
+                )
+            await session.commit()
 
     async def batch_write_session(self, *, user_id: str, session_id: str, history: list[dict]) -> dict:
         """批量写入一个 session 的对话历史到长期记忆。
 
-        用于对话结束后批量提取并写入，避免每轮都触发写入。
+        游标去重：只处理 cursor 之后的新消息（flush/compress/session_end 多时机幂等）。
         """
-        if not history:
+        if not history or not user_id:
             return {"written": 0, "skipped": 0, "replaced": 0}
 
+        cursor = await self.get_cursor(user_id=user_id, session_id=session_id)
+
         all_items: list[LongMemoryItem] = []
+        max_chat_id = cursor
         for msg in history:
             if msg.get("role") != "user":
                 continue
-            content = msg.get("content", "").strip()
+            content = str(msg.get("content", "")).strip()
             if not content:
                 continue
+            chat_id = msg.get("chat_id")
+            if chat_id is not None and int(chat_id) <= cursor:
+                continue  # 该消息已提取过
             try:
-                items = await self.extract_candidates(user_input=content)
+                items = await self.extract_candidates(
+                    user_input=content,
+                    source_chat_id=int(chat_id) if chat_id is not None else None,
+                )
                 all_items.extend(items)
             except Exception as e:
                 logger.error("batch_write_session extract failed for msg: %s", e)
+            if chat_id is not None:
+                max_chat_id = max(max_chat_id, int(chat_id))
 
         if not all_items:
             return {"written": 0, "skipped": 0, "replaced": 0}
 
-        return await self.write_with_conflict_check(
+        result = await self.write_with_conflict_check(
             user_id=user_id, session_id=session_id, items=all_items, source="session_end"
         )
+
+        if max_chat_id > cursor:
+            await self.update_cursor(user_id=user_id, session_id=session_id, chat_id=max_chat_id)
+        return result

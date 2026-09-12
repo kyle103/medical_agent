@@ -56,6 +56,10 @@
 
 * { box-sizing: border-box; }
 html, body { overflow-x: clip; }
+
+/* hidden 属性必须始终生效：元素若有 display:grid/flex 会覆盖 UA 默认样式，导致
+   登录页/聊天页同时显示（上下堆叠）的 bug。用 !important 兜底。 */
+[hidden] { display: none !important; }
 body {
   margin: 0;
   font-family: var(--font-sans);
@@ -414,6 +418,16 @@ code { font-family: var(--font-mono); }
 .send-btn:active:not(:disabled) { transform: translateY(1px); }
 .send-btn:disabled { opacity: 0.4; cursor: not-allowed; }
 .composer-hint { margin: var(--sp-2) 0 0; text-align: center; font-size: var(--fs-xs); color: var(--c-faint); }
+.disclaimer-bar {
+  width: min(720px, 100%);
+  margin: var(--sp-3) auto 0;
+  padding-top: var(--sp-2);
+  border-top: 1px solid var(--c-rule-soft);
+  font-size: var(--fs-xs);
+  color: var(--c-muted);
+  text-align: center;
+  line-height: 1.5;
+}
 
 /* ================= 响应式 ================= */
 @media (max-width: 920px) {

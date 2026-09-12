@@ -97,8 +97,8 @@ class Settings(BaseSettings):
     ACCESS_TOKEN_EXPIRE_MINUTES: int = 1440
     ALLOWED_HOSTS: str = Field(default="{{允许的跨域域名列表}}")
 
-    # Compliance（医疗 agent 安全底线：免责声明默认开启）
-    FORCE_DISCLAIMER: bool = True
+    # Compliance（免责声明由前端界面永久展示，不再逐条回复追加）
+    FORCE_DISCLAIMER: bool = False
     ENABLE_INPUT_CHECK: bool = False
     ENABLE_OUTPUT_CHECK: bool = False
 

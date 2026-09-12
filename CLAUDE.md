@@ -40,9 +40,9 @@ python -m rag_comprehensive_assessment.run evaluate --retrieval-mode hybrid --re
 The entire system is a **LangGraph StateGraph** pipeline defined in [app/core/agent/workflow.py](app/core/agent/workflow.py). `MedicalAgent` compiles a graph with these nodes in order:
 
 ```
-input_check → memory_load → intent_recognition → entity_extraction
+input_check → memory_load → intent_recognition
 → knowledge_retrieve → plan → execute → reconcile → response_plan
-→ llm_generate → output_check → commit → memory_update
+→ llm_generate → fact_check → output_check → commit → memory_update
 ```
 
 - `plan` generates an execution plan (which agent/tool to call). If the result is insufficient, `execute` can loop back to `plan` (max 2 replans).

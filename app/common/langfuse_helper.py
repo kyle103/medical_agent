@@ -48,6 +48,8 @@ def track_llm_call(
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    cache_miss_tokens: Optional[int] = None,
     success: bool = True,
     error: Optional[str] = None,
 ) -> None:
@@ -74,6 +76,8 @@ def track_llm_call(
                 "input_tokens": input_tokens,
                 "output_tokens": output_tokens,
                 "total_tokens": total_tokens,
+                "cached_tokens": cached_tokens,
+                "cache_miss_tokens": cache_miss_tokens,
                 "success": success,
                 "error": error,
             },

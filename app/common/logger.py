@@ -74,6 +74,8 @@ def log_llm_call(
     input_tokens: Optional[int] = None,
     output_tokens: Optional[int] = None,
     total_tokens: Optional[int] = None,
+    cached_tokens: Optional[int] = None,
+    cache_miss_tokens: Optional[int] = None,
     latency_ms: int = 0,
     success: bool = True,
     error: Optional[str] = None,
@@ -87,6 +89,10 @@ def log_llm_call(
         token_info += f" out_tok={output_tokens}"
     if total_tokens is not None:
         token_info += f" total_tok={total_tokens}"
+    if cached_tokens is not None:
+        token_info += f" cached={cached_tokens}"
+    if cache_miss_tokens is not None:
+        token_info += f" miss={cache_miss_tokens}"
     status = "OK" if success else f"FAIL({error})"
     _logger.info(
         "[LLM] %s | model=%s prompt_len=%d sys_prompt_len=%d resp_len=%d%s | latency=%dms | %s",

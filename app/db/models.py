@@ -52,6 +52,40 @@ class UserChatRecord(Base):
     )
 
 
+class UserChatSummary(Base):
+    """会话摘要（MemoryService 懒更新：按 covered_chat_id 增量维护）。"""
+
+    __tablename__ = "user_chat_summary"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), ForeignKey("user_info.user_id"))
+    session_id: Mapped[str] = mapped_column(String(64))
+    summary: Mapped[str] = mapped_column(Text)
+    covered_chat_id: Mapped[int] = mapped_column(Integer, default=0)  # 已总结到的最大 chat_id
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("idx_chat_summary", "user_id", "session_id"),)
+
+
+class UserLongMemoryCursor(Base):
+    """长期记忆批量写入游标（记录某会话已提取到哪条 chat_id，避免重复提取）。"""
+
+    __tablename__ = "user_long_memory_cursor"
+
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    user_id: Mapped[str] = mapped_column(String(64), ForeignKey("user_info.user_id"))
+    session_id: Mapped[str] = mapped_column(String(64))
+    chat_id: Mapped[int] = mapped_column(Integer, default=0)
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+
+    __table_args__ = (Index("idx_lm_cursor", "user_id", "session_id"),)
+
+
 class AgentSessionState(Base):
     __tablename__ = "agent_session_state"
 
@@ -115,7 +149,9 @@ class UserDrugRecord(Base):
     drug_alias: Mapped[str | None] = mapped_column(String(256), nullable=True)
     dosage: Mapped[str | None] = mapped_column(String(64), nullable=True)
     frequency: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    start_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
+    start_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)          # 服药日期（年月日）
+    start_time: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)      # 服药时间（年月日+时刻，如 2026-08-08 20:00）
+    intake_time_text: Mapped[str | None] = mapped_column(String(64), nullable=True)   # 原始时间描述（"昨天晚上八点"）
     end_date: Mapped[datetime | None] = mapped_column(Date, nullable=True)
     prescribe_hospital: Mapped[str | None] = mapped_column(String(128), nullable=True)
     remark: Mapped[str | None] = mapped_column(Text, nullable=True)

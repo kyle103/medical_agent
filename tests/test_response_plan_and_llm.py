@@ -7,8 +7,8 @@ from app.main import app
 
 
 @pytest.mark.asyncio
-async def test_response_plan_injects_memory_without_keywords():
-    """不依赖“你还记得/总结”等关键词：当用户追问很短且含指代时应自动注入会话记忆并走 LLM 生成链路。
+async def test_response_strategy_injects_memory_without_keywords():
+    """覆盖已并入 build_generation_prompt 的生成策略（原 response_plan 节点）：不依赖“你还记得/总结”等关键词：当用户追问很短且含指代时应自动注入会话记忆并走 LLM 生成链路。
 
     这里不要求真实 external LLM 可用：如果未配置 LLM，会回退到 tool_result 文本。
     重点验证：接口不 500、且状态机能写入记忆，第二轮可以利用记忆注入（从输出可见性角度做弱断言）。

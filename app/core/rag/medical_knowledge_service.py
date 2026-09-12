@@ -38,10 +38,18 @@ class MedicalKnowledgeService:
         out: dict[str, Any] = {}
 
         try:
-            drug_candidates = DrugEntityExtractor.extract_drug_candidates(text, max_items=6)
+            # 规则候选 + 词典前向最大匹配候选合并：规则找回分隔清晰的药名，
+            # 词典补足“无分隔符/带剂型粘连”与别名归一（见 entity_dictionary）。
+            svc = DrugKnowledgeService()
+            rule_candidates = DrugEntityExtractor.extract_drug_candidates(text, max_items=6)
+            try:
+                dict_names = await svc.resolve_text(text)
+            except Exception:  # noqa: BLE001 - 词典失败不影响规则链路
+                dict_names = []
+            drug_candidates = list(dict.fromkeys([*rule_candidates, *dict_names]))[:8]
             if drug_candidates:
                 drug_start = time.perf_counter()
-                matched_drugs = await DrugKnowledgeService().match_drugs(drug_candidates)
+                matched_drugs = await svc.match_drugs(drug_candidates)
                 drug_ms = int((time.perf_counter() - drug_start) * 1000)
                 out["drug_knowledge"] = [m for m in matched_drugs if isinstance(m, dict)]
                 log_rag_retrieval(
