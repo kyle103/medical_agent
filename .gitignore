@@ -31,7 +31,9 @@ ENV/
 .pytest_cache/
 
 # tests
-/tests/
+# 注意：这里**不再**忽略 /tests/。测试用例属于代码的一部分，必须入库；
+# 这条规则曾经吞掉过新增的测试文件（git add -A 不报错、只是静静不带），
+# 排查成本远高于收益。临时脚本请放 /scripts/ 或加 --ignored 自查。
 # IDE
 .vscode/
 # rag_tests
@@ -42,5 +44,10 @@ ENV/
 
 # 旧版本 / 设计文档归档
 /old_version/
+
+# 能力探针 / 冒烟脚本的产出报告（可重跑再生，不入库；脚本本身在 /scripts/ 保留）
+# 不锚定根目录：scripts/ 下也会有产出（如 smoke_stream_writer_result.json）
+probe_*_result.json
+smoke_*_result.json
 
 CLAUDE.md

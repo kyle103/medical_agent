@@ -21,6 +21,16 @@ async def _lifespan(app: FastAPI):
         await reload_entity_dictionary()
     except Exception as e:  # noqa: BLE001
         logger.warning("entity_dictionary preload failed (will lazy-load): %s", e)
+
+    # 预热结构化输出档位：提前确定模型是否真的下发 schema，并把生效档位打进启动日志。
+    # 目的是让"模型换了导致约束静默失效"这件事在启动时就可见，而不是等到线上解析失败。
+    try:
+        from app.core.llm.structured_output import warmup as warmup_structured_output
+
+        await warmup_structured_output()
+    except Exception as e:  # noqa: BLE001
+        logger.warning("structured_output warmup failed (will lazy-resolve): %s", e)
+
     yield
 
 

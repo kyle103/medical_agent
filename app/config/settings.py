@@ -31,6 +31,23 @@ class Settings(BaseSettings):
     LLM_MODEL_NAME: str = Field(default="{{LLM模型名称}}")
     LLM_TEMPERATURE: float = 0.1
     LLM_MAX_TOKENS: int = 2048
+    # 结构化输出档位：auto / json_schema / json_object
+    # auto = 启动时用探针判定模型是否真的下发 schema，并缓存结果（见 app/core/llm/structured_output.py）
+    # 背景：response_format 的支持度**逐模型快照不同**（如 deepseek-v4-flash 支持、deepseek-v4-flash-0731 不支持），
+    #       写死任一种都会在换模型时静默失效。客户端 Pydantic 校验始终是不变量。
+    STRUCTURED_OUTPUT_MODE: str = Field(default="auto")
+    # 结构化决策调用是否关闭「思考」（下发给 extra_body.enable_thinking=False）。
+    # 本模型的 max_tokens **同时覆盖推理与答案**：推理吃满预算时 content 返回空串
+    # （finish_reason='length'、completion_tokens 顶格），调用方只能看到"失败"。
+    # 实测（2026-09-12，deepseek-v4-flash，split_route_deps，各 3 次）：
+    #   思考开启 → 0/3 成功、墙钟 20~27s、且模型会把 intent_type 的取值写进 intent，
+    #              导致大量路由被业务层判非法后**静默丢弃**；
+    #   思考关闭 → 3/3 成功、墙钟 2.9~4.5s、0 条丢弃。
+    # 结构化决策是"照 schema 填字段"的任务，推理只带来延迟与字段串味。
+    # 只作用于 chat_completion_json（决策/抽取），不影响 chat_completion 的答案生成——
+    # 后者仍保留推理能力。
+    # 若换到不接受该参数的模型/网关，置 false 即可整体回退。
+    LLM_DISABLE_THINKING: bool = True
     # 对低意图/不确定意图场景的额外 LLM 增强（意图识别专用）
     INTENT_LLM_ENABLED: bool = True
     INTENT_LLM_TIMEOUT_S: float = 10.2

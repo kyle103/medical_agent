@@ -1,18 +1,12 @@
 from __future__ import annotations
 
-import asyncio
-import json
-import re
-import time
 from collections.abc import AsyncGenerator
 from datetime import datetime
 
 from langgraph.graph import END, StateGraph
 
 from app.common.exceptions import UserAuthException
-from app.common.logger import get_logger, log_node_execution
 from app.core.agent.nodes import (
-    build_generation_prompt,
     commit_gate,
     error_finalize,
     execute_node,
@@ -28,30 +22,16 @@ from app.core.agent.nodes import (
     reconcile_node,
 )
 from app.core.agent.state import AgentState
-from app.core.llm.llm_service import LLMService, begin_usage_tracking, end_usage_tracking
-from app.core.skills.medication_confirmation_skill import MedicationConfirmationSkill
-
-logger = get_logger(__name__)
-
-_SENTENCE_SPLIT_RE = re.compile(r'([。！？\n])')
-
-
-def _intent_event(state: dict) -> str:
-    return json.dumps({"type": "intent", "intent": state.get("intent", "general")}, ensure_ascii=False) + "\n"
-
-
-def _chunk_event(content: str) -> str:
-    return json.dumps({"type": "chunk", "content": content}, ensure_ascii=False) + "\n"
-
-
-def _log_stream_node(branch: str, t0: float, **detail) -> None:
-    """流式路径的节点级打点（原先整条流式链路都没有 log_node_execution）。"""
-    log_node_execution(
-        node_name="llm_generate_stream",
-        latency_ms=int((time.perf_counter() - t0) * 1000),
-        branch=branch,
-        **detail,
-    )
+from app.core.agent.stream_events import (
+    PROGRESS_EXCLUDED_NODES,
+    chunk_payload,
+    done_payload,
+    error_payload,
+    intent_payload,
+    progress_payload,
+    serialize,
+)
+from app.core.llm.llm_service import begin_usage_tracking, end_usage_tracking
 
 
 class MedicalAgent:
@@ -166,6 +146,19 @@ class MedicalAgent:
         user_input: str,
         enable_archive_link: bool,
     ) -> AsyncGenerator[str, None]:
+        """流式执行。
+
+        **唯一执行定义就是 `_build()` 那张图。**（Step 3 合并前，本方法手写了一份节点
+        序列 `pre_llm_nodes` 和一份自建的 replan while 循环，与图定义并存：加节点要改两处，
+        `MAX_REPLAN` 维护在三处，且流式路径不走 `error_finalize`。）
+
+        两个通道：
+          - `updates` → 节点完成 → progress / 完整版 intent / error
+          - `custom`  → `llm_generate` 节点内经 writer 推来的 chunk / 精简 intent
+
+        事件契约见 `app/core/agent/stream_events.py`；
+        前端消费点 `frontend/app.js::handleSSEEvent`。
+        """
         if not user_id:
             raise UserAuthException("未授权")
 
@@ -178,150 +171,78 @@ class MedicalAgent:
         }
         begin_usage_tracking()
 
-        pre_llm_nodes = [
-            ("input_check", input_check),
-            ("mem_load", memory_load),
-            ("intent_node", intent_recognition),
-            ("knowledge", knowledge_retrieve),
-            ("plan", plan_node),
-        ]
+        final_state: dict = dict(state)
+        # 首个 chunk 之后就不再发 progress：前端对 progress 是直接覆写气泡 innerHTML，
+        # 在回答已经开始渲染后再发会把回答正文盖成"正在…"（已有 chunk 仍累积在 JS 侧，
+        # 下一次 paint 会恢复，但视觉上会闪一下）。
+        answer_started = False
+        had_error = False
+        # commit 之后立刻收口用量统计，见下方注释；用于兜住错误/异常路径的泄漏
+        usage_closed = False
+        cache_stats = None
 
-        for node_name, node_fn in pre_llm_nodes:
-            yield json.dumps({"type": "progress", "node": node_name}, ensure_ascii=False) + "\n"
-            state = await node_fn(state)
-            if state.get("error_msg"):
-                yield json.dumps({"type": "error", "content": state.get("error_msg", "处理失败")}, ensure_ascii=False) + "\n"
-                return
-            if node_name == "intent_node":
-                ia = state.get("intent_analysis") or {}
-                yield json.dumps({
-                    "type": "intent",
-                    "intent": state.get("intent", "general"),
-                    "intent_analysis": {
-                        "intent_type": ia.get("intent_type", state.get("intent_type", "")),
-                        "confidence": ia.get("confidence", state.get("intent_confidence", 0.0)),
-                        "reason": ia.get("reason", state.get("intent_reason", "")),
-                        "target_name": ia.get("target_name", state.get("target_agent", "")),
-                    },
-                    "target_agent": state.get("target_agent", ""),
-                }, ensure_ascii=False) + "\n"
-
-        max_replan = 2
-        replan_count = 0
-        while True:
-            state = await execute_node(state)
-            if state.get("needs_replan") and replan_count < max_replan:
-                state = await plan_node(state)
-                replan_count += 1
-                continue
-            break
-
-        state = await reconcile_node(state)
-
-        _t_llm = time.perf_counter()
-        plan = build_generation_prompt(state)
-        branch = plan["branch"]
-
-        if branch == "multi_intent":
-            yield _intent_event(state)
-            full_response = ""
-            try:
-                async for chunk in LLMService().chat_completion_stream(
-                    prompt=plan["user_prompt"],
-                    system_prompt=plan["system_prompt"],
-                    timeout_s=15.0,
-                    max_tokens=1200,
-                ):
-                    full_response += chunk
-                    yield _chunk_event(chunk)
-            except Exception as e:
-                logger.error("stream multi-intent llm_generate failed: %s", e)
-                full_response = "\n\n".join([f"## {s}" for s in (state.get("reconciled_sections") or [])])
-                yield _chunk_event(full_response)
-
-            state["llm_output"] = full_response
-            state["final_response"] = full_response
-            _log_stream_node("multi_intent", _t_llm, section_count=len(state.get("reconciled_sections") or []))
-
-        elif branch == "final_response":
-            state["llm_output"] = state["final_response"]
-            yield _intent_event(state)
-            # 上游已产出完整文本，按句切分模拟流式，避免一次性吐出一大段
-            sentence_buf = ""
-            for part in _SENTENCE_SPLIT_RE.split(state["final_response"]):
-                sentence_buf += part
-                if len(sentence_buf) >= 12 or part in ("。", "！", "？", "\n"):
-                    if sentence_buf.strip():
-                        yield _chunk_event(sentence_buf)
-                    sentence_buf = ""
-            if sentence_buf.strip():
-                yield _chunk_event(sentence_buf)
-            _log_stream_node("final_response", _t_llm, shortcut="final_response")
-
-        elif branch == "confirmation":
-            # 与改造前一致：该分支不发 intent 事件
-            state["llm_output"] = state["confirmation_message"]
-            yield _chunk_event(state["confirmation_message"])
-            _log_stream_node("confirmation", _t_llm, shortcut="confirmation")
-
-        elif branch == "drug_confirmation":
-            # 与改造前一致：该分支不发 intent 事件
-            state.setdefault("skill_ctx", {})
-            state["skill_ctx"]["medication_confirmation"] = {"candidate_events": state["candidate_drug_events"]}
-            confirm_msg = MedicationConfirmationSkill().build_confirmation_message(state["candidate_drug_events"])
-            state["llm_output"] = confirm_msg
-            yield _chunk_event(confirm_msg)
-            _log_stream_node("drug_confirmation", _t_llm, shortcut="drug_confirmation")
-
-        else:
-            yield _intent_event(state)
-            full_response = ""
-            try:
-                async for chunk in LLMService().chat_completion_stream(
-                    prompt=plan["user_prompt"],
-                    system_prompt=plan["system_prompt"],
-                    timeout_s=15.0,
-                    max_tokens=900,
-                ):
-                    full_response += chunk
-                    yield _chunk_event(chunk)
-            except Exception as e:
-                logger.error("stream llm_generate failed: %s", e)
-                full_response = plan["content"]
-                yield _chunk_event(full_response)
-
-            state["llm_output"] = full_response
-            _log_stream_node("normal", _t_llm, mode=plan["mode"])
-
-        state = await fact_check(state)
-        state = await output_check_and_disclaimer(state)
-        state = await commit_gate(state)
-
-        disclaimer_text = state.get("final_response", "")
-        llm_output = state.get("llm_output", "")
-        if disclaimer_text and llm_output and disclaimer_text != llm_output:
-            added = disclaimer_text[len(llm_output):]
-            if added.strip():
-                yield json.dumps({"type": "chunk", "content": added}, ensure_ascii=False) + "\n"
-
-        # 本轮同步 LLM 调用的缓存命中统计（异步记忆提取不计入，它在 done 之后运行）
-        cache_stats = end_usage_tracking()
-
-        asyncio.create_task(self._async_memory_update(state))
-
-        history = state.get("history") or []
-        yield json.dumps({
-            "type": "done",
-            "session_id": session_id,
-            "intent": state.get("intent", "general"),
-            "needs_confirmation": bool(state.get("needs_confirmation")),
-            "conversation_turns": len(history) // 2 if history else 0,
-            "cache": cache_stats,
-        }, ensure_ascii=False) + "\n"
-
-    @staticmethod
-    async def _async_memory_update(state: dict):
         try:
-            await memory_update(state)
-        except Exception as e:
-            logger.error("async memory_update failed: %s", e)
+            async for mode, payload in self.graph.astream(
+                state,
+                config={"callbacks": None},
+                stream_mode=["updates", "custom"],
+            ):
+                # ---------- 节点内 writer 推来的事件 ----------
+                if mode == "custom":
+                    if isinstance(payload, dict):
+                        if payload.get("type") == "chunk":
+                            answer_started = True
+                        yield serialize(payload)
+                    continue
+
+                # ---------- 节点完成事件 ----------
+                if not isinstance(payload, dict):
+                    continue
+
+                for node_name, node_output in payload.items():
+                    if node_name == "__interrupt__":
+                        continue
+                    if isinstance(node_output, dict):
+                        final_state.update(node_output)
+
+                    if node_name not in PROGRESS_EXCLUDED_NODES and not answer_started:
+                        yield serialize(progress_payload(node_name))
+
+                    # 意图节点完成 → 完整版 intent（带 intent_analysis / target_agent）。
+                    # 开始生成前 `llm_generate` 内还会再发一次精简版，这是改造前的既有行为。
+                    if node_name == "intent_node":
+                        yield serialize(intent_payload(final_state, full=True))
+
+                    # 输出闸门完成 → 补发免责声明等"新增尾段"。
+                    # 改造前是拿 final_response 减去 llm_output 求增量，此处保持一致。
+                    if node_name == "out":
+                        disclaimer_text = final_state.get("final_response", "")
+                        llm_output = final_state.get("llm_output", "")
+                        if disclaimer_text and llm_output and disclaimer_text != llm_output:
+                            added = disclaimer_text[len(llm_output):]
+                            if added.strip():
+                                yield serialize(chunk_payload(added))
+
+                    # commit 完成 → 收口本轮 LLM 用量统计。
+                    # **必须在 mem 之前取**：mem 会 create_task 触发长期记忆写入（内含 LLM 调用），
+                    # 晚取会把那次调用的 token 算进本轮的缓存命中统计。
+                    if node_name == "commit":
+                        cache_stats = end_usage_tracking()
+                        usage_closed = True
+
+                    # `err` 节点运行 == 图判定的**终态**错误。用图自己的信号，而不是到处查
+                    # error_msg：execute 内部也会写 error_msg，但图并不会因此短路（照常
+                    # 走 reconcile → llm 出答案），那种情况不该给用户报错。
+                    if node_name == "err":
+                        yield serialize(error_payload(final_state.get("error_msg") or "处理失败"))
+                        had_error = True
+        finally:
+            # 错误/异常/consumer 提前关闭时也要收口，否则用量计数会泄漏到下一个请求
+            if not usage_closed:
+                end_usage_tracking()
+
+        if had_error:
+            # 与改造前一致：错误路径不发 done
+            return
+
+        yield serialize(done_payload(session_id=session_id, state=final_state, cache_stats=cache_stats))

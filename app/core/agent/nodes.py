@@ -6,12 +6,14 @@ import re
 import time
 from datetime import date, datetime
 
+from langgraph.types import StreamWriter
 from sqlalchemy import and_, select
 
 from app.common.logger import get_logger, log_node_execution, log_step_execution
 from app.core.agent.intent_classifier import IntentClassifier, IntentResult
 from app.core.agent.planner_agent import PlannerAgent
 from app.core.agent.state import ExecutionPlan, PlanStep
+from app.core.agent.stream_events import chunk_payload, intent_payload, iter_sentence_chunks
 from app.core.agent.tool_executor import ToolExecutor
 from app.core.llm.llm_service import LLMService
 from app.core.memory.long_memory_service import LongMemoryService
@@ -1347,29 +1349,59 @@ def build_generation_prompt(state: dict) -> dict:
     }
 
 
-async def llm_generate(state: dict) -> dict:
+#: 生成阶段的 LLM 超时（秒）。改造前非流式用 12s、流式用 15s；合并后统一取 15s
+#: （即流式路径的既有值）——保住流式契约不变，非流式那边略微变宽松、更少误超时。
+_GEN_TIMEOUT_S = 15.0
+
+
+def _noop_writer(_payload: dict) -> None:
+    """writer 兜底：直接调用本节点（不经图执行）时使用。
+
+    图执行时 langgraph 按「参数名 == writer 且注解 == StreamWriter」自动注入真 writer；
+    未开启 `stream_mode="custom"` 时它注入的也是等价的 no-op，所以这里不会崩。
+    """
+    return None
+
+
+async def llm_generate(state: dict, writer: StreamWriter = _noop_writer) -> dict:
+    """生成阶段节点。
+
+    Step 3 起本节点**同时承担推流职责**：真正的 token 由这里经 writer 推给
+    `run_stream` 的 `stream_mode="custom"` 通道。这是能消除 `workflow.py` 手搓
+    run_stream 的前提——改造前该节点调的是 `chat_completion`（非流式），节点内不产
+    token，所以流式只能绕开图另写一份节点序列。
+
+    约束：**参数名必须是 `writer`、注解必须是 `StreamWriter`**，否则 langgraph 不注入
+    （见 `langgraph/utils/runnable.py::KWARGS_CONFIG_KEYS`）；名字错了不会报错，
+    只会静默退化成非流式，属于最难查的一类故障。
+
+    state 写回语义与改造前**完全一致**（`llm_output` / `final_response` / `skill_ctx`）。
+    """
     _t0 = time.perf_counter()
 
     plan = build_generation_prompt(state)
     branch = plan["branch"]
 
     if branch == "multi_intent":
+        # 与改造前一致：开吐之前先发一次精简 intent（不带 intent_analysis）
+        writer(intent_payload(state, full=False))
+        full_response = ""
         try:
-            llm = LLMService()
-            raw = await llm.chat_completion(
+            async for tok in LLMService().chat_completion_stream(
                 prompt=plan["user_prompt"],
                 system_prompt=plan["system_prompt"],
-                timeout_s=15.0,
+                timeout_s=_GEN_TIMEOUT_S,
                 max_tokens=1200,
-            )
-            state["llm_output"] = (raw or "").strip()
-            state["final_response"] = state["llm_output"]
+            ):
+                full_response += tok
+                writer(chunk_payload(tok))
         except Exception as e:
             logger.error("llm_generate multi-intent failed: %s", e)
-            combined = "\n\n".join([f"## {s}" for s in (state.get("reconciled_sections") or [])])
-            state["llm_output"] = combined
-            state["final_response"] = combined
+            full_response = "\n\n".join([f"## {s}" for s in (state.get("reconciled_sections") or [])])
+            writer(chunk_payload(full_response))
 
+        state["llm_output"] = full_response
+        state["final_response"] = full_response
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(
             node_name="llm_generate",
@@ -1381,40 +1413,61 @@ async def llm_generate(state: dict) -> dict:
 
     if branch == "final_response":
         state["llm_output"] = state["final_response"]
+        # 上游已产出完整文本，按句切分模拟流式，避免一次性吐出一大段
+        writer(intent_payload(state, full=False))
+        for piece in iter_sentence_chunks(state["final_response"]):
+            writer(chunk_payload(piece))
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="final_response")
         return state
 
     if branch == "confirmation":
+        # 与改造前一致：该分支不发 intent 事件
         state["llm_output"] = state["confirmation_message"]
+        writer(chunk_payload(state["confirmation_message"]))
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="confirmation")
         return state
 
     if branch == "drug_confirmation":
-        skill = MedicationConfirmationSkill()
-        state["llm_output"] = skill.build_confirmation_message(state["candidate_drug_events"])
+        # 与改造前一致：该分支不发 intent 事件
         state.setdefault("skill_ctx", {})
         state["skill_ctx"]["medication_confirmation"] = {"candidate_events": state["candidate_drug_events"]}
+        confirm_msg = MedicationConfirmationSkill().build_confirmation_message(state["candidate_drug_events"])
+        state["llm_output"] = confirm_msg
+        writer(chunk_payload(confirm_msg))
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="drug_confirmation")
         return state
 
     mode = plan["mode"] or "llm_chat"
+    writer(intent_payload(state, full=False))
+    full_response = ""
     try:
-        llm = LLMService()
-        raw = await llm.chat_completion(
+        async for tok in LLMService().chat_completion_stream(
             prompt=plan["user_prompt"],
             system_prompt=plan["system_prompt"],
-            stream=False,
-            timeout_s=12.0,
+            timeout_s=_GEN_TIMEOUT_S,
             max_tokens=900,
-        )
-        state["llm_output"] = (raw or "").strip() or plan["content"]
+        ):
+            full_response += tok
+            writer(chunk_payload(tok))
     except Exception as e:
-        logger.error(f"LLM生成失败: {e}")
-        state["llm_output"] = plan["content"]
+        logger.error("llm_generate failed: %s", e)
+        full_response = plan["content"]
+        writer(chunk_payload(full_response))
 
+    # 空输出兜底：改造前**非流式**路径是 `(raw or "").strip() or plan["content"]`，
+    # 流式路径没有这层兜底。合并到一条路径后取并集，把兜底补回来——
+    # 否则"流建立成功但一个 token 都没吐"（`chat_completion_stream` 不抛异常，
+    # 该模型实测偶发 content=''）会让 llm_output 变成空串，且此时一个 chunk 都没发过，
+    # 前端气泡停在"正在生成…"，最终落到空回答（output_check 对空输出只跳过校验、不兜底）。
+    if not full_response.strip():
+        logger.warning("llm_generate 空输出，回退到 plan.content 兜底 (mode=%s)", mode)
+        full_response = plan["content"]
+        writer(chunk_payload(full_response))
+
+    state["llm_output"] = full_response.strip()
     latency_ms = int((time.perf_counter() - _t0) * 1000)
     log_node_execution(
         node_name="llm_generate",
@@ -1507,9 +1560,15 @@ async def memory_update(state: dict) -> dict:
         return state
 
     mem = MemoryService()
-    await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
-    if "final_response" in state:
-        await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
+    try:
+        await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
+        if "final_response" in state:
+            await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
+    except Exception as e:
+        # 落库失败不得反噬本轮回答：Step 3 起本节点进入流式 drain，异常上抛会打断一条
+        # 已经成功吐完内容的流（改造前流式路径把记忆更新丢在 create_task 里，有 try/except 兜底）。
+        # 非流式路径同样受益：DB 抖动不再把一次成功的问答变成 500。
+        logger.error("memory_update persist chat record failed: %s", e)
 
     if state.get("force_long_memory_write"):
         asyncio.create_task(_async_long_memory_write(state, source=state.get("long_memory_write_source", "explicit")))

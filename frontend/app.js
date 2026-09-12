@@ -358,9 +358,15 @@ async function validateSession() {
 /* ---------- 对话（SSE 流式） ---------- */
 function handleSSEEvent(evt, full) {
   if (evt.type === 'progress') {
+    // 节点名 → 中文标签。后端 progress 事件直接来自图节点名（Step 3 起由
+    // graph.astream(stream_mode="updates") 自动给出），新增节点务必在此登记，
+    // 否则会直接显示英文标识符。
     const names = {
       input_check: '检查输入', mem_load: '加载记忆', intent_node: '识别意图',
       entities: '提取实体', knowledge: '检索知识', plan: '制定计划',
+      execute: '执行计划', reconcile: '汇总结果', llm: '生成回答',
+      fact_check: '核对事实', out: '输出检查', commit: '提交结果',
+      mem: '更新记忆', err: '处理异常',
     };
     return { kind: 'progress', label: names[evt.node] || evt.node };
   }
