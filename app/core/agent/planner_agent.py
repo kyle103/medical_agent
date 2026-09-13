@@ -9,6 +9,7 @@ from app.core.agent.intent_classifier import IntentClassifier
 from app.core.agent.llm_decision_service import CAPABILITY_REGISTRY, LLMDecisionService
 from app.core.agent.state import ExecutionPlan, PlanStep
 from app.core.llm.llm_service import LLMService
+from app.core.tools.lab_item_parser import has_lab_values
 
 logger = get_logger(__name__)
 
@@ -177,7 +178,20 @@ def _route_by_intent_and_text(state: dict) -> dict:
     drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
 
     if intent == "lab":
-        return {"target_type": "tool", "target_name": "lab_report", "intent_type": "lab_report", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=lab"}
+        # 「化验 / 血常规」只说明话题落在检验上，**不代表用户给了可解读的数据**。
+        # 用户在问「化验单怎么看」「我直接发单子给你吗」时同样命中这些词。
+        # 若仍路由到 lab_report，工具会零抽取并回一句「请提供指标名称和数值」——
+        # 答非所问，且用户再问一次收到的还是同一句（实测反复复读，见 附一之九）。
+        # 因此：抽不出「指标名 + 数值」就退回通用问答，让 LLM 直接回应用户的问题。
+        if has_lab_values(text):
+            return {"target_type": "tool", "target_name": "lab_report", "intent_type": "lab_report", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=lab"}
+        return {
+            "target_type": "agent",
+            "target_name": "main_qa_agent",
+            "intent_type": "general",
+            "confidence": float(state.get("intent_confidence") or 0.8),
+            "reason": "route by intent=lab but no readable values -> general",
+        }
     if intent == "archive":
         return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "archive", "confidence": float(state.get("intent_confidence") or 0.9), "reason": "route by intent=archive"}
     if intent == "general":
@@ -211,7 +225,11 @@ def _route_by_intent_and_text(state: dict) -> dict:
         return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "drug_query", "confidence": float(state.get("intent_confidence") or 0.7), "reason": "route by drug default to qa"}
 
     if any(k in text for k in ["化验", "检验", "血常规", "尿常规", "指标"]):
-        return {"target_type": "tool", "target_name": "lab_report", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
+        # 同 `intent == "lab"` 分支：关键词只表示话题，必须有可读数值才路由到化验工具，
+        # 否则「血常规怎么看」这类问句会被当成解读请求。
+        if has_lab_values(text):
+            return {"target_type": "tool", "target_name": "lab_report", "intent_type": "lab_report", "confidence": 0.75, "reason": "route by text: lab"}
+        return {"target_type": "agent", "target_name": "main_qa_agent", "intent_type": "general", "confidence": 0.7, "reason": "route by text: lab keywords but no readable values"}
     if any(k in text for k in ["相互作用", "一起吃", "同服", "冲突", "禁忌"]):
         return {"target_type": "tool", "target_name": "drug_interaction", "intent_type": "drug_conflict", "confidence": 0.75, "reason": "route by text: drug conflict"}
     if any(k in text for k in ["用药记录", "记录", "添加", "吃了", "服用", "mg", "毫克"]):

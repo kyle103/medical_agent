@@ -1,15 +1,28 @@
 from __future__ import annotations
 
-import re
 import time
 
 from app.common.logger import get_logger
 from app.core.rag.drug_knowledge_service import DrugKnowledgeService
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
+from app.core.tools.lab_item_parser import parse_lab_items
 from app.core.tools.lab_report_tool import LabReportTool
 
 logger = get_logger(__name__)
+
+
+#: 化验工具「零抽取」时回给上游的说明文本。
+#:
+#: 两点必须写清，否则用户会反复问同一件事：
+#: 1) **能力边界**：本系统没有图片识别能力，用户问"我直接发单子给你吗"时，
+#:    能给的确定答案只有"不行，请发文本"；
+#: 2) **可用的输入格式**：给出可直接照抄的示例。
+#: 这段文本只在 `no_data=True` 时出现，不会再被当作"化验结论"输出（见 `_decide_response_mode`）。
+_LAB_NO_DATA_HINT = (
+    "本系统只能解读**文本形式**的检验指标，不支持上传或拍照化验单（没有图片识别能力）。"
+    "如需解读，请把指标按「名称 + 数值」用文字发来，一行一项即可，例如：血糖 6.5；血压 120/80。"
+)
 
 
 class ToolExecutor:
@@ -115,12 +128,18 @@ class ToolExecutor:
         user_id = state.get("user_id", "")
         user_input = state.get("user_input", "")
 
-        lab_items = self._extract_lab_items(user_input)
+        lab_items = parse_lab_items(user_input)
         if not lab_items:
             return {
                 "tool_result": {
                     "item_list": [],
-                    "final_desc": "未识别到有效的检验指标。请提供指标名称和数值，例如：血糖6.5，血压120/80。",
+                    # 「工具拿到了零数据」必须与「工具给出了结论」区分开。
+                    # `_decide_response_mode` 见这个标记会回到对话模式，
+                    # 否则会把下面这段说明当成"解读结论"输出 —— 用户问
+                    # 「我直接发单子给你吗」时会收到「请提供指标名称和数值」，
+                    # 再问一次仍收到同一句（实测死循环）。
+                    "no_data": True,
+                    "final_desc": _LAB_NO_DATA_HINT,
                 },
                 "intent_type": "lab_report",
             }
@@ -134,55 +153,3 @@ class ToolExecutor:
             "tool_result": tool_result,
             "intent_type": "lab_report",
         }
-
-    def _extract_lab_items(self, user_input: str) -> list[dict]:
-        lab_items: list[dict] = []
-        common_items = [
-            "血糖", "血压", "血脂", "胆固醇", "肝功能", "肾功能",
-            "白细胞", "红细胞", "血小板", "尿酸", "转氨酶",
-        ]
-
-        lines = user_input.split("\n")
-        for line in lines:
-            line = line.strip()
-            if not line:
-                continue
-            separators = [":", "：", "=", "是", "为"]
-            for sep in separators:
-                if sep in line:
-                    parts = line.split(sep, 1)
-                    if len(parts) == 2:
-                        item_name = parts[0].strip()
-                        test_value = parts[1].strip()
-                        if any(keyword in item_name for keyword in common_items):
-                            lab_items.append({
-                                "item_name": item_name,
-                                "test_value": test_value,
-                                "unit": self._infer_unit(test_value),
-                            })
-                        break
-
-        if not lab_items:
-            for item in common_items:
-                if item in user_input:
-                    numbers = re.findall(r'\d+\.?\d*', user_input)
-                    if numbers:
-                        lab_items.append({
-                            "item_name": item,
-                            "test_value": numbers[0],
-                            "unit": self._infer_unit(numbers[0]),
-                        })
-
-        return lab_items
-
-    @staticmethod
-    def _infer_unit(test_value: str) -> str:
-        if "/" in test_value:
-            return "mmHg"
-        try:
-            v = float(test_value)
-            if "." in test_value and v < 20:
-                return "mmol/L"
-        except (ValueError, TypeError):
-            pass
-        return ""

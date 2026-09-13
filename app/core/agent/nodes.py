@@ -1016,6 +1016,15 @@ async def execute_node(state: dict) -> dict:
     return state
 
 
+def _tool_result_is_no_data(tool_result: object) -> bool:
+    """工具是否**显式声明**「这回什么数据都没拿到」。
+
+    必须由工具自己标记（`no_data=True`），不能靠 `item_list` 为空之类的推断 ——
+    那会把「查过档案但确实没有记录」也误判成零数据。
+    """
+    return isinstance(tool_result, dict) and tool_result.get("no_data") is True
+
+
 def _tool_result_content(result: dict) -> str:
     """从工具结果里提取可展示文本。
 
@@ -1212,7 +1221,18 @@ async def reconcile_node(state: dict) -> dict:
 
     if len(results) == 1:
         single = next(iter(results.values()))
-        content = single.get("final_response") or _tool_result_content(single) or single.get("error_msg") or ""
+        # 工具「零抽取」不是可展示的结论，只是"没有可解读的数据"这一事实。
+        # 若把它写进 final_response，`build_generation_prompt` 的 final_response 短路
+        # 分支会直接把它当答案吐出，**LLM 完全没机会回答用户真正问的问题** ——
+        # 实测「我直接发单子给你吗」收到「请提供指标名称和数值」，再问一次仍是同一句。
+        # 正确做法：不写 final_response，让生成走到 normal 分支，
+        # 由 `_decide_response_mode` 判为 llm_chat，把这句说明当**上下文**交给 LLM。
+        no_data_only = _tool_result_is_no_data(single.get("tool_result"))
+        content = (
+            ""
+            if no_data_only
+            else single.get("final_response") or _tool_result_content(single) or single.get("error_msg") or ""
+        )
         if conflict_map:
             warning = _format_conflict_warning(list(conflict_map.values()), state.get("cross_step_conflict"))
             # 工具自身的 final_desc 已按同样格式列出冲突，直接替换为带警示标题的版本，避免重复
@@ -1286,6 +1306,30 @@ _FACT_INTENTS = {"archive", "drug", "lab", "drug_conflict", "drug_record", "lab_
 _FACT_TOOLS = {"drug_interaction", "lab_report", "archive"}
 
 
+def _has_only_no_data_tool_result(state: dict) -> bool:
+    """本轮是否「工具跑了，但什么数据都没拿到」。
+
+    判据必须由工具**显式声明**（`tool_result["no_data"] is True`），不能靠
+    "item_list 为空"之类的推断 —— 那会把「查过档案但确实没有记录」也误判成零数据。
+
+    只在**全部**工具结果都没有实质数据时才成立；多步场景里只要有任何一步拿到了
+    真数据，就仍按事实型约束输出，不能因为另一步空手而归就整体退回对话模式。
+    """
+    tool_results: list[dict] = []
+    top = state.get("tool_result")
+    if isinstance(top, dict):
+        tool_results.append(top)
+    for result in (state.get("plan_step_results") or {}).values():
+        if isinstance(result, dict) and isinstance(result.get("tool_result"), dict):
+            tool_results.append(result["tool_result"])
+
+    if not tool_results:
+        return False
+    if any(tr.get("item_list") or tr.get("interaction_result") for tr in tool_results):
+        return False
+    return any(_tool_result_is_no_data(tr) for tr in tool_results)
+
+
 def _decide_response_mode(state: dict) -> str:
     """按【本次实际产出了什么】决定生成模式，而不是只看顶层 intent。
 
@@ -1293,6 +1337,14 @@ def _decide_response_mode(state: dict) -> str:
     ② 此前 reconcile 会把 intent 改成 "multi"，而 "multi" 不在事实型集合里，
        导致多步响应全部退回 llm_chat，丢掉「不得添加结果外医学事实」的约束。
     """
+    # 「工具零抽取」不是事实型结果：它说明本轮没有可解读的内容，
+    # 必须回到对话模式回答用户真正问的问题（如「我直接发单子给你吗」）。
+    # 否则会走 llm_format，把工具那句「请提供指标名称和数值」当成化验结论输出 ——
+    # 这正是用户实测到的答非所问（见 附一之九）。
+    # 路由层已有同类守卫，这里是兜底：LLM 直接指定 target_name 时路由守卫不经过。
+    if _has_only_no_data_tool_result(state):
+        return "llm_chat"
+
     intents: set[str] = set()
     top_intent = state.get("intent")
     if top_intent:
