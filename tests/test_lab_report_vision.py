@@ -333,6 +333,33 @@ async def test_image_extract_endpoint_gates():
         settings.LAB_IMAGE_MAX_MB = old_mb
 
 
+def test_unauthenticated_request_returns_401_not_500():
+    """未鉴权必须是 **401**，不能是 500。
+
+    这是一条**全站级**的回归守门：`AuthMiddleware` 继承 `BaseHTTPMiddleware`，
+    它挂在 `ExceptionMiddleware` 的**外层**，所以在 `dispatch` 里 `raise HTTPException`
+    不会被翻译成响应，而是冒泡成 500（且 body 为空）。
+
+    现象不起眼，后果很实：前端靠 `res.status === 401` 判断 token 过期并登出，
+    拿到 500 就会走进"系统暂时无法响应"的兜底话术 → **用户卡在一个登不出去的状态里**。
+
+    ⚠️ 这条只有**真实 HTTP 调用**能发现 —— 直接调路由函数时中间件根本不参与
+    （本文件其余接口测试就是这样，所以它们全部"绿"，却漏掉了这个洞）。
+    """
+    from fastapi.testclient import TestClient
+
+    from app.main import app
+
+    # 不用 with：跳过 lifespan（会预加载词典、探测模型档位，都不该在单测里发生）
+    client = TestClient(app)
+    resp = client.post(
+        "/api/v1/lab/image-extract",
+        json={"image_base64": "A" * 64},
+    )
+    assert resp.status_code == 401, f"未鉴权应返回 401，实际 {resp.status_code}"
+    assert resp.json().get("msg") == "未授权"
+
+
 @pytest.mark.asyncio
 async def test_image_extract_endpoint_response_shape(monkeypatch):
     """成功路径的**响应契约**：结果字典必须能装配成 `LabImageExtractResponse`。
