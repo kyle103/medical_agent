@@ -1487,6 +1487,21 @@ def build_generation_prompt(state: dict) -> dict:
 #: （即流式路径的既有值）——保住流式契约不变，非流式那边略微变宽松、更少误超时。
 _GEN_TIMEOUT_S = 15.0
 
+#: 短路分支（`final_response` / `confirmation` / `drug_confirmation`）的**模拟流式节拍**。
+#:
+#: 为什么需要：这几个分支的文本由前置节点**整段**产出，不经过 LLM 逐 token 生成。
+#: `iter_sentence_chunks` 把整段切成小片后，若**在同一个事件循环轮次里连续 writer()**，
+#: 所有 chunk 会在同一瞬间产生 → `astream` 一次性吐出 → StreamingResponse 在一个 TCP 包
+#: 送达 → 前端一次 paint 渲染完。**表现就是"一大坨文字一次性出现"，与真流式肉眼可辨。**
+#: （实测：假流式 chunk 总跨度 0ms；真流式 3.5s。）
+#:
+#: 修复方式：每片之间 `await asyncio.sleep()`，让出事件循环，使 SSE 真正分片送达。
+#:
+#: 代价与边界：这是**人为等待**，不是让内容变快。总追加时长由 `_FAKE_STREAM_BUDGET_S`
+#: 封顶，避免长文本把总时长拖长；把 `_FAKE_STREAM_DELAY_S` 置 0 即整体关闭（退回旧行为）。
+_FAKE_STREAM_DELAY_S = 0.02
+_FAKE_STREAM_BUDGET_S = 1.2
+
 
 def _noop_writer(_payload: dict) -> None:
     """writer 兜底：直接调用本节点（不经图执行）时使用。
@@ -1495,6 +1510,31 @@ def _noop_writer(_payload: dict) -> None:
     未开启 `stream_mode="custom"` 时它注入的也是等价的 no-op，所以这里不会崩。
     """
     return None
+
+
+async def _emit_pieces_with_pace(pieces: list[str], writer: StreamWriter) -> int:
+    """把整段文本的切片**按节拍**经 writer 推出，返回人为等待的总毫秒数。
+
+    为什么不能直接 for-writer：见 `_FAKE_STREAM_DELAY_S` 的注释——同一事件循环轮次内
+    连续 writer() 会让所有 chunk 在同一瞬间产生，SSE 一个包送达，前端一次渲染完，
+    用户看到"一大坨"。**必须让出事件循环**，切片才有意义。
+
+    节拍策略：单片间隔不超过 `_FAKE_STREAM_DELAY_S`，且**总等待不超过
+    `_FAKE_STREAM_BUDGET_S`**（长文本按片数摊薄），避免文本越长总时长越久。
+    末片之后不再等待——那一段是纯白等。
+    """
+    if not pieces:
+        return 0
+    delay = 0.0
+    if _FAKE_STREAM_DELAY_S > 0 and len(pieces) > 1:
+        delay = min(_FAKE_STREAM_DELAY_S, _FAKE_STREAM_BUDGET_S / (len(pieces) - 1))
+    waited = 0.0
+    for i, piece in enumerate(pieces):
+        writer(chunk_payload(piece))
+        if delay and i < len(pieces) - 1:
+            await asyncio.sleep(delay)
+            waited += delay
+    return int(waited * 1000)
 
 
 async def llm_generate(state: dict, writer: StreamWriter = _noop_writer) -> dict:
@@ -1547,12 +1587,19 @@ async def llm_generate(state: dict, writer: StreamWriter = _noop_writer) -> dict
 
     if branch == "final_response":
         state["llm_output"] = state["final_response"]
-        # 上游已产出完整文本，按句切分模拟流式，避免一次性吐出一大段
+        # 上游已产出完整文本，按句切分模拟流式，避免一次性吐出一大段。
+        # ⚠️ 每片之间必须 `await` 让出事件循环，否则等于没切——见 _FAKE_STREAM_DELAY_S 注释。
         writer(intent_payload(state, full=False))
-        for piece in iter_sentence_chunks(state["final_response"]):
-            writer(chunk_payload(piece))
+        pieces = list(iter_sentence_chunks(state["final_response"]))
+        fake_delay_ms = await _emit_pieces_with_pace(pieces, writer)
         latency_ms = int((time.perf_counter() - _t0) * 1000)
-        log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="final_response")
+        log_node_execution(
+            node_name="llm_generate",
+            latency_ms=max(0, latency_ms - fake_delay_ms),   # 扣掉人为节拍，保持延迟指标可比
+            shortcut="final_response",
+            chunks=len(pieces),
+            fake_delay_ms=fake_delay_ms,
+        )
         return state
 
     if branch == "confirmation":

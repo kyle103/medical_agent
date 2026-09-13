@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import ast
 import json
+import time
 from pathlib import Path
 from typing import TypedDict
 
@@ -534,3 +535,72 @@ async def test_all_steps_failed_does_not_replan():
     }
     out = await planner.evaluate_for_replan(state)
     assert out["needs_replan"] is False
+
+
+# ------------------------------------------------- C. 短路分支的"模拟流式"必须真的分片
+
+
+@pytest.mark.asyncio
+async def test_final_response_branch_paces_chunks_across_event_loop_turns():
+    """短路分支的 chunk 必须**跨事件循环轮次**产出，否则等于没切片。
+
+    背景（2026-09-13 实测）：`reconcile_node` 在单步结果时直接写 `final_response`，
+    `llm_generate` 遂走 `final_response` 短路分支，用 `iter_sentence_chunks` 把整段
+    切成 12 字小片。但切片循环里**没有 await** → 所有 chunk 在同一事件循环轮次内
+    瞬间产出 → SSE 一个 TCP 包送达 → 前端一次 paint 渲染完。
+    **用户看到的是"一大坨文字一次性出现"，而不是逐字流出。**
+
+    实测数字（修复前 vs 修复后）：
+        通用问答   30 chunk / 总跨度   0 ms  →  40 chunk / 总跨度 1180 ms
+        短闲聊      4 chunk / 总跨度   0 ms  →   4 chunk / 总跨度   86 ms
+
+    本测试不依赖图、不依赖 LLM、不依赖网络：直接调节点、注入假 writer、量时间跨度。
+    只断言跨度的**下界**（宽松），避免 CI 抖动；真正的回归信号是"跨度塌成 0"。
+    """
+    from app.core.agent import nodes as nodes_mod
+
+    if nodes_mod._FAKE_STREAM_DELAY_S <= 0:
+        pytest.skip("模拟流式节拍已被显式关闭（_FAKE_STREAM_DELAY_S <= 0），本次不做流式形态断言")
+
+    stamps: list[float] = []
+    t0 = time.perf_counter()
+
+    def fake_writer(payload: dict) -> None:
+        if payload.get("type") == "chunk":
+            stamps.append(time.perf_counter() - t0)
+
+    # 足够长、且能被 iter_sentence_chunks 切成多片（它按 12 字或句末标点切）
+    long_text = "".join(f"这是第{i}段用于验证分片节拍的测试文本内容。" for i in range(1, 13))
+    state = {
+        "user_input": "x",
+        "intent": "general",
+        "final_response": long_text,
+    }
+
+    out = await nodes_mod.llm_generate(state, writer=fake_writer)
+
+    assert out["llm_output"] == long_text
+    assert len(stamps) >= 4, f"chunk 片数过少，切分逻辑变了？得到 {len(stamps)}"
+
+    span_ms = (stamps[-1] - stamps[0]) * 1000
+    # 下界取 30ms：片数 ≥4 时约定等待 ≥3×delay；即便 delay 被预算摊薄到 5ms 也有 15ms。
+    # 留一倍余量，只抓"完全没让出事件循环"（跨度≈0）这一种回归。
+    assert span_ms >= 30, (
+        f"chunk 总跨度仅 {span_ms:.0f} ms —— 说明循环里没有 await，"
+        f"所有 chunk 在同一事件循环轮次产出，前端会一次性渲染完（假流式）。"
+    )
+
+
+def test_fake_stream_budget_bounds_added_latency():
+    """模拟流式的**人为等待**必须有上限，否则长文本会拖长总时长。
+
+    约定：总等待 ≤ `_FAKE_STREAM_BUDGET_S`。这条是防"为了流式效果牺牲响应时间"。
+    """
+    from app.core.agent import nodes as nodes_mod
+
+    assert nodes_mod._FAKE_STREAM_BUDGET_S <= 2.0, "预算过大，会明显拖慢长回答"
+
+    # 片数很多时，单片间隔必须被摊薄
+    many = 1000
+    delay = min(nodes_mod._FAKE_STREAM_DELAY_S, nodes_mod._FAKE_STREAM_BUDGET_S / (many - 1))
+    assert delay * (many - 1) <= nodes_mod._FAKE_STREAM_BUDGET_S + 1e-9

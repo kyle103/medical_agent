@@ -95,6 +95,21 @@ def _collect_text(events: list[dict]) -> str:
     return "".join(parts).strip()
 
 
+#: 上游 LLM 不可用时的固定话术（`LLMCallException` → `err` 节点兜底）。
+#:
+#: 存在的意义：把「模型/网络抖动」与「代码缺陷」区分开。
+#: 实测（2026-09-13）：DashScope 偶发 `Connection error` 时，TURN2 会输出
+#: "抱歉，处理请求时出现错误：大模型调用失败" —— 这**不是** BUG-1 复发，
+#: 但断言"答案应含某关键词"会把它判成失败，属于误报。
+#: 规则：**不变量断言（如"不得复读拦截语"）无论如何都要跑**；
+#: 只有"答案内容质量"类断言在上游不可用时跳过。
+_LLM_UNAVAILABLE_MARKERS = ("大模型调用失败", "大模型流式调用失败", "大模型调用超时")
+
+
+def _llm_unavailable(text: str) -> bool:
+    return any(m in text for m in _LLM_UNAVAILABLE_MARKERS)
+
+
 @pytest.mark.asyncio
 async def test_get_state_snapshot_only_contains_tracked_fields():
     """核心验收 ②：`get_state(config).values` 不含任何 UntrackedValue 字段。"""
@@ -222,9 +237,16 @@ async def test_bug1_compliance_block_does_not_poison_next_turn():
         agent, session_id=session_id, user_input="你好，请问高血压平时要注意什么？",
     )
     a2 = _collect_text(e2)
+    # —— BUG-1 的**核心不变量**：TURN2 不得复读合规拦截语 ——
+    # 这条与 LLM 可用性无关，必须严格断言，不因上游抖动跳过。
     assert "已按合规要求拦截" not in a2, (
         f"BUG-1 复发：TURN2 复读了拦截语 → {a2[:80]!r}"
     )
+
+    # 上游 LLM 偶发不可用时，不评估答案内容质量（否则"模型抖动"会被误报成"会话被毒化"）。
+    if _llm_unavailable(a2):
+        pytest.skip(f"上游 LLM 不可用，跳过答案内容断言：{a2[:60]!r}")
+
     # TURN2 应给出高血压管理建议（模型常用 paraphrase，不一定含字面「高血压」三字）
     advice_kw = ["血压", "低盐", "低脂", "保暖", "饮食", "心态", "防过劳", "便秘"]
     hit = [k for k in advice_kw if k in a2]
@@ -294,10 +316,17 @@ async def test_bug3_final_response_does_not_leak_across_turns():
     e2 = await _run_stream_async(agent, session_id=session_id, user_input="高血压平时要注意什么")
     a2 = _collect_text(e2)
 
-    # TURN2 应含本轮输入的关键词
-    assert "高血压" in a2, f"TURN2 应含 '高血压' → {a2[:80]!r}"
-    # TURN2 不应是 TURN1 的复读
+    # —— BUG-3 的**核心不变量**：TURN2 不得复读 TURN1 的开场白 ——
+    # 这条与上游 LLM 是否可用无关，必须严格断言。
     assert a1[:60] != a2[:60] or "高血压" in a2, "TURN2 与 TURN1 答案高度相似可能是复读"
+
+    # 上游 LLM 抖动时（DashScope 连接失败），答案里只有错误话术，无法判断内容质量 →
+    # 跳过内容断言，但**不跳过**上面的不变量。
+    if _llm_unavailable(a2):
+        pytest.skip(f"上游 LLM 不可用，跳过答案内容断言：{a2[:60]!r}")
+
+    # TURN2 应含本轮输入的关键词（证明本轮真的重新生成了答案）
+    assert "高血压" in a2, f"TURN2 应含 '高血压' → {a2[:80]!r}"
 
 
 # ─────────────────────────────────────────────── C. 文档化约束（无 LLM）
