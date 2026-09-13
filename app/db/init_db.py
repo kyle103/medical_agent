@@ -50,6 +50,14 @@ async def _migrate_missing_columns(engine: AsyncEngine) -> None:
 
 
 async def import_min_kb(engine: AsyncEngine) -> None:
+    """把 CSV 种子数据导入知识库表。
+
+    **语义是 upsert，不是 insert-if-absent。** 这两张表是纯种子数据（运行时没有任何
+    写入路径：`app/db/crud/` 下只有 archive/user），CSV 就是唯一事实源。
+    早先的"已存在就跳过"会让**改 CSV 后重跑导入静默无效** —— 看着像更新了、
+    库里其实没变，属于最难排查的一类故障；改列（如新增 `item_alias`）时
+    老行也永远拿不到新字段。upsert 后 CSV 的改动一定落地。
+    """
     kb_dir = Path("data/knowledge_base")
     drug_csv = kb_dir / "drug_knowledge.csv"
     lab_csv = kb_dir / "lab_item_reference.csv"
@@ -59,50 +67,60 @@ async def import_min_kb(engine: AsyncEngine) -> None:
     async_session = async_sessionmaker(engine, expire_on_commit=False)
 
     async with async_session() as session:
-        existing_drug_names = set(
-            (await session.execute(select(DrugKnowledgeBase.drug_name))).scalars().all()
-        )
-        existing_item_names = set(
-            (await session.execute(select(LabItemReferenceBase.item_name))).scalars().all()
-        )
+        existing_drugs = {
+            row.drug_name: row
+            for row in (await session.execute(select(DrugKnowledgeBase))).scalars().all()
+        }
+        existing_items = {
+            row.item_name: row
+            for row in (await session.execute(select(LabItemReferenceBase))).scalars().all()
+        }
+
         if drug_csv.exists():
             with drug_csv.open("r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
+                for row in csv.DictReader(f):
                     drug_name = (row.get("drug_name", "") or "").strip()
-                    if not drug_name or drug_name in existing_drug_names:
+                    if not drug_name:
                         continue
-                    existing_drug_names.add(drug_name)
-                    session.add(
-                        DrugKnowledgeBase(
-                            drug_name=drug_name,
-                            drug_alias=row.get("drug_alias") or None,
-                            indications=row.get("indications") or None,
-                            contraindications=row.get("contraindications") or None,
-                            side_effects=row.get("side_effects") or None,
-                            interaction_drugs=row.get("interaction_drugs") or None,
-                            interaction_desc=row.get("interaction_desc") or None,
-                        )
-                    )
+                    fields = {
+                        "drug_alias": row.get("drug_alias") or None,
+                        "indications": row.get("indications") or None,
+                        "contraindications": row.get("contraindications") or None,
+                        "side_effects": row.get("side_effects") or None,
+                        "interaction_drugs": row.get("interaction_drugs") or None,
+                        "interaction_desc": row.get("interaction_desc") or None,
+                    }
+                    obj = existing_drugs.get(drug_name)
+                    if obj is None:
+                        obj = DrugKnowledgeBase(drug_name=drug_name, **fields)
+                        session.add(obj)
+                        existing_drugs[drug_name] = obj
+                    else:
+                        for k, v in fields.items():
+                            setattr(obj, k, v)
 
         if lab_csv.exists():
             with lab_csv.open("r", encoding="utf-8") as f:
-                reader = csv.DictReader(f)
-                for row in reader:
+                for row in csv.DictReader(f):
                     item_name = (row.get("item_name", "") or "").strip()
-                    if not item_name or item_name in existing_item_names:
+                    if not item_name:
                         continue
-                    existing_item_names.add(item_name)
-                    session.add(
-                        LabItemReferenceBase(
-                            item_name=item_name,
-                            item_en_name=row.get("item_en_name", "").strip(),
-                            reference_range=row.get("reference_range", "").strip(),
-                            unit=row.get("unit") or None,
-                            high_meaning=row.get("high_meaning") or None,
-                            low_meaning=row.get("low_meaning") or None,
-                        )
-                    )
+                    fields = {
+                        "item_en_name": (row.get("item_en_name", "") or "").strip(),
+                        "item_alias": row.get("item_alias") or None,
+                        "reference_range": (row.get("reference_range", "") or "").strip(),
+                        "unit": row.get("unit") or None,
+                        "high_meaning": row.get("high_meaning") or None,
+                        "low_meaning": row.get("low_meaning") or None,
+                    }
+                    obj = existing_items.get(item_name)
+                    if obj is None:
+                        obj = LabItemReferenceBase(item_name=item_name, **fields)
+                        session.add(obj)
+                        existing_items[item_name] = obj
+                    else:
+                        for k, v in fields.items():
+                            setattr(obj, k, v)
 
         await session.commit()
 
@@ -121,8 +139,10 @@ def ensure_min_csv() -> None:
     lab_csv = Path("data/knowledge_base/lab_item_reference.csv")
     if not lab_csv.exists():
         lab_csv.write_text(
-            "item_name,item_en_name,reference_range,unit,high_meaning,low_meaning\n"
-            "血糖,GLU,3.9-6.1,mmol/L,可能与饮食/应激等因素相关，建议结合复查与医生意见进行评估。,可能与进食不足等因素相关，建议结合复查与医生意见进行评估。\n",
+            "item_name,item_en_name,item_alias,reference_range,unit,high_meaning,low_meaning\n"
+            "血糖,GLU,空腹血糖/葡萄糖,3.9-6.1,mmol/L,"
+            "通用科普信息：升高可能与饮食、应激等因素相关，建议结合复查与医生意见综合评估。,"
+            "通用科普信息：降低可能与进食不足等因素相关，建议结合复查与医生意见综合评估。\n",
             encoding="utf-8",
         )
 

@@ -356,13 +356,30 @@ async def reload_entity_dictionary(*, log: bool = True) -> EntityDictionary:
         terms = [row.item_name]
         if row.item_en_name:
             terms.append(row.item_en_name)
+        # 别名必须进词典：化验单上印正式名（白细胞计数），用户和解析器用的是短名
+        # （白细胞），词典是唯一能把两者归一到同一个规范名的地方。
+        terms.extend(_split_aliases(row.item_alias))
+        seen_lab: set[str] = set()
+        dedup_lab_terms: list[str] = []
+        for t in terms:
+            # 单字词条不进词典：本词典是在**原文**上做前向最大匹配，
+            # 而单字化学元素名恰好是药品名的组成部分 —— 实测加入「钙」之后
+            # 「钙片要吃吗」被解析成化验项「总钙」，「氯化钾」也会命中「钾」。
+            # 注意这里只过滤词典词条：`LabReferenceService.match_items` 仍接受
+            # 单字别名（它的入参是已经抽好的指标名，不存在在自由文本里乱匹配的问题）。
+            if len(t.strip()) < 2:
+                continue
+            if t not in seen_lab:
+                seen_lab.add(t)
+                dedup_lab_terms.append(t)
         builder.add_entry(
             kind="lab",
             canonical_name=row.item_name,
-            terms=terms,
+            terms=dedup_lab_terms,
             payload={
                 "item_name": row.item_name,
                 "item_en_name": row.item_en_name,
+                "item_alias": row.item_alias,
                 "reference_range": row.reference_range,
                 "unit": row.unit,
                 "high_meaning": row.high_meaning,

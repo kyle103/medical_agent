@@ -126,6 +126,13 @@ class LabItemReferenceBase(Base):
     item_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
     item_name: Mapped[str] = mapped_column(String(64), unique=True, index=True)
     item_en_name: Mapped[str] = mapped_column(String(64), index=True)
+    #: 别名，用 `,` `，` `、` `;` `；` `/` `|` 分隔（与 `drug_alias` 同一套切分口径，
+    #: 复用 `entity_dictionary._split_aliases`）。
+    #: 为什么必需：`lab_item_parser` 的白名单输出的是**短名**（白细胞 / 红细胞 /
+    #: 血小板 / 转氨酶 / 胆固醇 / 尿酸），而化验单上印的是**正式名**
+    #: （白细胞计数 / 丙氨酸氨基转移酶 / 总胆固醇）。只靠 item_name + item_en_name
+    #: 两个精确等值键，文本链路抽出来的名字一个都对不上 → 全部落到"暂未纳入参考库"。
+    item_alias: Mapped[str | None] = mapped_column(String(256), nullable=True)
     reference_range: Mapped[str] = mapped_column(String(64))
     unit: Mapped[str | None] = mapped_column(String(32), nullable=True)
     high_meaning: Mapped[str | None] = mapped_column(Text, nullable=True)
