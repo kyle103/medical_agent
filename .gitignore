@@ -51,3 +51,5 @@ probe_*_result.json
 smoke_*_result.json
 
 CLAUDE.md
+# 探针脚本的运行期产物（生成的图片等）
+scripts/_out/
