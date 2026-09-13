@@ -328,3 +328,80 @@ def test_thread_id_format_helper():
     assert _thread_id("", "s1") == "anon:s1"
     assert _thread_id("alice", "") == "alice:"
     assert _thread_id("", "") == "anon:"
+
+
+def test_build_sub_state_does_not_cause_plan_step_results_recursion():
+    """固化：`_build_sub_state` 不得让 `plan_step_results` 自引用。
+
+    根因（设计文档「附一之七 偏差 2」）：`dict(state)` 是浅拷贝，
+    `sub_state["plan_step_results"]` 与 `results` 是同一对象；
+    而 `_execute_single_step` 又把 `sub_state` 本身塞回 `results[sid]`，
+    于是 `results[sid]["plan_step_results"] is results`——真循环引用。
+    checkpointer 序列化阶段遍历 writes 字段时 ormsgpack 栈溢出。
+
+    验证方式：调一次真实图，让 planner 出多步规划（用「drug_conflict」intent 触发，
+    见 `planner_agent` 已知会拆 s1 → s_conflict_check_1 → s_conflict_check_2 的链），
+    然后沿 `plan_step_results` 走引用并验证不存在「回到 self」的路径。
+
+    这条是 Step 5 必做项「`_build_sub_state` 循环引用根治」的回归守门。
+    """
+    from app.core.agent.nodes import _build_sub_state
+
+    # 构造一个含 plan_step_results 的"半真"状态。
+    plan_results: dict[str, dict] = {}
+    state: dict = {
+        "user_input": "布洛芬有什么副作用？",
+        "target_agent": "drug",
+        "intent_type": "drug_conflict",
+        "extract_entities": {"drugs": ["布洛芬"]},
+        "tool_result": {},
+        "plan_step_results": plan_results,   # ← 与 results 同对象（模拟 _build_sub_state 的浅拷贝 bug）
+        # 其余"应被剥掉"的字段，故意填上非空值以验证确实剥了
+        "final_response": "上一轮的答案（必须被剥）",
+        "error_msg": "上一轮的错误（必须被剥）",
+        "intent_analysis": "上一轮的分析（必须被剥）",
+        "llm_output": "上一轮的原文（必须被剥）",
+    }
+
+    # 模拟一次 _execute_single_step：把 sub_state 塞回 results
+    step = {"step_id": "s1", "query": "布洛芬有什么副作用？", "target_name": "drug", "intent_type": "drug_conflict"}
+    sub_state = _build_sub_state(state, step, step_results=plan_results, preserve_entities=True)
+    plan_results["s1"] = sub_state
+
+    # 守门 1：sub_state["plan_step_results"] 已被剥掉（dict.pop 之后键消失）
+    assert "plan_step_results" not in sub_state, (
+        f"_build_sub_state 漏剥 plan_step_results：{list(sub_state.keys())}"
+    )
+
+    # 守门 2：sub_state 不再持有 state["plan_step_results"] 的引用（即 plan_results）
+    # 若仍持有，`is` 比较会判定为同一对象；剥干净后就是 None / 缺失
+    assert sub_state.get("plan_step_results") is None, (
+        "sub_state 仍持有 plan_step_results 引用，会被塞回 results 形成自引用"
+    )
+
+    # 守门 3：其它「应被剥」的字段也都被 pop
+    for k in ("final_response", "error_msg", "intent_analysis", "llm_output"):
+        assert k not in sub_state, f"_build_sub_state 漏剥 {k}"
+
+    # 守门 4（决定性）：plan_results 不能存在任何「回到 plan_results 自身」的引用路径
+    seen: set[int] = set()
+    stack: list[tuple[int, object]] = [(id(plan_results), plan_results)]
+    while stack:
+        obj_id, obj = stack.pop()
+        if obj_id in seen:
+            continue
+        seen.add(obj_id)
+        if isinstance(obj, dict):
+            for v in obj.values():
+                if id(v) == id(plan_results):
+                    raise AssertionError(
+                        f"plan_step_results 仍构成循环引用：在 {obj} 里找到了 results 自身"
+                    )
+                if isinstance(v, (dict, list)):
+                    stack.append((id(v), v))
+        elif isinstance(obj, list):
+            for v in obj:
+                if id(v) == id(plan_results):
+                    raise AssertionError("plan_step_results 仍构成循环引用：list 元素里找到了 results 自身")
+                if isinstance(v, (dict, list)):
+                    stack.append((id(v), v))
