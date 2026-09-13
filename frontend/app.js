@@ -492,7 +492,9 @@ async function sendMessage() {
  * 这里只负责展示与被挡住的原因，不重复判断。
  */
 const LAB_IMAGE_MAX_MB = 5; // 仅前置提示；真正口径在后端 settings.LAB_IMAGE_MAX_MB
-const LAB_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/bmp'];
+// 与后端 `_ALLOWED_FORMATS` 对齐。⚠️ 不含 HEIC/HEIF —— 后端无 pillow-heif，确实读不了；
+// iPhone 默认拍照就是 HEIC，所以宁可在这里就明确报错，也不要传上去再失败。
+const LAB_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/bmp', 'image/avif'];
 
 //: 未回填的原因码 → 中文。后端 `note` 字段的取值。
 const LAB_NOTE_LABELS = {

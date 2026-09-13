@@ -277,6 +277,39 @@ def test_prepare_image_normalizes_format_and_resizes():
         assert im.size == (2000, 400), "降采样后的实际尺寸与 meta 不一致"
 
 
+def test_prepare_image_accepts_avif_but_not_heic():
+    """白名单必须与 Pillow 的**实际能力**对齐：能读的要放行，读不了的才拒。
+
+    这是"白拒"类缺陷的守门测试 —— 名单里少一个格式，功能看起来正常，
+    只是某些用户的图**永远传不进来**，而且报错文案是"不支持的图片格式"，
+    会被读成"你传错格式了"，而不是"我们漏配了"。
+
+    实测：Pillow 12 自带 libavif（`.avif` 在 `registered_extensions()` 里），
+    所以 AVIF 必须放行；`pillow-heif` 未安装（`.heic`/`.heif` 不在表里），
+    HEIC 只能拒 —— 这是真限制，不是配置遗漏。
+    """
+    from PIL import Image
+
+    from app.core.tools.lab_report_vision import _ALLOWED_FORMATS
+
+    # AVIF：Pillow 能读写 → 必须放行，且重编码成 PNG
+    buf = io.BytesIO()
+    Image.new("RGB", (100, 80), "white").save(buf, format="AVIF")
+    out, mime, meta = prepare_image(buf.getvalue())
+    assert meta["format"] == "AVIF"
+    assert mime == "image/png", "非 JPEG 来源应统一转 PNG 送模型"
+    assert out[:8] == b"\x89PNG\r\n\x1a\n"
+
+    # 白名单与 Pillow 能力的一致性：注册表里有的扩展名，格式应被接受
+    registered = {e.lower() for e in Image.registered_extensions()}
+    assert ".avif" in registered, "Pillow 不再支持 AVIF？那要把 AVIF 从白名单移除"
+    assert "AVIF" in _ALLOWED_FORMATS
+
+    # HEIC 读不了 → 必须在白名单之外（否则会走到解码失败的分支）
+    assert not {".heic", ".heif"} & registered, "环境装上了 pillow-heif，应把 HEIC 加入白名单"
+    assert "HEIC" not in _ALLOWED_FORMATS
+
+
 def test_prepare_image_rejects_non_image():
     """不是图片要给明确错误，不能把未知字节塞给模型（那会得到一段编造的结果）。"""
     from app.common.exceptions import ParamException

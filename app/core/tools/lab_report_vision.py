@@ -107,7 +107,13 @@ _SUPERSCRIPT_RUN_RE = re.compile(r"([0-9])([⁰¹²³⁴⁵⁶⁷⁸⁹]+)")
 
 #: 能被 Pillow 解出来的来源格式。**判型以解码结果为准**，不看客户端声明的 mime。
 #: 送模型前一律重编码成 JPEG / PNG，所以来源可以放宽（连 TIFF 也能吃）。
-_ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP", "BMP", "GIF", "TIFF"})
+#:
+#: ⚠️ 这份名单要与 **Pillow 实际能力**对齐，否则会出现"白拒"：
+#: 实测 `PIL.Image.registered_extensions()` 里有 `.avif`（Pillow 12 自带 libavif），
+#: 但本名单最初漏了它 → AVIF 图会被"不支持的图片格式"挡在门外，而它其实完全能读。
+#: **HEIC/HEIF 确实读不了**（无 `pillow-heif`，注册表里没有 `.heic`）—— 这是真限制，
+#: 不是配置遗漏；iPhone 默认拍照格式就是 HEIC，要用得先转 JPG。
+_ALLOWED_FORMATS = frozenset({"JPEG", "PNG", "WEBP", "BMP", "GIF", "TIFF", "AVIF"})
 
 #: 送入模型前的最长边上限（像素）。依据见 `prepare_image` 的说明。
 MAX_IMAGE_SIDE = 2000
