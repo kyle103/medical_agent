@@ -215,6 +215,7 @@ function setBusy(b) {
   state.busy = b;
   $('sendBtn').disabled = b;
   $('userInput').disabled = b;
+  $('attachBtn').disabled = b;
   document.querySelectorAll('.cap-card').forEach((c) => { c.disabled = b; });
 }
 
@@ -256,6 +257,7 @@ function leaveApp() {
   localStorage.removeItem(LS_TOKEN);
   localStorage.removeItem(LS_USER);
   $('messageList').innerHTML = '';
+  clearAttachStrip();
   show($('emptyState'));
   $('diagTurns').textContent = '0';
   $('diagIntent').textContent = '—';
@@ -273,6 +275,7 @@ function startNewChat() {
   state.sessionId = null;
   state.turns = 0;
   $('messageList').innerHTML = '';
+  clearAttachStrip();
   show($('emptyState'));
   $('diagTurns').textContent = '0';
   $('diagIntent').textContent = '—';
@@ -396,6 +399,7 @@ async function sendMessage() {
   addMessage('user', text);
   input.value = '';
   autogrow();
+  clearAttachStrip(); // 图片只是"取数的入口"，发出去的是文本，预览条不再保留
 
   const assistantEl = addMessage('assistant', '');
   assistantEl.classList.add('is-thinking');
@@ -480,6 +484,147 @@ async function sendMessage() {
   }
 }
 
+/* ---------- 化验单图片识别（图 → 可编辑文本，不产出结论） ----------
+ * 设计约束：识别结果**只回填到输入框**，绝不自动发送。
+ * 用户先看到逐条结果、改了再发，走的还是和手工输入完全相同的那条链路 ——
+ * 所以"图路"和"文路"的判定口径不可能分叉。
+ * 后端在识别阶段就挡掉了单位冲突 / 比较符值（见 lab_report_vision.py），
+ * 这里只负责展示与被挡住的原因，不重复判断。
+ */
+const LAB_IMAGE_MAX_MB = 5; // 仅前置提示；真正口径在后端 settings.LAB_IMAGE_MAX_MB
+const LAB_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/bmp'];
+
+//: 未回填的原因码 → 中文。后端 `note` 字段的取值。
+const LAB_NOTE_LABELS = {
+  unit_mismatch: '与参考库单位不一致',
+  comparator_value: '带 < > 前缀，不是精确值',
+  empty_value: '图中该值不清或为空',
+  value_not_numeric: '不是数值',
+  empty_name: '没有识别出项目名',
+};
+
+let labImageUrl = null;
+
+function readAsDataURL(file) {
+  return new Promise((resolve, reject) => {
+    const fr = new FileReader();
+    fr.onload = () => resolve(String(fr.result || ''));
+    fr.onerror = () => reject(new Error('读取文件失败'));
+    fr.readAsDataURL(file);
+  });
+}
+
+function setAttachStatus(text, kind) {
+  const strip = $('attachStrip');
+  strip.classList.remove('is-ok', 'is-error');
+  if (kind === 'ok') strip.classList.add('is-ok');
+  if (kind === 'error') strip.classList.add('is-error');
+  $('attachStatus').textContent = text;
+}
+
+function showAttachStrip(file) {
+  if (labImageUrl) URL.revokeObjectURL(labImageUrl);
+  labImageUrl = URL.createObjectURL(file);
+  $('attachThumb').src = labImageUrl;
+  $('attachName').textContent =
+    file.name + ' · ' + Math.max(1, Math.round(file.size / 1024)) + ' KB';
+  show($('attachStrip'));
+  setAttachStatus('准备识别…');
+}
+
+function clearAttachStrip() {
+  if (labImageUrl) { URL.revokeObjectURL(labImageUrl); labImageUrl = null; }
+  $('attachThumb').removeAttribute('src');
+  hide($('attachStrip'));
+  setAttachStatus('—');
+  $('labImageInput').value = '';
+}
+
+function labResultMarkdown(d) {
+  const lines = [];
+  if (!d.item_count) {
+    lines.push('**未在图片中识别到检验项目。**');
+    lines.push('');
+    lines.push('请确认图片是完整的检验报告、清晰且方向正确，或直接手工输入「指标名 + 数值」。');
+  } else {
+    lines.push('**已识别 ' + d.item_count + ' 个检验项目，已回填到输入框，请核对后再发送：**');
+    lines.push('');
+    d.items.forEach((it) => {
+      const unit = it.unit ? ' ' + it.unit : '';
+      const tail = it.fillable
+        ? ''
+        : '（未回填：' + (LAB_NOTE_LABELS[it.note] || it.note || '取值不可靠') + '）';
+      lines.push('- ' + it.item_name + '：' + it.test_value + unit + tail);
+    });
+  }
+  if (d.warnings && d.warnings.length) {
+    lines.push('');
+    lines.push('**提示**');
+    d.warnings.forEach((w) => lines.push('- ' + w));
+  }
+  return lines.join('\n');
+}
+
+async function handleLabImageFile(file) {
+  if (!file || state.busy) return;
+
+  if (!LAB_IMAGE_TYPES.includes(file.type)) {
+    showAttachStrip(file);
+    setAttachStatus('不支持的图片格式（' + (file.type || '未知') + '），请使用 JPG / PNG', 'error');
+    return;
+  }
+  if (file.size > LAB_IMAGE_MAX_MB * 1024 * 1024) {
+    showAttachStrip(file);
+    setAttachStatus('图片超过 ' + LAB_IMAGE_MAX_MB + 'MB，请压缩后再试', 'error');
+    return;
+  }
+
+  showAttachStrip(file);
+  setAttachStatus('正在识别检验项目…（通常需要几秒）');
+  $('attachBtn').classList.add('is-loading');
+  $('attachBtn').disabled = true;
+
+  try {
+    // base64 直接经 JSON 发送：与本项目其余接口同一套约定，
+    // 也省掉 multipart（后端未依赖 python-multipart）。格式真伪由后端解码判定。
+    const dataUrl = await readAsDataURL(file);
+    const headers = { 'Content-Type': 'application/json' };
+    if (state.token) headers.Authorization = 'Bearer ' + state.token;
+    const res = await fetch(API_BASE + '/api/v1/lab/image-extract', {
+      method: 'POST',
+      headers,
+      body: JSON.stringify({ image_base64: dataUrl, mime: file.type }),
+    });
+    const body = await res.json().catch(() => ({}));
+
+    if (res.status === 401) { leaveApp(); showAuthError('登录已过期，请重新登录'); return; }
+    if (!res.ok || !body.data) {
+      setAttachStatus(body.detail || ('识别失败 (' + res.status + ')'), 'error');
+      return;
+    }
+
+    const d = body.data;
+    addMessage('assistant', labResultMarkdown(d));
+
+    if (d.fill_text) {
+      const ta = $('userInput');
+      // 输入框已有内容时不覆盖：追加在末尾，用户看得到全部内容再决定发不发
+      ta.value = ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n' + d.fill_text : d.fill_text;
+      autogrow();
+      ta.focus();
+      setAttachStatus('已识别 ' + d.item_count + ' 项并填入输入框，请核对后发送', 'ok');
+    } else {
+      setAttachStatus('未识别到检验项目，详见对话中的提示', 'error');
+    }
+  } catch (err) {
+    console.error('化验单识别失败:', err);
+    setAttachStatus('识别失败：网络异常或服务不可用，请稍后重试', 'error');
+  } finally {
+    $('attachBtn').classList.remove('is-loading');
+    $('attachBtn').disabled = state.busy;
+  }
+}
+
 /* ---------- 侧边栏（移动端） ---------- */
 function openSidebar() {
   $('sidebar').classList.add('is-open');
@@ -515,6 +660,14 @@ function setupEvents() {
   $('newChatBtn').addEventListener('click', startNewChat);
   $('menuBtn').addEventListener('click', openSidebar);
   $('sideOverlay').addEventListener('click', closeSidebar);
+
+  $('attachBtn').addEventListener('click', () => { if (!state.busy) $('labImageInput').click(); });
+  $('attachRemove').addEventListener('click', clearAttachStrip);
+  $('labImageInput').addEventListener('change', (e) => {
+    const f = e.target.files && e.target.files[0];
+    e.target.value = ''; // 清空以便连续选同一张图仍能触发 change
+    if (f) handleLabImageFile(f);
+  });
 
   const ta = $('userInput');
   ta.addEventListener('input', autogrow);

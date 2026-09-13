@@ -48,6 +48,32 @@ class Settings(BaseSettings):
     # 后者仍保留推理能力。
     # 若换到不接受该参数的模型/网关，置 false 即可整体回退。
     LLM_DISABLE_THINKING: bool = True
+    # ---- 视觉 LLM（化验单图像识别专用，与文本主链路**解耦**）----
+    # 为什么不复用 LLM_MODEL_NAME：主模型（文本）**没有视觉能力**，"跟随主流程"
+    # 只能等价于"把主链路换成 VL 模型"——而主链路的全部结论（schema 遵从度、
+    # 推理型特性、LLM_DISABLE_THINKING 的作用范围）都是按主模型实测定下来的，
+    # 换掉即全部作废重测，收益为零（主链路不处理图片）。
+    # 所以：**配置与调用入口独立，横切能力（错误分类/重试/日志/探针）共用。**
+    # 选型实测：多模态化验单识别-选型实验与集成方案.md
+    #   （清晰 PNG / JPEG q55+旋转 1.5° / 降采样+模糊+q40 三档，逐项数值均 5/5）。
+    # ⚠️ 用**去日期后缀**的名字（如 qwen3-vl-flash）。日期快照的兼容层可能丢
+    #    response_format → json_schema **静默失效**；文本侧已踩过一次
+    #    （deepseek-v4-flash-0731）。换模型后跑 scripts/probe_lab_vision_params.py。
+    # 留空 = 关闭图片识别（接口会明确回"未配置视觉模型"，不会静默降级）。
+    LLM_VISION_MODEL_NAME: str = Field(default="")
+    LLM_VISION_TIMEOUT_S: float = 60.0
+    LLM_VISION_MAX_TOKENS: int = 2048
+    # 视觉抽取是否下发 extra_body.enable_thinking=False。
+    # 默认 **false（不下发）**：该参数是提供方耦合点，未确认收益前进默认路径。
+    # 实测（2026-09-13，qwen3-vl-flash，同一张血常规图，scripts/probe_lab_vision_params.py）：
+    #   不传该参数            → 4.2s / out_tok=277 / 逐项 5/5
+    #   enable_thinking=False → 3.6s / out_tok=266 / 逐项 5/5
+    #   enable_thinking=True  → 0.3s / out_tok=3   / **5 项全漏**  ← 该档在视觉侧不可用
+    # 结论：不传与 false 无实质差别（少一个耦合点更稳），true 会直接废掉抽取。
+    # 另外探针同时确认 resolve_mode(qwen3-vl-flash) = json_schema，即严格 schema 真被下发。
+    LLM_VISION_DISABLE_THINKING: bool = False
+    # 化验单图片上传上限（MB）。超限明确报错，不静默截断。
+    LAB_IMAGE_MAX_MB: float = 5.0
     # 对低意图/不确定意图场景的额外 LLM 增强（意图识别专用）
     INTENT_LLM_ENABLED: bool = True
     INTENT_LLM_TIMEOUT_S: float = 10.2

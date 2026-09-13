@@ -185,7 +185,30 @@
 
       <footer class="composer-wrap">
         <div class="composer-inner">
+          <!-- 化验单图片识别：只做「图 → 可编辑文本」，不产出任何结论。
+               识别结果回填到输入框，由用户核对后再发送，走的是和手工输入完全相同的那条链路。 -->
+          <div class="attach-strip" id="attachStrip" hidden>
+            <img class="attach-thumb" id="attachThumb" alt="化验单缩略图">
+            <div class="attach-body">
+              <p class="attach-name" id="attachName">—</p>
+              <p class="attach-status" id="attachStatus">—</p>
+            </div>
+            <button class="attach-remove" id="attachRemove" type="button" aria-label="移除图片" title="移除图片">
+              <svg viewBox="0 0 24 24" width="16" height="16" aria-hidden="true">
+                <path d="M6 6l12 12M18 6L6 18" stroke="currentColor" stroke-width="2" stroke-linecap="round"/>
+              </svg>
+            </button>
+          </div>
+
           <div class="composer-box">
+            <button class="attach-btn" id="attachBtn" type="button" aria-label="上传化验单" title="上传化验单图片，自动识别检验项目">
+              <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
+                <rect x="3" y="5" width="18" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/>
+                <circle cx="9" cy="10" r="1.6" fill="currentColor"/>
+                <path d="M4 17l4.5-4.5L13 17l3-2.5 4 3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+              </svg>
+            </button>
+            <input type="file" id="labImageInput" accept="image/jpeg,image/png,image/webp,image/bmp" hidden>
             <textarea class="composer-input" id="userInput" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
             <button class="send-btn" id="sendBtn" type="button" aria-label="发送" title="发送">
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -193,7 +216,7 @@
               </svg>
             </button>
           </div>
-          <p class="composer-hint">Enter 发送 · Shift+Enter 换行</p>
+          <p class="composer-hint">Enter 发送 · Shift+Enter 换行 · 点左侧图片按钮可上传化验单自动识别</p>
         </div>
         <p class="disclaimer-bar">免责声明：本内容仅为通用健康科普参考，不构成任何医疗诊断、用药建议。如有身体不适，请及时前往正规医疗机构就诊，遵医嘱治疗。</p>
       </footer>

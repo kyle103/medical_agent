@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import contextvars
 from collections.abc import AsyncGenerator
 
@@ -600,5 +601,235 @@ class LLMService:
             success=False,
             error="schema_validation",
             caller="chat_completion_json",
+        )
+        return None
+
+    async def chat_completion_vision(
+        self,
+        *,
+        prompt: str,
+        image_bytes: bytes,
+        mime: str,
+        schema: type[BaseModel],
+        system_prompt: str = "",
+        timeout_s: float | None = None,
+        max_tokens: int | None = None,
+        max_retry: int = 1,
+        schema_name: str | None = None,
+    ) -> BaseModel | None:
+        """图像 + 文本 → 受 schema 约束的结构化结果。
+
+        **为什么单独成方法，而不是给 `chat_completion_json` 加个参数**：
+        后者的 `messages` 是 `list[dict[str, str]]`，塞不进图片 content block
+        （图片块是 `list[dict]`）；而它承载的是**文本主链路**，签名一改就把风险引到主链路上。
+        这里只新增入口，主链路一行不动。
+
+        与 `chat_completion_json` **有意复用**的部分：
+
+        - 档位判定 `resolve_mode(client, model)` —— 缓存按 `(base_url, model)` 分键，
+          视觉模型是**独立的一次探测**，不会蹭文本模型的结论
+        - 失败三分类计数：`empty_response` / `truncated` / `validation_failure`
+        - 重试时回灌校验错误（`_build_repair_prompt` / `_build_truncated_prompt`）
+        - 客户端 `model_validate_json` **始终执行** —— `response_format` 只是加速器
+
+        **不同**的部分：
+
+        - 模型取 `settings.LLM_VISION_MODEL_NAME`（独立配置，留空视为未开启）
+        - `enable_thinking` 由 `LLM_VISION_DISABLE_THINKING` 单独控制，默认**不下发** ——
+          该参数是提供方耦合点，换模型/换提供方必须重测
+          （`scripts/probe_lab_vision_params.py`）
+
+        返回：校验通过的模型实例；重试耗尽仍不合法返回 `None`。
+        传输层错误抛 `LLMCallException`，与另外两个方法一致。
+        """
+        global _extract_fallback_count, _validation_failure_count
+        global _empty_response_count, _truncated_count
+
+        model = (settings.LLM_VISION_MODEL_NAME or "").strip()
+        if not model:
+            raise LLMCallException("未配置视觉模型（LLM_VISION_MODEL_NAME 为空）")
+
+        start = time_block()
+        client = await self._get_client()
+        mode = await resolve_mode(client, model)
+        response_format = build_response_format(schema, mode, name=schema_name)
+
+        image_b64 = base64.b64encode(image_bytes).decode("ascii")
+        messages: list[dict] = []
+        if system_prompt:
+            messages.append({"role": "system", "content": system_prompt})
+        messages.append(
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "image_url",
+                        "image_url": {"url": f"data:{mime};base64,{image_b64}"},
+                    },
+                    {"type": "text", "text": prompt},
+                ],
+            }
+        )
+        attempts = max(1, max_retry + 1)
+
+        for attempt in range(attempts):
+            try:
+                coro = client.chat.completions.create(
+                    model=model,
+                    messages=messages,
+                    temperature=settings.LLM_TEMPERATURE,
+                    max_tokens=max_tokens
+                    if max_tokens is not None
+                    else settings.LLM_VISION_MAX_TOKENS,
+                    response_format=response_format,
+                    **(
+                        {"extra_body": {"enable_thinking": False}}
+                        if settings.LLM_VISION_DISABLE_THINKING
+                        else {}
+                    ),
+                )
+                resp = await (asyncio.wait_for(coro, timeout=timeout_s) if timeout_s else coro)
+            except asyncio.TimeoutError as e:
+                latency_ms = elapsed_ms(start)
+                logger.warning("LLM视觉调用超时(%.2fs)", float(timeout_s or 0))
+                track_llm_call(model=model, latency_ms=latency_ms, success=False, error="timeout")
+                log_llm_call(
+                    model=model,
+                    prompt_len=len(prompt),
+                    latency_ms=latency_ms,
+                    success=False,
+                    error="timeout",
+                    caller="chat_completion_vision",
+                )
+                raise LLMCallException("视觉模型调用超时") from e
+            except Exception as e:
+                latency_ms = elapsed_ms(start)
+                logger.error("LLM视觉调用失败: %s", str(e))
+                track_llm_call(model=model, latency_ms=latency_ms, success=False, error="call_failed")
+                log_llm_call(
+                    model=model,
+                    prompt_len=len(prompt),
+                    latency_ms=latency_ms,
+                    success=False,
+                    error=str(e)[:100],
+                    caller="chat_completion_vision",
+                )
+                raise LLMCallException("视觉模型调用失败") from e
+
+            usage = getattr(resp, "usage", None)
+            input_tokens = getattr(usage, "prompt_tokens", None) if usage is not None else None
+            output_tokens = getattr(usage, "completion_tokens", None) if usage is not None else None
+            total_tokens = getattr(usage, "total_tokens", None) if usage is not None else None
+            cached_tokens, cache_miss_tokens = _extract_cache_tokens(usage, input_tokens)
+            record_usage(input_tokens, cached_tokens)
+
+            choice = resp.choices[0]
+            raw = choice.message.content or ""
+            finish_reason = getattr(choice, "finish_reason", None)
+
+            # --- 空响应：先于 JSON 校验判定，且不计入 schema 校验失败 ---
+            # 视觉模型（尤其推理型）的 max_tokens 可能同时覆盖推理与答案，
+            # 推理吃满预算时答案侧拿不到 token。当成 JSON 语法错误处理会把排查带偏。
+            if not raw.strip():
+                _empty_response_count += 1
+                logger.warning(
+                    "[vision] 空响应(mode=%s attempt=%d/%d finish_reason=%s out_tok=%s)"
+                    "→ 按「无输出」重试；不计入 schema 校验失败",
+                    mode,
+                    attempt + 1,
+                    attempts,
+                    finish_reason,
+                    output_tokens,
+                )
+                if attempt + 1 < attempts:
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": _build_no_output_prompt(
+                                f"上一条回复为空，finish_reason={finish_reason}"
+                            ),
+                        }
+                    )
+                    continue
+                break
+
+            if finish_reason == "length":
+                _truncated_count += 1
+                logger.warning(
+                    "[vision] 响应被截断(mode=%s attempt=%d/%d len=%d out_tok=%s)："
+                    "strict schema 要求字段全部出现，应提高 LLM_VISION_MAX_TOKENS",
+                    mode,
+                    attempt + 1,
+                    attempts,
+                    len(raw),
+                    output_tokens,
+                )
+
+            text, used_fallback = extract_json_candidate(raw)
+            if used_fallback:
+                _extract_fallback_count += 1
+                logger.info(
+                    "[vision] 响应需兜底提取(mode=%s attempt=%d) raw=%r",
+                    mode,
+                    attempt + 1,
+                    raw[:120],
+                )
+
+            try:
+                obj = schema.model_validate_json(text)
+            except ValidationError as e:
+                _validation_failure_count += 1
+                logger.warning(
+                    "[vision] schema 校验失败(mode=%s attempt=%d/%d): %s",
+                    mode,
+                    attempt + 1,
+                    attempts,
+                    _validation_error_brief(e),
+                )
+                if attempt + 1 < attempts:
+                    messages.append({"role": "assistant", "content": raw})
+                    repair = (
+                        _build_truncated_prompt()
+                        if finish_reason == "length"
+                        else _build_repair_prompt(schema, e)
+                    )
+                    messages.append({"role": "user", "content": repair})
+                    continue
+                break
+
+            latency_ms = elapsed_ms(start)
+            track_llm_call(
+                model=model,
+                latency_ms=latency_ms,
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
+                cache_miss_tokens=cache_miss_tokens,
+                success=True,
+            )
+            log_llm_call(
+                model=model,
+                prompt_len=len(prompt),
+                response_len=len(raw),
+                input_tokens=input_tokens,
+                output_tokens=output_tokens,
+                total_tokens=total_tokens,
+                cached_tokens=cached_tokens,
+                cache_miss_tokens=cache_miss_tokens,
+                latency_ms=latency_ms,
+                success=True,
+                caller="chat_completion_vision",
+            )
+            return obj
+
+        latency_ms = elapsed_ms(start)
+        log_llm_call(
+            model=model,
+            prompt_len=len(prompt),
+            latency_ms=latency_ms,
+            success=False,
+            error="schema_validation",
+            caller="chat_completion_vision",
         )
         return None

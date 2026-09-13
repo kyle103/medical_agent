@@ -398,6 +398,47 @@ code { font-family: var(--font-mono); }
   transition: border-color var(--dur-fast) var(--ease), box-shadow var(--dur-fast) var(--ease);
 }
 .composer-box:focus-within { border-color: var(--c-accent-line); box-shadow: 0 0 0 3px var(--c-accent-soft); }
+.attach-btn {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 40px; height: 40px; flex: 0 0 auto; align-self: flex-end;
+  border: 0; border-radius: var(--r-md); cursor: pointer;
+  background: transparent; color: var(--c-muted);
+  transition: background var(--dur-fast) var(--ease), color var(--dur-fast) var(--ease);
+}
+.attach-btn:hover:not(:disabled) { background: var(--c-hover); color: var(--c-accent); }
+.attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
+.attach-btn.is-loading { color: var(--c-accent); animation: attach-pulse 1.1s ease-in-out infinite; }
+@keyframes attach-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+
+/* 上传预览条：缩略图 + 文件名 + 状态，去掉按钮 */
+.attach-strip {
+  display: flex; align-items: center; gap: var(--sp-3);
+  margin-bottom: var(--sp-2); padding: var(--sp-2);
+  background: var(--c-card); border: 1px solid var(--c-rule); border-radius: var(--r-md);
+  box-shadow: var(--shadow-1);
+}
+.attach-strip[hidden] { display: none; }
+.attach-strip.is-error { border-color: color-mix(in oklch, var(--c-danger) 32%, var(--c-card)); }
+.attach-thumb {
+  width: 52px; height: 40px; flex: 0 0 auto;
+  object-fit: cover; border-radius: var(--r-sm);
+  border: 1px solid var(--c-rule); background: var(--c-hover);
+}
+.attach-body { flex: 1; min-width: 0; }
+.attach-name {
+  margin: 0; font-size: var(--fs-sm); color: var(--c-ink);
+  white-space: nowrap; overflow: hidden; text-overflow: ellipsis;
+}
+.attach-status { margin: 2px 0 0; font-size: var(--fs-xs); color: var(--c-muted); line-height: 1.4; }
+.attach-strip.is-error .attach-status { color: var(--c-danger); }
+.attach-strip.is-ok .attach-status { color: var(--c-success); }
+.attach-remove {
+  display: inline-flex; align-items: center; justify-content: center;
+  width: 28px; height: 28px; flex: 0 0 auto;
+  border: 0; border-radius: var(--r-sm); cursor: pointer;
+  background: transparent; color: var(--c-faint);
+}
+.attach-remove:hover { background: var(--c-hover); color: var(--c-ink); }
 .composer-input {
   flex: 1; min-width: 0;
   border: 0; background: transparent; resize: none; outline: none;

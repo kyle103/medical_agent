@@ -24,3 +24,6 @@ jieba==0.42.1
 pymilvus==2.4.6
 setuptools==75.8.0
 langfuse==2.43.0
+# 化验单图片预处理（格式判型 / EXIF 摆正 / 降采样）。见 app/core/tools/lab_report_vision.py
+# 说明：此前是 chromadb 的传递依赖，版本随 chromadb 浮动；本模块直接使用，故显式固定。
+pillow==12.2.0
