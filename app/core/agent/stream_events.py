@@ -14,6 +14,9 @@
     intent    {"type":"intent","intent":...,"intent_analysis":{...},"target_agent":...}
               —— 注意有两处产出点，字段**刻意不同**（见 intent_payload 的 full 参数）
     chunk     {"type":"chunk","content":<增量文本>}
+    options   {"type":"options","confirmation_id":...,"options":[{id,label,value,kind}],
+               "allow_other":true}
+              —— 写操作二次确认的选项卡，前端渲染成可点击按钮；点击后按普通消息再发一轮
     error     {"type":"error","content":<错误文本>}
     done      {"type":"done","session_id":...,"intent":...,"needs_confirmation":...,
                "conversation_turns":...,"cache":...}
@@ -37,6 +40,7 @@ __all__ = [
     "progress_payload",
     "intent_payload",
     "chunk_payload",
+    "options_payload",
     "error_payload",
     "done_payload",
     "serialize",
@@ -93,6 +97,26 @@ def intent_payload(state: dict[str, Any], *, full: bool) -> dict[str, Any]:
 
 def chunk_payload(content: str) -> dict[str, Any]:
     return {"type": "chunk", "content": content}
+
+
+def options_payload(
+    *,
+    confirmation_id: str,
+    options: list[dict[str, Any]],
+    allow_other: bool = True,
+) -> dict[str, Any]:
+    """写操作二次确认的选项卡。
+
+    `options` 每项形如 `{"id": "A", "label": "布洛芬", "value": "布洛芬", "kind": "drug"}`；
+    前端点击时发的是 **label**（不是 id），解析器对 label 有精确匹配分支，兜底最稳。
+    `allow_other=True` 表示除已列选项外还接受自由输入（对应卡片文本里的"其他"）。
+    """
+    return {
+        "type": "options",
+        "confirmation_id": confirmation_id,
+        "options": options,
+        "allow_other": allow_other,
+    }
 
 
 def error_payload(content: str) -> dict[str, Any]:

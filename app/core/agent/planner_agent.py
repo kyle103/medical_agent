@@ -9,7 +9,7 @@ from app.core.agent.intent_classifier import IntentClassifier
 from app.core.agent.llm_decision_service import CAPABILITY_REGISTRY, LLMDecisionService
 from app.core.agent.state import ExecutionPlan, PlanStep
 from app.core.llm.llm_service import LLMService
-from app.core.tools.lab_item_parser import has_lab_values
+from app.core.tools.lab_item_parser import has_lab_values, lab_route_text
 
 logger = get_logger(__name__)
 
@@ -173,7 +173,11 @@ def _quick_intent_classify(text: str) -> str:
 
 def _route_by_intent_and_text(state: dict) -> dict:
     intent = (state.get("intent") or "").strip().lower()
-    text = state.get("user_input", "").strip()
+    # 判定用**合并文本**（用户原话 + 随消息上传的化验单识别结果）。用户只发图不打字时
+    # `user_input` 是空串，用它的 `has_lab_values("")` 必然为假 → 那张单子会被路由到
+    # `main_qa_agent` 而不是化验工具，图白传了。
+    # ⚠️ `text` 在本函数里只用于**判定关键词/数值**，不写回 state（见 lab_route_text 的说明）。
+    text = lab_route_text(state).strip()
     entities = state.get("extract_entities") or {}
     drug_names = entities.get("drug_name_list") if isinstance(entities, dict) else []
 

@@ -13,7 +13,12 @@ from app.common.logger import get_logger, log_node_execution, log_step_execution
 from app.core.agent.intent_classifier import IntentClassifier, IntentResult
 from app.core.agent.planner_agent import PlannerAgent
 from app.core.agent.state import ExecutionPlan, PlanStep
-from app.core.agent.stream_events import chunk_payload, intent_payload, iter_sentence_chunks
+from app.core.agent.stream_events import (
+    chunk_payload,
+    intent_payload,
+    iter_sentence_chunks,
+    options_payload,
+)
 from app.core.agent.tool_executor import ToolExecutor
 from app.core.llm.llm_service import LLMService
 from app.core.memory.long_memory_service import LongMemoryService
@@ -21,10 +26,16 @@ from app.core.memory.memory_service import MemoryService
 from app.core.rag.medical_knowledge_service import MedicalKnowledgeService
 from app.core.rag.public_kb_service import PublicKnowledgeService
 from app.core.session.agent_state_store import AgentStateStore
+from app.core.skills.drug_write_confirmation import (
+    MAX_ATTEMPTS,
+    PENDING_TYPE,
+    resolve_answer,
+)
 from app.core.skills.medication_confirmation_skill import MedicationConfirmationSkill
 from app.core.tools.archive_query_tool import ArchiveQueryTool
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_record_tool import DrugRecordTool
+from app.core.tools.lab_item_parser import lab_route_text
 
 from app.db.database import get_sessionmaker
 from app.db.models import UserDrugRecord
@@ -130,13 +141,19 @@ def _build_decision_context(state: dict, max_chars: int = 600) -> str:
         if bits:
             parts.append("上一轮决策：\n" + "；".join(bits))
 
+    # 待确认块**不放进 parts**：它是本轮路由的唯一依据（用户可能只回一个 "A"），
+    # 必须活过 max_chars 的整体截断——排在前面的近期对话/上一轮决策一旦写满预算，
+    # 它就会被切掉，确认随之丢失。故单独拼在末尾、算在预算之外。
     pending = state.get("pending_confirmation")
+    pending_block = ""
     if isinstance(pending, dict) and pending:
+        # 上限 800 而非 400：确认卡要把 options 数组一起喂给路由 LLM，
+        # 400 会在选项中间腰斩成不可解析的 JSON。
         try:
-            pend_str = json.dumps(pending, ensure_ascii=False, default=str)[:400]
+            pend_str = json.dumps(pending, ensure_ascii=False, default=str)[:800]
         except Exception:
-            pend_str = str(pending)[:400]
-        parts.append("待用户确认的用药记录：\n" + pend_str)
+            pend_str = str(pending)[:800]
+        pending_block = "待用户确认的用药记录：\n" + pend_str
 
     summary = (state.get("memory_summary") or "").strip()
     if summary:
@@ -145,7 +162,119 @@ def _build_decision_context(state: dict, max_chars: int = 600) -> str:
     text = "\n\n".join(parts)
     if len(text) > max_chars:
         text = text[:max_chars]
+    if pending_block:
+        text = (text + "\n\n" + pending_block).strip() if text else pending_block
     return text
+
+
+#: 图片块里"未纳入"明细的条数上限。原因看 `_image_facts` 的说明。
+_MAX_IMAGE_EXCLUDED_SHOWN = 8
+
+#: 原因码 → 说给人听的话。键与 `lab_report_vision._clean_value` 的原因码一一对应。
+_IMAGE_DROP_REASON_TEXT = {
+    "empty_value": "图上看不清数值",
+    "comparator_value": "带比较符（如 <0.05），不是精确值",
+    "value_not_numeric": "不是数值",
+}
+
+
+def _image_facts(state: dict) -> tuple[str, str, list[tuple[str, str]]]:
+    """图片三个字段 → `(失败说明, 可判定指标文本, [(项名, 未纳入原因)])`。
+
+    两个渲染器（给模型看的块 / 给用户看的提示）共用这一份**事实提取**，
+    免得"哪些项没纳入"在一处算成 3 项、另一处算成 4 项。
+    """
+    note = (state.get("image_note") or "").strip()
+    text = (state.get("image_lab_text") or "").strip()
+
+    excluded: list[tuple[str, str]] = []
+    for it in state.get("image_lab_items") or []:
+        if not isinstance(it, dict) or it.get("fillable"):
+            continue
+        name = (it.get("item_name") or it.get("raw_name") or "").strip() or "（未识别出名称）"
+        if (it.get("note") or "") == "unit_mismatch":
+            image_unit = (it.get("unit") or "").strip() or "空"
+            lib_unit = (it.get("lib_unit") or "").strip() or "空"
+            reason = f"单位与参考库不一致（图上 {image_unit}，库内 {lib_unit}）"
+        else:
+            reason = _IMAGE_DROP_REASON_TEXT.get((it.get("note") or ""), "不符合判定要求")
+        excluded.append((name, reason))
+
+    return note, text, excluded
+
+
+def image_context_block(state: dict) -> str:
+    """把「用户上传的化验单图片」变成一个**标明来源**的块，喂给生成阶段的 LLM。
+
+    为什么要单独成块、而不是拼进"用户输入"：`state["user_input"]` 必须是用户的原话
+    （它进对话记录、进快照）。图片里的字是**我们认出来的**，来源必须对模型交代清楚 ——
+    否则模型会把识别结果当成用户陈述复述回去，用户无从分辨哪些是自己说的、
+    哪些是系统读图读出来的（读错时这一点尤其要紧）。
+
+    为什么必须包含「未纳入的项及原因」：`image_lab_text` 只含**可回填**的项，
+    单位不一致 / 带比较符 / 看不清的都被过滤掉了。只给回填文本的话，
+    模型根本不知道还有被丢掉的部分，也就永远说不出"你有 3 项因单位不一致未参与判定"
+    —— 用户会以为那张单子上被丢掉的项根本没出现过。
+
+    列表条数封顶 `_MAX_IMAGE_EXCLUDED_SHOWN`：一张生化全项能丢十几项，
+    全量塞进 prompt 会把真正重要的上下文挤掉，取前几条已足够说明"有几项没纳入"。
+    """
+    note, text, excluded = _image_facts(state)
+    if not note and not text and not excluded:
+        return ""
+
+    parts = [
+        "【用户上传的化验单图片】",
+        "下面这段是**系统从图片里识别出来的**，不是用户打的字；用户可能在「用户输入」里另有问题。",
+    ]
+
+    if note:
+        parts.append(f"图片这条线没能走通：{note}")
+        parts.append("请在回复里如实说明这一点，不要让用户以为这张图已经被读过。")
+
+    if text:
+        parts.append("已纳入判定的指标（已交给检验解读工具）：\n" + text)
+
+    if excluded:
+        shown = excluded[:_MAX_IMAGE_EXCLUDED_SHOWN]
+        lines = [f"- {name}：{reason}" for name, reason in shown]
+        if len(excluded) > len(shown):
+            lines.append(f"- （另有 {len(excluded) - len(shown)} 项，原因同类）")
+        parts.append(
+            f"识别到但**未纳入判定**的 {len(excluded)} 项（这些项没有参与异常判定，"
+            "如用户问起请如实说明原因，不要当作正常结果）：\n" + "\n".join(lines)
+        )
+
+    return "\n\n".join(parts)
+
+
+def image_user_caveat(state: dict) -> str:
+    """给**用户**看的图片说明，作为回答的前置段落。没有要说的就返回空串。
+
+    为什么需要它、以及为什么不能直接复用 `image_context_block`：
+    `build_generation_prompt` 的 `final_response` 短路分支（单步化验解读走的就是它）
+    **完全不过 LLM**，上游文本原样吐出。所以喂给模型的那个块在这条路径上没人读 ——
+    "有 3 项因单位不一致未纳入"这句话就永远到不了用户眼前，而用户会默认
+    整张单子都被判过了。这是本轮改造要堵的最隐蔽的一个洞。
+
+    与模型块的区别不只是措辞：这里是**面向患者**的措辞（说清"未纳入≠正常"），
+    那边是给模型的指令（"不要当作正常结果"）。
+    """
+    note, _text, excluded = _image_facts(state)
+    if not note and not excluded:
+        return ""
+
+    lines: list[str] = []
+    if note:
+        lines.append(f"⚠️ 你上传的这张化验单图片没能识别成功：{note}")
+    if excluded:
+        shown = excluded[:_MAX_IMAGE_EXCLUDED_SHOWN]
+        detail = "；".join(f"{name}（{reason}）" for name, reason in shown)
+        if len(excluded) > len(shown):
+            detail += f"；另有 {len(excluded) - len(shown)} 项同类"
+        lines.append(f"⚠️ 图里有 {len(excluded)} 项没有纳入判定：{detail}。")
+        lines.append("未纳入不等于正常，请对照原图核对，或咨询医生。")
+    return "\n".join(lines)
 
 
 def _format_history(history: list[dict], max_chars: int = 1400) -> str:
@@ -264,6 +393,17 @@ _TURN_LOCAL_FIELDS: tuple[str, ...] = (
     "llm_output",
     # 确认/合规（每轮由 input_check / out 节点重算）
     "needs_confirmation", "confirmation_message", "compliance_check_result",
+    # 上轮确认卡的回答（每轮由 intent_node 重算；残留会让下一轮误触发落库）
+    "confirmation_resolution",
+    # ⚠️ 图片三字段（image_lab_text / image_lab_items / image_note）**刻意不在这里**。
+    # 它们与 user_input 同类，是**路由层每轮送进来的请求级输入**（chat_router::
+    # _extract_lab_image 在入图之前算好），而 turn_reset 是**图的入口节点**——
+    # 写进这个列表等于把路由层刚算出的识别结果当场清空：实测表现为
+    # `[vision] 条目=3 回填=3` 紧跟着 `[STEP] s1 | target=main_qa_agent query=""`，
+    # 图白识别了，还会因为 `lab_route_text` 拿到空串而路由到通用问答。
+    # 不吃"跨轮残留"的亏是因为它们本就是 `UntrackedValue`（见 state.py）：不进快照，
+    # 下一轮从 checkpointer 起手时压根没有这些键——所以本文件开头那条
+    # "已是 UntrackedValue 的中间产物不需要重置"同样适用于它们。
     # 计划（每轮由 plan_node 重算）
     "execution_plan",
     "is_multi_section", "plan_phase",
@@ -301,6 +441,7 @@ _TURN_LOCAL_DEFAULTS: dict[str, object] = {
     # dict
     "intent_analysis": {}, "extract_entities": {}, "tool_result": {},
     "execution_plan": {}, "replan_context": {}, "cross_step_conflict": {},
+    "confirmation_resolution": {},
     # list[dict]
     "candidate_drug_events": [],
 }
@@ -458,13 +599,70 @@ async def memory_load(state: dict) -> dict:
     return state
 
 
+def _intercept_pending_confirmation(state: dict, user_input_raw: str) -> bool:
+    """若用户正在回答上一轮的写操作确认卡，规则解析并直接路由。
+
+    返回 True 表示本轮已被确认回答接管，调用方必须立刻 return。
+
+    为什么必须在这里就跳过 LLM 路由：用户对确认卡的回答常常只是一个 "A" / "嗯" /
+    "不记录"。交给分类器有相当概率落到 general 或 main_qa_agent，确认就此丢失——
+    用户以为选了，档案里却什么也没有。规则解析既确定又省一次 LLM 往返。
+    """
+    pending = state.get("pending_confirmation")
+    if not isinstance(pending, dict) or pending.get("type") != PENDING_TYPE:
+        return False
+
+    action, payload = resolve_answer(user_input_raw, pending)
+
+    if action == "unrelated":
+        attempts = int(pending.get("attempts") or 0) + 1
+        if attempts < MAX_ATTEMPTS:
+            # 只是没听懂，保留 pending 记一次数，本轮照常走 LLM 路由
+            state["pending_confirmation"] = {**pending, "attempts": attempts}
+            logger.info("pending confirmation not understood (attempt %s/%s)", attempts, MAX_ATTEMPTS)
+            return False
+        # 连续答非所问 → 放弃，避免 pending 永久悬挂导致之后每轮都被拦截
+        logger.info("pending confirmation abandoned after %s attempts", attempts)
+        action, payload = "deny", None
+
+    state["confirmation_resolution"] = {"action": action, "payload": payload, "pending": pending}
+    # 强制单意图路由到写库 agent；字段与 classify_route_and_extract 的正常产出保持同形
+    state["intent"] = "drug"
+    state["intent_type"] = "drug_record"
+    state["intent_confidence"] = 1.0
+    state["intent_reason"] = f"pending_confirmation:{action}"
+    state["intent_analysis"] = {
+        "intent_type": "drug_record",
+        "confidence": 1.0,
+        "reason": f"pending_confirmation:{action}",
+        "target_name": "drug_record_agent",
+    }
+    state["target_agent"] = "drug_record_agent"
+    state["is_multi_intent"] = False
+    return True
+
+
 async def intent_recognition(state: dict) -> dict:
     _t0 = time.perf_counter()
     from app.core.agent.intent_classifier import IntentClassifier
     from app.core.agent.llm_decision_service import LLMDecisionService
 
-    text = state.get("user_input", "").strip().lower()
     user_input_raw = state.get("user_input", "")
+    # 分类看的是**合并文本**（用户原话 + 图上识别出的指标）：用户只发图不打字时
+    # `user_input` 是空串，只看它的话「发了一张单子」会落成 general，
+    # 那张单子明明就摆在眼前却没人解读它。
+    #
+    # ⚠️ 两条分类路径**都要**用合并文本。第一版只把规则回退那一侧的入参换掉了，
+    # LLM 侧的 `classify_route_and_extract` 仍收 `user_input_raw` —— 于是 LLM 看到
+    # 空串判成 general，而 `_llm_enabled_for_nodes()` 为真时**根本走不到**规则回退，
+    # 单子照样没人解读。端到端才暴露：日志里 `[vision] 条目=3 回填=3`（识别成功）
+    # 紧跟着 `intent=general | target=main_qa_agent query=""`。
+    # 故保留一份**未 lower** 的合并文本给 LLM：它要顺带抽取药名/指标名，
+    # 小写化会把英文名毁掉（"Aspirin" → "aspirin"）。`text` 仍供关键词匹配用。
+    merged_text = lab_route_text(state).strip()
+    text = merged_text.lower()
+    # ⚠️ 下面几处仍用 `user_input_raw`：确认卡应答解析、记忆写入指令
+    # —— 这些是**在解读用户本人的话**，把系统识别出的文本混进去等于替用户表态。
 
     # 结构化决策上下文注入（方案B）：供分类/路由消解跨轮指代与省略
     if not state.get("decision_context"):
@@ -476,9 +674,21 @@ async def intent_recognition(state: dict) -> dict:
         state["long_memory_write_source"] = "explicit"
         logger.info("memory_save intent detected: user_input=%s", user_input_raw[:50])
 
+    # 写操作确认卡的答案优先于一切：命中了就不再走 LLM 分类
+    if _intercept_pending_confirmation(state, user_input_raw):
+        latency_ms = int((time.perf_counter() - _t0) * 1000)
+        log_node_execution(
+            node_name="intent_recognition",
+            latency_ms=latency_ms,
+            intent=state.get("intent"),
+            confidence=state.get("intent_confidence"),
+            confirmation_action=(state.get("confirmation_resolution") or {}).get("action"),
+        )
+        return state
+
     if _llm_enabled_for_nodes():
         llm_decision = LLMDecisionService()
-        combined = await llm_decision.classify_route_and_extract(user_input_raw, ctx=decision_ctx)
+        combined = await llm_decision.classify_route_and_extract(merged_text, ctx=decision_ctx)
 
         if combined and combined.get("target_name") and combined.get("confidence", 0) >= 0.5:
             state["intent"] = combined.get("intent", "general")
@@ -841,9 +1051,15 @@ def _extract_key_findings(text: str) -> list[str]:
 #:   _build_structured_context / _detect_cross_step_conflict（final_response / extract_entities / tool_result）
 #:   execute_node 的 state.update 回填（final_response / error_msg / tool_result / llm_output / extract_entities）
 #:   _has_substantive_context（tool_result）
+#:   build_generation_prompt 的确认短路分支（needs_confirmation / confirmation_message）
+#:   memory_update 的 pending 持久化（pending_confirmation）
 #: 其余键一律剥掉：`_execute_single_step` 返回的是 sub_state 本身，原样存进
 #: `plan_step_results` 会让每个步骤结果里嵌一份近乎完整的 state 副本，
 #: 随重规划轮次逐层嵌套（体积 = 步骤数 × 整份状态）。
+#:
+#: ⚠️ 写操作二次确认的字段**必须**在这里。`_execute_single_step` 返回的是
+#: `_project_step_result()` 裁剪后的 dict，agent 写在 sub_state 上的字段不在此列
+#: 就会被静默丢掉——症状是"确认卡不出、或者选了没反应"，且不报任何错。
 _STEP_RESULT_KEYS: tuple[str, ...] = (
     "final_response",
     "error_msg",
@@ -851,6 +1067,9 @@ _STEP_RESULT_KEYS: tuple[str, ...] = (
     "llm_output",
     "extract_entities",
     "intent_type",
+    "needs_confirmation",
+    "confirmation_message",
+    "pending_confirmation",
 )
 
 
@@ -924,7 +1143,17 @@ async def execute_node(state: dict) -> dict:
             sub_state = _build_sub_state(state, step, step_results=results, preserve_entities=True)
             result = await _execute_single_step(sub_state, step)
             results[step["step_id"]] = result
-            state.update({k: v for k, v in result.items() if k in ("final_response", "error_msg", "tool_result", "llm_output", "extract_entities")})
+            # 与 _STEP_RESULT_KEYS 保持一致：确认字段必须回填到主 state，
+            # 否则 build_generation_prompt 看不到 needs_confirmation、memory_update 也存不下 pending。
+            state.update({
+                k: v
+                for k, v in result.items()
+                if k in (
+                    "final_response", "error_msg", "tool_result", "llm_output",
+                    "extract_entities", "needs_confirmation", "confirmation_message",
+                    "pending_confirmation",
+                )
+            })
             # tool_name 此前从未被赋值，导致生成模式判定里 tool_name 分支恒为死代码
             if step.get("target_type") == "tool":
                 state["tool_name"] = step.get("target_name", "")
@@ -1415,6 +1644,36 @@ def build_generation_prompt(state: dict) -> dict:
       content       : 工具结果兜底文本（"normal" 分支 LLM 失败时的降级内容）
       mode          : 生成策略，仅 "normal" 分支非空（由 _decide_response_strategy 按需计算），其余为 None
     """
+    # 写操作确认卡**最优先**，必须排在下面所有分支（含 multi_intent）之前。
+    #
+    # 它是一道阻塞式写库门控：用户不回答就不会落库，而 `pending_confirmation` 此刻
+    # 已经写进 AgentStateStore 了。execute_node 在确认被抛出后仍可能 replan 出新步骤
+    # ——实测"我吃了布洛芬和阿司匹林"会追加一步 drug_interaction 冲突检查（execute_node
+    # 给出的 replan 理由是"单句多药却没做相互作用检查"），于是同轮又产出了
+    # reconciled_sections / final_response。这些文本一旦抢先命中短路分支，卡片就被整个
+    # 吞掉：`done` 事件里 needs_confirmation 仍为 true、pending 也已落库，但用户**只看到
+    # 相互作用提示，永远不知道有一条记录在等他确认**。
+    #
+    # 为什么必须无条件压过其他分支（而不是"卡片也显示、其他回答也显示"）：pending 挂起
+    # 期间，下一句输入会被 `_intercept_pending_confirmation` 当成对卡片的回答去解析。
+    # 卡片若不可见，用户根本不知道自己在回答什么——而 resolve_answer 的自由文本分支
+    # 能把一句话里的药名解析成"选中该药"，等于**把用户没打算写的药写进医疗档案**。
+    # 丢一次对话回答是可接受的代价；静默写错档案不是。
+    if state.get("needs_confirmation") and state.get("confirmation_message"):
+        other = state.get("final_response") or ""
+        if not other:
+            # 同轮其他步骤的产出（这里是相互作用告警）不能因为写操作被挂起就丢掉，
+            # 由 confirmation 分支前置渲染在卡片之前。取 reconciled_sections 是因为
+            # 多步路径下它已有内容、而 final_response 要等生成阶段才写。
+            other = "\n\n".join(s for s in (state.get("reconciled_sections") or []) if s and s.strip())
+        return {
+            "branch": "confirmation",
+            "system_prompt": "",
+            "user_prompt": "",
+            "content": other,
+            "mode": None,
+        }
+
     reconciled_sections = state.get("reconciled_sections") or []
     if len(reconciled_sections) > 1:
         system_prompt = (
@@ -1433,13 +1692,24 @@ def build_generation_prompt(state: dict) -> dict:
         for i, section in enumerate(reconciled_sections):
             sections_text += f"\n\n--- 子问题 {i + 1} ---\n{section}"
         user_prompt = f"用户原始问题：{state.get('user_input', '')}\n\n以下是各子问题的回答：{sections_text}"
+        # 图片块排在各子问题之前：它交代的是"用户这一轮还带了什么"，
+        # 是整合时对上下文的理解，不是某一段可以被合并掉的子回答。
+        image_block = image_context_block(state)
+        if image_block:
+            user_prompt = f"{image_block}\n\n{user_prompt}"
         return {"branch": "multi_intent", "system_prompt": system_prompt, "user_prompt": user_prompt, "content": "", "mode": None}
 
     # 以下几个是短路分支：上游已产出可直接返回的文本，无需再走 LLM、也无需计算生成策略
     if state.get("final_response"):
-        return {"branch": "final_response", "system_prompt": "", "user_prompt": "", "content": "", "mode": None}
-    if state.get("needs_confirmation") and state.get("confirmation_message"):
-        return {"branch": "confirmation", "system_prompt": "", "user_prompt": "", "content": "", "mode": None}
+        # content 在这个分支的含义是「正文之前要加的一段话」（与 confirmation 分支同一约定）。
+        # 这里放图片提示而不是走 prompt：该分支**不过 LLM**，写进 prompt 也没人看。
+        return {
+            "branch": "final_response",
+            "system_prompt": "",
+            "user_prompt": "",
+            "content": image_user_caveat(state),
+            "mode": None,
+        }
     if state.get("candidate_drug_events"):
         return {"branch": "drug_confirmation", "system_prompt": "", "user_prompt": "", "content": "", "mode": None}
 
@@ -1496,6 +1766,9 @@ def build_generation_prompt(state: dict) -> dict:
             user_prompt = f"医疗知识库检索结果（供参考）：\n{json.dumps(retrieved_knowledge, ensure_ascii=False)}\n\n" + user_prompt
         if recon:
             user_prompt = f"本轮已确认的结构化事实（来源：工具/档案查询，优先级高于检索结果）：\n{recon}\n\n" + user_prompt
+        image_block = image_context_block(state)
+        if image_block:
+            user_prompt = f"{image_block}\n\n{user_prompt}"
     else:
         system_prompt = (
             "你是医疗问答助手，需要用自然的对话方式回答用户。\n"
@@ -1523,6 +1796,11 @@ def build_generation_prompt(state: dict) -> dict:
             parts.append("医疗知识库检索结果（供参考）：\n" + json.dumps(retrieved_knowledge, ensure_ascii=False))
         if recon:
             parts.append("本轮已确认的结构化事实（来源：工具/档案查询，优先级高于检索结果）：\n" + recon)
+        # 图片块紧贴"用户输入"：两者是同一轮里用户带来的东西，分开会让模型把图片
+        # 当成上一轮的遗留。**不能并进"用户输入"**——那等于把识别结果冒充成用户原话。
+        image_block = image_context_block(state)
+        if image_block:
+            parts.append(image_block)
         parts.append("用户输入：\n" + (state.get("user_input", "") or ""))
         user_prompt = "\n\n".join(parts)
 
@@ -1638,11 +1916,18 @@ async def llm_generate(state: dict, writer: StreamWriter = _noop_writer) -> dict
         return state
 
     if branch == "final_response":
-        state["llm_output"] = state["final_response"]
+        # plan["content"] 是本分支的图片提示（见 build_generation_prompt 的说明）。
+        # 必须**并进 llm_output**而不是只多发一个 chunk：workflow.run_stream 靠
+        # `disclaimer_text[len(llm_output):]` 求免责声明增量，llm_output 与
+        # final_response 一旦不是前缀关系，用户会在末尾收到一段被腰斩的乱码。
+        _lead = (plan.get("content") or "").strip()
+        _body = state["final_response"]
+        _message = f"{_lead}\n\n{_body}" if _lead else _body
+        state["llm_output"] = _message
         # 上游已产出完整文本，按句切分模拟流式，避免一次性吐出一大段。
         # ⚠️ 每片之间必须 `await` 让出事件循环，否则等于没切——见 _FAKE_STREAM_DELAY_S 注释。
         writer(intent_payload(state, full=False))
-        pieces = list(iter_sentence_chunks(state["final_response"]))
+        pieces = list(iter_sentence_chunks(_message))
         fake_delay_ms = await _emit_pieces_with_pace(pieces, writer)
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(
@@ -1656,8 +1941,23 @@ async def llm_generate(state: dict, writer: StreamWriter = _noop_writer) -> dict
 
     if branch == "confirmation":
         # 与改造前一致：该分支不发 intent 事件
-        state["llm_output"] = state["confirmation_message"]
-        writer(chunk_payload(state["confirmation_message"]))
+        # plan["content"] 是同轮其他步骤的产出（如相互作用告警）。确认卡优先展示，
+        # 但不能因此吞掉安全提示——写操作被挂起 ≠ 用户不需要看到这条告警。
+        _lead = (plan.get("content") or "").strip()
+        _card = state["confirmation_message"]
+        _message = f"{_lead}\n\n{_card}" if _lead else _card
+        state["llm_output"] = _message
+        writer(chunk_payload(_message))
+        # 写操作确认卡：把选项作为结构化事件推给前端渲染成按钮。
+        # pending 没带 options 时不发（那类确认只能照着文本打字），前端对此是兼容的。
+        pending = state.get("pending_confirmation")
+        if isinstance(pending, dict) and pending.get("options"):
+            writer(
+                options_payload(
+                    confirmation_id=str(pending.get("id") or ""),
+                    options=pending["options"],
+                )
+            )
         latency_ms = int((time.perf_counter() - _t0) * 1000)
         log_node_execution(node_name="llm_generate", latency_ms=latency_ms, shortcut="confirmation")
         return state
@@ -1792,9 +2092,18 @@ async def memory_update(state: dict) -> dict:
         log_node_execution(node_name="memory_update", latency_ms=latency_ms, skipped=True)
         return state
 
+    # 只发图不打字时 `user_input` 是空串，直接落库就是一条空的用户消息——
+    # 下一轮 `_format_history` 会把空内容整行跳过（见那里的 `if not content: continue`），
+    # 于是这段对话在历史里**只剩一句孤零零的助手回答**，指代彻底断掉。
+    # 写一个占位符如实描述用户做了什么：它是对话记录层的**标注**，不是用户原话，
+    # 所以只写进库里，绝不回流进 `state["user_input"]`（那会让它冒充用户发言）。
+    _user_message = state["user_input"] if (state["user_input"] or "").strip() else (
+        "（上传了一张化验单图片）" if (state.get("image_lab_text") or state.get("image_lab_items")) else ""
+    )
+
     mem = MemoryService()
     try:
-        await mem.update_user_memory(state["user_id"], state["session_id"], "user", state["user_input"])
+        await mem.update_user_memory(state["user_id"], state["session_id"], "user", _user_message)
         if "final_response" in state:
             await mem.update_user_memory(state["user_id"], state["session_id"], "assistant", state["final_response"])
     except Exception as e:
@@ -1884,7 +2193,7 @@ async def _async_long_memory_write(state: dict, source: str = "chat"):
         result = await svc.write_with_conflict_check(
             user_id=user_id, session_id=session_id, items=items, source=source
         )
-        # 更新游标：本消息已提取（drug_event 已由服务分流到 SQL）
+        # 更新游标：本消息已提取
         if source_chat_id:
             await svc.update_cursor(user_id=user_id, session_id=session_id, chat_id=source_chat_id)
         write_time_ms = int((time.time() - start_time) * 1000)

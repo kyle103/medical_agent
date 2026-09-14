@@ -185,10 +185,11 @@
 
       <footer class="composer-wrap">
         <div class="composer-inner">
-          <!-- 化验单图片识别：只做「图 → 可编辑文本」，不产出任何结论。
-               识别结果回填到输入框，由用户核对后再发送，走的是和手工输入完全相同的那条链路。 -->
+          <!-- 化验单图片：选图只挂成**本地待发送附件**，不发任何请求；
+               点发送时图片与文本一起进对话，由后端识别并结合文本作答。
+               后端仍是「图 → 文本 → 同一个判定实现」，不新开第二条医学判定路径。 -->
           <div class="attach-strip" id="attachStrip" hidden>
-            <img class="attach-thumb" id="attachThumb" alt="化验单缩略图">
+            <img class="attach-thumb" id="attachThumb" alt="待发送图片缩略图">
             <div class="attach-body">
               <p class="attach-name" id="attachName">—</p>
               <p class="attach-status" id="attachStatus">—</p>
@@ -201,14 +202,17 @@
           </div>
 
           <div class="composer-box">
-            <button class="attach-btn" id="attachBtn" type="button" aria-label="上传化验单" title="上传化验单图片，自动识别检验项目">
+            <button class="attach-btn" id="attachBtn" type="button" aria-label="上传化验单" title="上传化验单图片（会随消息一起发送）">
               <svg viewBox="0 0 24 24" width="19" height="19" aria-hidden="true">
                 <rect x="3" y="5" width="18" height="14" rx="3" fill="none" stroke="currentColor" stroke-width="1.8"/>
                 <circle cx="9" cy="10" r="1.6" fill="currentColor"/>
                 <path d="M4 17l4.5-4.5L13 17l3-2.5 4 3.5" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
               </svg>
             </button>
-            <input type="file" id="labImageInput" accept="image/jpeg,image/png,image/webp,image/bmp" hidden>
+            <!-- accept 与后端 `_ALLOWED_FORMATS` / app.js 的 LAB_IMAGE_TYPES 三处必须一致：
+                 少一个就是"明明能读却被文件选择器挡在门外"。AVIF 曾被漏在这里
+                 （Pillow 12 自带 libavif，实测能读）。 -->
+            <input type="file" id="labImageInput" accept="image/jpeg,image/png,image/webp,image/bmp,image/avif" hidden>
             <textarea class="composer-input" id="userInput" rows="1" placeholder="输入你的问题…（Enter 发送，Shift+Enter 换行）"></textarea>
             <button class="send-btn" id="sendBtn" type="button" aria-label="发送" title="发送">
               <svg viewBox="0 0 24 24" width="18" height="18" aria-hidden="true">
@@ -216,7 +220,7 @@
               </svg>
             </button>
           </div>
-          <p class="composer-hint">Enter 发送 · Shift+Enter 换行 · 点左侧图片按钮可上传化验单自动识别</p>
+          <p class="composer-hint">Enter 发送 · Shift+Enter 换行 · 点左侧图片按钮可附带化验单照片（可只发图，也可配一句话）</p>
         </div>
         <p class="disclaimer-bar">免责声明：本内容仅为通用健康科普参考，不构成任何医疗诊断、用药建议。如有身体不适，请及时前往正规医疗机构就诊，遵医嘱治疗。</p>
       </footer>

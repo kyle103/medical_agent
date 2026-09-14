@@ -37,9 +37,11 @@
 
 from __future__ import annotations
 
+import base64
+import binascii
 import re
 
-from app.common.exceptions import LLMCallException, ParamException
+from app.common.exceptions import LLMCallException, ParamException, PayloadTooLargeException
 from app.common.logger import get_logger
 from app.config.settings import settings
 from app.core.llm.llm_service import LLMService
@@ -47,6 +49,14 @@ from app.core.rag.lab_reference_service import LabReferenceService
 from app.schema.lab_schema import LabVisionReport
 
 logger = get_logger(__name__)
+
+
+#: `data:image/png;base64,xxxx` 形态的前缀。有前缀时 mime 以前缀为准 ——
+#: 它由浏览器按文件内容填，比用户单独传的字段可信。
+_DATA_URL_RE = re.compile(r"^data:(?P<mime>[a-z0-9.+-]+/[a-z0-9.+-]+)?\s*;?\s*base64,", re.I)
+
+#: base64 字符集：解码前先粗筛，避免把明显不是图片的东西送进解码器。
+_B64_RE = re.compile(r"^[A-Za-z0-9+/\s]*={0,2}$")
 
 
 #: 识别提示词。要点与坑（2026-09-13 实测）：
@@ -168,6 +178,54 @@ def _normalize_unit(unit: str | None) -> str:
     for src in ("μ", "µ"):
         s = s.replace(src, "u")
     return s
+
+
+def decode_upload(
+    payload: str, mime_hint: str = "", *, max_mb: float | None = None
+) -> tuple[bytes, str]:
+    """base64（可带 data URL 前缀）→ `(原始字节, mime)`。
+
+    这是**所有图片入口的唯一闸门**：`/lab/image-extract`（用户手工选图后单独识别）
+    与聊天路径（图片随消息一起发）都走这里。刻意只此一份 —— 两条入口各写一版尺寸/
+    字符集校验，迟早会在某一版上漂移，而其中一版会漏掉体积门。
+
+    顺序是有讲究的：**体积闸门放在解码之前**。base64 膨胀约 4/3，用编码长度反推
+    上界就能拦掉超大文件，不必先把它解成几十 MB 的 bytes 再报错（那时内存已经吃掉了）。
+
+    抛 `PayloadTooLargeException`（→413，可压小重试）与 `ParamException`（→400，数据本身坏）。
+    调用方负责把 `code` 映射成自己的响应形态（HTTP 状态码 / 对话内的说明文案）。
+    """
+    max_mb = float(settings.LAB_IMAGE_MAX_MB or 0) if max_mb is None else float(max_mb)
+    max_bytes = int(max_mb * 1024 * 1024)
+
+    payload = (payload or "").strip()
+    mime = (mime_hint or "").split(";")[0].strip().lower()
+
+    # --- 1) 允许 data URL 前缀；前缀里的 mime 优先于独立字段 ---
+    m = _DATA_URL_RE.match(payload)
+    if m:
+        mime = (m.group("mime") or mime).lower()
+        payload = payload[m.end():]
+
+    # --- 2) 体积闸门（解码之前）---
+    if max_bytes and len(payload) > (max_bytes * 4 // 3) + 1024:
+        raise PayloadTooLargeException(f"图片过大，请压缩到 {max_mb:g}MB 以内再试")
+
+    payload = re.sub(r"\s+", "", payload)
+    if not _B64_RE.match(payload):
+        raise ParamException("图片数据不是合法的 base64，请重新选择文件")
+    try:
+        raw = base64.b64decode(payload, validate=True)
+    except (binascii.Error, ValueError) as e:
+        raise ParamException("图片数据不是合法的 base64，请重新选择文件") from e
+
+    if not raw:
+        raise ParamException("图片内容为空")
+    # 字符集合法但体积超限（例如填充字符使编码长度恰好没触发上面的粗筛）→ 仍按 413
+    if max_bytes and len(raw) > max_bytes:
+        raise PayloadTooLargeException(f"图片过大，请压缩到 {max_mb:g}MB 以内再试")
+
+    return raw, mime
 
 
 def prepare_image(raw: bytes) -> tuple[bytes, str, dict]:

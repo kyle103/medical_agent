@@ -61,7 +61,8 @@ _UNTRACKED_FIELDS: frozenset[str] = frozenset({
     "decision_context", "last_decision",
     "tool_result", "llm_output",
     "candidate_drug_events", "pending_drug_events_for_confirmation",
-    "session_runtime_state", "pending_confirmation",
+    "session_runtime_state", "pending_confirmation", "confirmation_resolution",
+    "image_lab_text", "image_lab_items", "image_note",
     "plan_step_results", "reconciled_sections", "reconciled_context",
     "replan_context", "cross_step_conflict", "proposed_updates",
 })

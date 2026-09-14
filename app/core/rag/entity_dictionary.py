@@ -240,6 +240,29 @@ class EntityDictionary:
                 names.append(canon)
         return names
 
+    def candidates_for(self, text: str, kinds: Sequence[str] | None = None) -> list[dict]:
+        """原文中出现的候选实体（保序、按规范名去重）。
+
+        与 `resolve()` 的区别：额外保留**命中的原始词**。确认卡要让用户看到
+        "你写的『感康』我理解为『复方氨酚烷胺片』"这类对应关系，只有规范名不够。
+        """
+        out: list[dict] = []
+        seen: set[str] = set()
+        for hit in self.scan_hits(text, kinds=kinds):
+            canon = hit["canonical_name"]
+            if canon in seen:
+                continue
+            seen.add(canon)
+            out.append(
+                {
+                    "canonical_name": canon,
+                    "matched_term": hit["term"],
+                    "kind": hit["kind"],
+                    "negated": hit["negated"],
+                }
+            )
+        return out
+
     # ---- 候选解析 --------------------------------------------------------
     def canonical_name_for(self, name: str, kinds: Sequence[str] | None = None) -> str | None:
         """把“候选名”解析到已知标准名（含标准名+剂型后缀形式）。

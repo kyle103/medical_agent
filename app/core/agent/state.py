@@ -123,6 +123,29 @@ class AgentState(TypedDict, total=False):
     session_runtime_state: Annotated[dict, UntrackedValue]
     # (a) 跨轮确认态，owner 是 AgentStateStore
     pending_confirmation: Annotated[dict, UntrackedValue]
+    # (c) 本轮用户对上一轮确认卡的回答（intent_node 规则解析，零 LLM）。
+    #     单轮有效：由下游 agent 消费后即完成使命，不需要跨轮。
+    #     ⚠️ 它驱动的落库决定**必须**能在 execute_node 的步骤结果白名单里回传，见 nodes.py::_STEP_RESULT_KEYS
+    confirmation_resolution: Annotated[dict, UntrackedValue]
+
+    # (c) 用户本轮随消息上传的化验单图片，经视觉模型识别后的产物。
+    #     `image_lab_text` 是可被 `lab_item_parser.parse_lab_items` 重新解析的文本
+    #     （写法按显式分隔符定制，见 lab_report_vision 模块说明），图路与文路由此汇入
+    #     **同一个**判定实现；`image_lab_items` 是结构化条目，供生成阶段说明
+    #     "哪些项未纳入及原因"。
+    #     ⚠️ 图片字节**绝不**进 state：base64 有几 MB，进 tracked 字段会被写进每一份
+    #     checkpointer 快照。识别在路由层完成，这里只收小的文本/结构化结果。
+    #     ⚠️ 绝不把 `image_lab_text` 拼进 `user_input`：后者原样落进 user_chat_records
+    #     成为对话记录，拼上就等于把系统的解析结果冒充成用户说的话。
+    #     路由/解析需要合并视图时用 nodes.py::lab_route_text()。
+    image_lab_text: Annotated[str, UntrackedValue]
+    image_lab_items: Annotated[list[dict], UntrackedValue]
+    # 图片这条线**没能走通**时给用户的一句实话（未配置视觉模型 / 解码失败 / 模型调用失败 /
+    # 合规拦截 / 没读出可解析指标）。路由层写，只喂生成阶段那个图片块。
+    # 为什么不让路由层直接回一句就完事：用户**同时打了字**时轮次必须照常走完，
+    # 而"图没读出来"这件事只有并进本轮上下文才有人告诉用户 —— 否则用户发了一张单子
+    # 加一句「这个严重吗」，收到的回答对那张图只字不提，看起来像是系统读过并认为没问题。
+    image_note: Annotated[str, UntrackedValue]
 
     execution_plan: ExecutionPlan
     # (c) 每步结果内部嵌着整份 state 副本 → 循环引用，无法序列化，必须排除

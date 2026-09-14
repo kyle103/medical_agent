@@ -217,3 +217,27 @@ def has_lab_values(user_input: str) -> bool:
       否则工具会零抽取并回一句「请提供指标名称和数值」，答非所问且会反复复读。
     """
     return bool(parse_lab_items(user_input))
+
+
+def lab_route_text(state: dict) -> str:
+    """本轮**路由与解析**该看的那段文本 = 用户原话 + 图片识别出的指标。
+
+    为什么放在这个中立模块（而不是 `nodes.py`）：它有三个消费者 ——
+    `nodes.py::intent_recognition`、`planner_agent._route_by_intent_and_text`、
+    `tool_executor._execute_lab_report` —— 而 `nodes` 已经 import 了后两者，
+    反向 import 就是循环。本模块的定位恰好就是"化验解析的中立交汇点"（见文件头）。
+
+    ⚠️ **绝不把图片文本写回 `state["user_input"]`。** 那个字段会被原样写进
+    `user_chat_records` 成为对话记录，也会进 checkpointer 快照；拼上识别结果就等于
+    把系统的解析产物冒充成用户说过的话 —— 用户从没打过「白细胞：6.2」这行字。
+
+    ⚠️ 只服务于**判定**（"有没有可解读的指标"），不是给用户看的文本。
+    给模型看的那段另有一个标明来源的块，见 `nodes.py::image_context_block`。
+    """
+    user_text = (state.get("user_input") or "").strip()
+    image_text = (state.get("image_lab_text") or "").strip()
+    if not image_text:
+        return user_text
+    if not user_text:
+        return image_text
+    return f"{user_text}\n{image_text}"

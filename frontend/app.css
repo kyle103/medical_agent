@@ -57,6 +57,12 @@
 * { box-sizing: border-box; }
 html, body { overflow-x: clip; }
 
+/* 全局图片兜底：`<img>` 是 replaced element，没有任何尺寸约束时按**原始像素**渲染，
+   一张 4000px 的化验单照片就足以把页面撑破、把其他组件挤出视口。
+   这里只兜"永远不许超出容器"，具体尺寸由各自组件决定（`.attach-thumb` 52×40、
+   `.msg-img` 240×180）——它防的是失控，不是排版。 */
+img { max-width: 100%; height: auto; }
+
 /* hidden 属性必须始终生效：元素若有 display:grid/flex 会覆盖 UA 默认样式，导致
    登录页/聊天页同时显示（上下堆叠）的 bug。用 !important 兜底。 */
 [hidden] { display: none !important; }
@@ -325,6 +331,48 @@ code { font-family: var(--font-mono); }
   max-width: 78%;
 }
 
+/* 用户气泡里随消息发出去的图。缩略图定位：看得清是哪张单子就够了，放大看细节不是这里的
+   职责（医学影像不落库，刷新后气泡里也不会再有图）。
+
+   ⚠️ 选择器必须同时写**结构式**（`.msg--user .bubble img`）和**类式**（`.msg-img`）：
+   只挂类式的话，尺寸约束就依赖 JS 是否给 img 加上了 class —— app.js 一旦命中旧缓存，
+   整条约束失效，只剩上面那条全局兜底（3000×4000 的图会渲染成 520×694，看着仍像"图片过大"）。
+   挂在结构选择器上就不依赖 JS。
+
+   ⚠️ `!important` 是防"看不见的对手"（第三方/浏览器扩展注入的 `img` 规则）：这类规则随时可能
+   命中 img，而"我们的规则被别人的规则盖掉"从代码里完全看不出来。带 `!important` + 结构选择器
+   是样式表这一侧能拿到的最强约束；JS 侧另有一层行内 `!important`（app.js::lockImageSize）。 */
+.msg--user .bubble img,
+.msg-img {
+  display: block !important;
+  max-width: min(240px, 100%) !important;
+  max-height: 180px !important;
+  object-fit: contain !important;
+  border-radius: var(--r-sm);
+  background: var(--c-card);
+}
+.msg-img + .msg-text { margin-top: var(--sp-2); }
+
+/* 写操作二次确认的选择卡按钮（后端 SSE options 事件 → app.js::flushQuickReplies）
+   挂在对应助手消息下方，与卡面文本（同一条 bubble 里已列出 A/B/C）互为补充：
+   有按钮就点，没有按钮（stream=false 的客户端）照着文本打字同样能走通。 */
+.reply-row {
+  display: flex; flex-wrap: wrap; gap: var(--sp-2);
+  margin-top: var(--sp-3);
+}
+.reply-chip {
+  display: inline-flex; align-items: center;
+  padding: 5px var(--sp-3);
+  font-size: var(--fs-sm); font-family: inherit; color: var(--c-ink);
+  background: var(--c-card); border: 1px solid var(--c-accent-line);
+  border-radius: var(--r-full); cursor: pointer;
+  transition: background var(--dur-fast) var(--ease), border-color var(--dur-fast) var(--ease);
+}
+.reply-chip:hover { background: var(--c-accent-soft); }
+.reply-chip:disabled { opacity: 0.5; cursor: not-allowed; }
+/* 过期卡：pending_confirmation 在会话里只有一槽，新卡覆盖旧卡，旧按钮必须失效 */
+.reply-chip.is-stale { border-color: var(--c-rule); text-decoration: line-through; }
+
 /* 助手气泡内 markdown */
 .bubble h2, .bubble h3, .bubble h4 { margin: var(--sp-4) 0 var(--sp-2); font-weight: 700; line-height: 1.35; overflow-wrap: anywhere; }
 .bubble h2:first-child, .bubble h3:first-child, .bubble h4:first-child { margin-top: 0; }
@@ -407,8 +455,8 @@ code { font-family: var(--font-mono); }
 }
 .attach-btn:hover:not(:disabled) { background: var(--c-hover); color: var(--c-accent); }
 .attach-btn:disabled { opacity: 0.4; cursor: not-allowed; }
-.attach-btn.is-loading { color: var(--c-accent); animation: attach-pulse 1.1s ease-in-out infinite; }
-@keyframes attach-pulse { 0%, 100% { opacity: 1; } 50% { opacity: 0.35; } }
+/* 注：曾有一个 .attach-btn.is-loading 呼吸动画，用于"选图即开始识别"那套流程。
+   现在选图只做本地挂附件（见 app.js::attachLabImage），没有异步等待可指示，故移除。 */
 
 /* 上传预览条：缩略图 + 文件名 + 状态，去掉按钮 */
 .attach-strip {

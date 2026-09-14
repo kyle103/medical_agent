@@ -853,30 +853,3 @@ class LLMDecisionService:
             logger.warning("LLMDecisionService.extract_drug_info failed: %s", e)
             return None
 
-    async def extract_drug_name_from_event(self, text: str) -> str | None:
-        """LLM 优先：从用药事件文本中提取药品名称。"""
-        if not _llm_enabled():
-            return None
-
-        system_prompt = (
-            "请从以下文本中提取药品名称。只输出药品名称，不要输出其他内容。\n"
-            "如果文本中包含多个药品，只输出第一个。如果无法识别，输出空字符串。"
-        )
-        user_prompt = f"文本：{text}"
-
-        try:
-            raw = await self.llm.chat_completion(
-                prompt=user_prompt,
-                system_prompt=system_prompt,
-                stream=False,
-                timeout_s=4.0,
-                max_tokens=30,
-            )
-            if raw:
-                name = raw.strip()
-                if len(name) >= 2 and len(name) <= 24:
-                    return name
-            return None
-        except Exception as e:
-            logger.warning("LLMDecisionService.extract_drug_name_from_event failed: %s", e)
-            return None

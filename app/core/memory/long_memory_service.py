@@ -23,7 +23,6 @@ from app.db.chroma_store import (
     vector_search,
 )
 from app.core.session.agent_state_store import AgentStateStore
-from app.core.tools.drug_record_tool import DrugRecordTool
 
 logger = get_logger(__name__)
 
@@ -610,30 +609,23 @@ class LongMemoryService:
         return "skip"
 
     async def write_with_conflict_check(self, *, user_id: str, session_id: str, items: list[LongMemoryItem], source: str = "chat") -> dict:
-        """带冲突检测的写入，返回写入结果摘要。
+        """带冲突检测的写入，返回写入结果摘要。全部类型一律走向量库。
 
-        分流：
-        - drug_event 类型 → SQL（UserDrugRecord，结构化档案）
-        - 其余（fact/profile/preference/summary）→ 向量库（带冲突检测）
+        ⚠️ `drug_event` 曾是例外——从这里直连 `DrugRecordTool.add_record` 写
+        `user_drug_records`。那条路径已移除：该表是医疗档案，**只能**由用药记录 agent
+        在用户确认后写入（见 app/core/skills/drug_write_confirmation.py）。会话结束时的
+        批量落库是无人交互的异步任务，结构上无法向用户确认，让它继续直写档案会让
+        "模型不直接修改用户档案"变成假话。
+
+        药事件仍作为普通记忆项留在向量库（用户问"我以前说过吃什么药"照样召回），
+        只是不再进结构化档案表。
         """
         if not items:
             return {"written": 0, "skipped": 0, "replaced": 0}
 
-        # 1) drug_event 走 SQL，不进向量库
-        drug_events = [it for it in items if it.memory_type == "drug_event"]
-        others = [it for it in items if it.memory_type != "drug_event"]
-
         result = {"written": 0, "skipped": 0, "replaced": 0}
-        if drug_events:
-            sql_written = await self._write_drug_events_to_sql(user_id=user_id, items=drug_events)
-            result["written"] += sql_written
-            result["skipped"] += len(drug_events) - sql_written
 
-        if not others:
-            return result
-
-        # 2) 其余类型走向量库（冲突检测）
-        conflicts = await self.detect_conflicts(user_id=user_id, items=others)
+        conflicts = await self.detect_conflicts(user_id=user_id, items=items)
         conflict_map = {}
         for c in conflicts:
             conflict_map[c["candidate"].memory_id] = c
@@ -642,7 +634,7 @@ class LongMemoryService:
         skipped = 0
         replaced = 0
 
-        for item in others:
+        for item in items:
             conflict = conflict_map.get(item.memory_id)
             if not conflict:
                 to_write.append(item)
@@ -673,55 +665,6 @@ class LongMemoryService:
             source, len(items), result["written"], result["skipped"], result["replaced"],
         )
         return result
-
-    async def _write_drug_events_to_sql(self, *, user_id: str, items: list[LongMemoryItem]) -> int:
-        """drug_event 写入 SQL（UserDrugRecord），用 add_record 的幂等去重防重复。"""
-        written = 0
-        tool = DrugRecordTool()
-        for it in items:
-            original = (it.text or "").replace("用户", "我")
-            drug_name = await self._extract_drug_name(original)
-            if not drug_name:
-                continue
-            time_text = self._extract_time_text(original)
-            try:
-                res = await tool.add_record(user_id=user_id, drug_name=drug_name, time_text=time_text)
-                if res.get("created"):
-                    written += 1
-                    logger.info("drug_event -> SQL: user=%s drug=%s", user_id, drug_name)
-                elif not res.get("ok"):
-                    logger.warning("drug_event SQL write failed: %s", res.get("message"))
-            except Exception as e:
-                logger.error("drug_event SQL write error: %s", e)
-        return written
-
-    @staticmethod
-    def _extract_time_text(text: str) -> str:
-        """从用药事件文本粗提取时间描述（"今天"/"昨天下午"等），无则空串。"""
-        for kw in ["今天晚上", "昨天晚上", "今天中午", "昨天下午", "昨天早上", "前天晚上",
-                   "前天", "昨天", "今天", "晚上", "下午", "上午", "早上", "中午", "凌晨", "半夜"]:
-            if kw in (text or ""):
-                return kw
-        return ""
-
-    async def _extract_drug_name(self, text: str) -> str | None:
-        """从用药事件文本提取药名。
-
-        正则优先（确定性，避开"用户"里的"用"误匹配），LLM 兜底（处理非"吃了X"句式）。
-        """
-        m = re.search(r"(?:吃了|服用了|服用过|使用了|使用过|服用)([^，。！？\s：:，]{1,12})", text)
-        if m:
-            candidate = m.group(1).strip().strip("了")
-            if 2 <= len(candidate) <= 24:
-                return candidate
-        try:
-            from app.core.agent.llm_decision_service import LLMDecisionService
-            name = await LLMDecisionService().extract_drug_name_from_event(text)
-            if name:
-                return name
-        except Exception:
-            pass
-        return None
 
     async def get_cursor(self, *, user_id: str, session_id: str) -> int:
         from sqlalchemy import select

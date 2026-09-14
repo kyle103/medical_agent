@@ -135,6 +135,9 @@ class MedicalAgent:
         user_input: str,
         stream: bool,
         enable_archive_link: bool,
+        image_lab_text: str = "",
+        image_lab_items: list[dict] | None = None,
+        image_note: str = "",
     ) -> dict:
         if not user_id:
             raise UserAuthException("未授权")
@@ -145,6 +148,12 @@ class MedicalAgent:
             "user_input": user_input,
             "stream": stream,
             "enable_archive_link": enable_archive_link,
+            # 图片识别产物（由 chat_router 在入图**之前**算好，见 chat_router::_extract_lab_image）。
+            # 传进来的只有小的文本/结构化结果 —— 图片字节（base64 有几 MB）绝不进 state：
+            # 进 tracked 字段就会被写进每一份 checkpointer 快照。
+            "image_lab_text": image_lab_text,
+            "image_lab_items": image_lab_items or [],
+            "image_note": image_note,
         }
         begin_usage_tracking()
         out = await self.graph.ainvoke(
@@ -174,6 +183,9 @@ class MedicalAgent:
             "intent_analysis": intent_analysis,
             "target_agent": out.get("target_agent", ""),
             "needs_confirmation": bool(out.get("needs_confirmation")),
+            # 写操作二次确认的选项。SSE 路径由 stream_events.options_payload 单独发
+            # options 事件；这里保证 stream=false 的调用方拿到同一份选项，不必再判空。
+            "options": list((out.get("pending_confirmation") or {}).get("options") or []),
             "conversation_turns": len(history) // 2 if history else 0,
             "cache_stats": cache_stats,
         }
@@ -185,6 +197,9 @@ class MedicalAgent:
         session_id: str,
         user_input: str,
         enable_archive_link: bool,
+        image_lab_text: str = "",
+        image_lab_items: list[dict] | None = None,
+        image_note: str = "",
     ) -> AsyncGenerator[str, None]:
         """流式执行。
 
@@ -208,6 +223,10 @@ class MedicalAgent:
             "user_input": user_input,
             "stream": True,
             "enable_archive_link": enable_archive_link,
+            # 图片识别产物 —— 与 run() 同一份契约，理由见那里的注释
+            "image_lab_text": image_lab_text,
+            "image_lab_items": image_lab_items or [],
+            "image_note": image_note,
         }
         begin_usage_tracking()
 

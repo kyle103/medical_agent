@@ -13,6 +13,17 @@ class ParamException(AppException):
     msg = "参数错误"
 
 
+class PayloadTooLargeException(ParamException):
+    """请求体过大（图片上传）。
+
+    单独一个类而不是复用 ParamException：413 是能表达"这次不行、压小再来"的可重试语义的，
+    而 400 会被前端当成"你传的东西是坏的"。图片入口的闸门在 decode 之前就要能报出这个区分。
+    """
+
+    code = 413
+    msg = "上传内容过大"
+
+
 class UserAuthException(AppException):
     code = 401
     msg = "用户身份非法，请重新获取用户标识"

@@ -6,7 +6,7 @@ from app.common.logger import get_logger
 from app.core.rag.drug_knowledge_service import DrugKnowledgeService
 from app.core.tools.drug_entity_extractor import DrugEntityExtractor
 from app.core.tools.drug_interaction_tool import DrugInteractionTool
-from app.core.tools.lab_item_parser import parse_lab_items
+from app.core.tools.lab_item_parser import lab_route_text, parse_lab_items
 from app.core.tools.lab_report_tool import LabReportTool
 
 logger = get_logger(__name__)
@@ -15,13 +15,16 @@ logger = get_logger(__name__)
 #: 化验工具「零抽取」时回给上游的说明文本。
 #:
 #: 两点必须写清，否则用户会反复问同一件事：
-#: 1) **能力边界**：本系统没有图片识别能力，用户问"我直接发单子给你吗"时，
-#:    能给的确定答案只有"不行，请发文本"；
+#: 1) **这一轮到底怎么了** —— 是"没给数值"还是"给了但读不出来"。
+#:    曾经这里写的是「本系统…不支持上传或拍照化验单（没有图片识别能力）」：
+#:    图片识别接入后这句话就成了明确的假话，而且用户照着它去改也没用
+#:    （他可能已经发了图，问题在于图没读出来）；
 #: 2) **可用的输入格式**：给出可直接照抄的示例。
 #: 这段文本只在 `no_data=True` 时出现，不会再被当作"化验结论"输出（见 `_decide_response_mode`）。
 _LAB_NO_DATA_HINT = (
-    "本系统只能解读**文本形式**的检验指标，不支持上传或拍照化验单（没有图片识别能力）。"
-    "如需解读，请把指标按「名称 + 数值」用文字发来，一行一项即可，例如：血糖 6.5；血压 120/80。"
+    "这一轮我没拿到可以解读的检验指标。"
+    "你可以直接上传化验单照片，也可以把指标按「名称 + 数值」用文字发来，"
+    "一行一项即可，例如：血糖 6.5；血压 120/80。"
 )
 
 
@@ -126,9 +129,12 @@ class ToolExecutor:
     async def _execute_lab_report(self, state: dict) -> dict:
         tool = LabReportTool()
         user_id = state.get("user_id", "")
-        user_input = state.get("user_input", "")
 
-        lab_items = parse_lab_items(user_input)
+        # 图路与文路在此汇入**同一个** `parse_lab_items` → `LabReportTool`：
+        # 图片识别产出的文本就是按 `parse_lab_items` 的显式分隔符定制的
+        # （见 lab_report_vision 模块说明），所以图路不新开第二条判定路径。
+        # 新增图片时这里只改"喂什么文本"，判定口径一行未动。
+        lab_items = parse_lab_items(lab_route_text(state))
         if not lab_items:
             return {
                 "tool_result": {

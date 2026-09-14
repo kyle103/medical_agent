@@ -16,6 +16,11 @@ const state = {
   sessionId: null,
   busy: false,
   turns: 0,
+  //: 待发送的图片附件 `{file, dataUrl, mime, name, size, previewUrl}`，或 null。
+  //: 选图只挂在这里，**不发任何请求**；点发送时才随消息一起上去（见 attachLabImage）。
+  //: 之所以存 dataUrl 而不是只存 File：发送要立刻用，而 FileReader 是异步的 ——
+  //: 留到点击那一刻再读，用户会看到一个"点了没反应"的间隙。
+  attachment: null,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -101,6 +106,39 @@ function scrollToBottom() {
   sc.scrollTop = sc.scrollHeight;
 }
 
+/* ---------- 图片尺寸硬约束（行内 style + !important） ----------
+ *
+ * 为什么不能只靠 app.css 里的规则：样式表可能因缓存命中旧副本、或被第三方（浏览器扩展）
+ * 注入的规则盖掉而失效 —— 这类"我们的规则没生效"从代码里完全看不出来，只在用户浏览器里发生。
+ *
+ * 行内 style + `!important` 是页面这一侧能拿到的最强声明：按 CSS 优先级，style 属性上的
+ * !important 高于**任何**作者样式表的 !important，与选择器特异性无关。两道防线互补 ——
+ * app.css 兜"JS 没跑到"，这里兜"CSS 没生效"。
+ *
+ * 约束用 `max-*` + `object-fit: contain`，不写死 width/height：缩略图永远装进框里、不裁切，
+ * 横图/竖图/超长化验单都只是等比变小。 */
+const IMG_FIT_MSG = {
+  width: 'auto', height: 'auto',
+  'max-width': 'min(240px, 100%)', 'max-height': '180px',
+  'object-fit': 'contain',
+};
+const IMG_FIT_THUMB = {
+  width: '52px', height: '40px',
+  'max-width': '52px', 'max-height': '40px',
+  'object-fit': 'cover',
+};
+
+/* ⚠️ 键名必须是 **kebab-case**（`max-width`），不能写 camelCase（`maxWidth`）：
+   `CSSStyleDeclaration.setProperty` 不做驼峰转换，名字不认识就**静默忽略**（不抛异常、
+   不返回 false），守卫"看起来跑了"实际只挂上一半。改这里的键名后，量一次
+   `el.getAttribute('style')` 逐条核对。 */
+function lockImageSize(img, fit) {
+  if (!img || !img.style) return;
+  Object.keys(fit).forEach((k) => {
+    try { img.style.setProperty(k, fit[k], 'important'); } catch (e) { /* 忽略 */ }
+  });
+}
+
 function addMessage(role, content, meta) {
   const list = $('messageList');
   hide($('emptyState'));
@@ -145,7 +183,24 @@ function addMessage(role, content, meta) {
 
     const bubble = document.createElement('div');
     bubble.className = 'bubble';
-    bubble.textContent = content;
+    // 气泡里如实放出用户发的图。"我发了这张图"必须在界面上看得见 ——
+    // 只显示一句话的话，用户没法确认自己到底发出去了哪一张。
+    if (meta && meta.imageUrl) {
+      const img = document.createElement('img');
+      img.className = 'msg-img';
+      lockImageSize(img, IMG_FIT_MSG);
+      img.src = meta.imageUrl;
+      img.alt = '上传的图片';
+      bubble.appendChild(img);
+    }
+    // 文本可能为空（只发图不打字）：此时不塞一个空文本节点，
+    // 否则气泡里会多出一行空白把图片顶下去。
+    if (content) {
+      const textEl = document.createElement('div');
+      textEl.className = 'msg-text';
+      textEl.textContent = content;
+      bubble.appendChild(textEl);
+    }
     body.appendChild(bubble);
 
     const av = document.createElement('div');
@@ -217,6 +272,9 @@ function setBusy(b) {
   $('userInput').disabled = b;
   $('attachBtn').disabled = b;
   document.querySelectorAll('.cap-card').forEach((c) => { c.disabled = b; });
+  // 只动当前有效的那张选择卡：过期卡（is-stale）必须保持禁用，否则请求结束后被
+  // 这里一并解锁，用户点了就会把旧选项答到新的待确认记录上。
+  document.querySelectorAll('.reply-chip:not(.is-stale)').forEach((c) => { c.disabled = b; });
 }
 
 /* ---------- 认证 ---------- */
@@ -370,6 +428,8 @@ function handleSSEEvent(evt, full) {
       execute: '执行计划', reconcile: '汇总结果', llm: '生成回答',
       fact_check: '核对事实', out: '输出检查', commit: '提交结果',
       mem: '更新记忆', err: '处理异常',
+      // 不是图节点：由 chat_router 在识别图片时直接推（图还没建好，界面不能干等）
+      lab_vision: '识别化验单',
     };
     return { kind: 'progress', label: names[evt.node] || evt.node };
   }
@@ -379,6 +439,12 @@ function handleSSEEvent(evt, full) {
   }
   if (evt.type === 'chunk') { full.content += evt.content; return { kind: 'render' }; }
   if (evt.type === 'content') { full.content = evt.content; return { kind: 'render' }; }
+  if (evt.type === 'options') {
+    // 写操作二次确认的选择卡。按钮要挂在**这一条**助手消息下面，而事件在文本吐完
+    // 之前就到了，所以先存进 full，等本轮流结束再渲染（见 flushQuickReplies）。
+    full.options = evt.options || [];
+    return { kind: 'none' };
+  }
   if (evt.type === 'done') {
     if (evt.session_id) state.sessionId = evt.session_id;
     updateDiagnostics({ conversation_turns: evt.conversation_turns, needs_confirmation: evt.needs_confirmation });
@@ -390,16 +456,35 @@ function handleSSEEvent(evt, full) {
   return { kind: 'none' };
 }
 
-async function sendMessage() {
+function sendMessage() {
   if (state.busy) return;
   const input = $('userInput');
   const text = input.value.trim();
-  if (!text) return;
-
-  addMessage('user', text);
+  // 只发一张图、一个字都不打也是合法的一轮：判断条件是"有文本**或**有附件"。
+  if (!text && !state.attachment) return;
   input.value = '';
   autogrow();
-  clearAttachStrip(); // 图片只是"取数的入口"，发出去的是文本，预览条不再保留
+  const att = state.attachment;
+  // 把附件从 state 摘走再交给 sendUserText：预览 URL 的所有权随之转移给那条消息气泡，
+  // 免得 sendUserText 里 clearAttachStrip() 把气泡正要用的图撤销掉。
+  state.attachment = null;
+  return sendUserText(text, att);
+}
+
+/* 发送一段文本（可带一张待发附件）。从输入框发送（sendMessage）和点确认卡按钮
+ * （quickReply）共用这一条路径 —— 选择卡的按钮本质上就是"替用户打了一句话"，
+ * 走同一入口才不会有第二套行为。quickReply 不传附件：那一下是在回答确认卡，
+ * 把图片捎进去只会让后端把它当成同一轮的问题。
+ */
+async function sendUserText(text, attachment) {
+  if (state.busy) return;
+  if (!text && !attachment) return;
+
+  addMessage('user', text, attachment ? { imageUrl: attachment.previewUrl } : undefined);
+  if (attachment) {
+    // 图片已经进了气泡，预览条不再需要（URL 留着给气泡用，见 clearAttachStrip 的说明）
+    clearAttachStrip();
+  }
 
   const assistantEl = addMessage('assistant', '');
   assistantEl.classList.add('is-thinking');
@@ -415,13 +500,20 @@ async function sendMessage() {
   };
 
   try {
+    const payload = {
+      user_input: text,
+      session_id: state.sessionId || '',
+      stream: true,
+    };
+    if (attachment) {
+      // 图片与文本一起进对话，由**后端**识别并结合文本作答。
+      // 服务端会先推一条 progress(lab_vision)，前端显示"正在识别化验单"。
+      payload.image_base64 = attachment.dataUrl;
+      payload.image_mime = attachment.mime;
+    }
     const res = await api('/api/v1/chat/completion', {
       method: 'POST',
-      body: JSON.stringify({
-        user_input: text,
-        session_id: state.sessionId || '',
-        stream: true,
-      }),
+      body: JSON.stringify(payload),
     });
 
     if (!res.ok) {
@@ -464,15 +556,18 @@ async function sendMessage() {
         }
       }
       if (full.content) paint(false);
+      flushQuickReplies(assistantEl, full);
     } else {
       const body = await res.json();
       const data = (body && body.data) || {};
       if (data.session_id) state.sessionId = data.session_id;
       full.content = data.assistant_output || '暂无回复';
+      full.options = data.options || [];
       updateDiagnostics(data);
       if (data.cache_stats) updateCacheStats(data.cache_stats);
       refreshSessionDisplay();
       paint(false);
+      flushQuickReplies(assistantEl, full);
     }
   } catch (err) {
     console.error('发送失败:', err);
@@ -482,6 +577,41 @@ async function sendMessage() {
     state.busy = false;
     setBusy(false);
   }
+}
+
+/* ---------- 写操作二次确认的选项卡 ----------
+ * 点击后按普通消息再发一轮，发的是 **label 而不是 id**：后端
+ * drug_write_confirmation.resolve_answer 有 label 精确匹配分支，而且 label 本身
+ * 就是合法药名/动作词（"布洛芬" / "不记录"），即便那条分支漏了也能靠自由文本兜底。
+ *
+ * 同一时刻只允许最后一张卡可点：pending_confirmation 在会话里是**单槽**的，新一轮
+ * 确认会覆盖上一张卡。若旧卡按钮仍可点，用户点它等于把一个过期选项答到当前待确认的
+ * 记录上——正是这个功能要防的事，所以旧卡一律置灰（is-stale）。
+ */
+function flushQuickReplies(assistantEl, full) {
+  const options = full.options || [];
+  if (!options.length) return;
+
+  document.querySelectorAll('.reply-chip:not(.is-stale)').forEach((btn) => {
+    btn.classList.add('is-stale');
+    btn.disabled = true;
+    btn.title = '这张确认卡已过期，请使用最新的那张';
+  });
+
+  const body = assistantEl.querySelector('.msg-body');
+  if (!body) return;
+  const row = document.createElement('div');
+  row.className = 'reply-row';
+  options.forEach((opt) => {
+    const btn = document.createElement('button');
+    btn.type = 'button';
+    btn.className = 'reply-chip';
+    btn.textContent = opt.label;
+    btn.dataset.reply = opt.label;
+    row.appendChild(btn);
+  });
+  body.appendChild(row);
+  scrollToBottom();
 }
 
 /* ---------- 化验单图片识别（图 → 可编辑文本，不产出结论） ----------
@@ -495,17 +625,6 @@ const LAB_IMAGE_MAX_MB = 5; // 仅前置提示；真正口径在后端 settings.
 // 与后端 `_ALLOWED_FORMATS` 对齐。⚠️ 不含 HEIC/HEIF —— 后端无 pillow-heif，确实读不了；
 // iPhone 默认拍照就是 HEIC，所以宁可在这里就明确报错，也不要传上去再失败。
 const LAB_IMAGE_TYPES = ['image/jpeg', 'image/png', 'image/webp', 'image/bmp', 'image/avif'];
-
-//: 未回填的原因码 → 中文。后端 `note` 字段的取值。
-const LAB_NOTE_LABELS = {
-  unit_mismatch: '与参考库单位不一致',
-  comparator_value: '带 < > 前缀，不是精确值',
-  empty_value: '图中该值不清或为空',
-  value_not_numeric: '不是数值',
-  empty_name: '没有识别出项目名',
-};
-
-let labImageUrl = null;
 
 function readAsDataURL(file) {
   return new Promise((resolve, reject) => {
@@ -524,108 +643,76 @@ function setAttachStatus(text, kind) {
   $('attachStatus').textContent = text;
 }
 
-function showAttachStrip(file) {
-  if (labImageUrl) URL.revokeObjectURL(labImageUrl);
-  labImageUrl = URL.createObjectURL(file);
-  $('attachThumb').src = labImageUrl;
+function showAttachStrip(att) {
+  const thumb = $('attachThumb');
+  // 预览条缩略图同样写行内约束：它比气泡里的图更早出现（选完文件就渲染），
+  // 一旦 app.css 没生效，用户第一眼看到的就是"图片撑满页面"。
+  lockImageSize(thumb, IMG_FIT_THUMB);
+  thumb.src = att.previewUrl || '';
   $('attachName').textContent =
-    file.name + ' · ' + Math.max(1, Math.round(file.size / 1024)) + ' KB';
+    att.name + ' · ' + Math.max(1, Math.round(att.size / 1024)) + ' KB';
   show($('attachStrip'));
-  setAttachStatus('准备识别…');
 }
 
 function clearAttachStrip() {
-  if (labImageUrl) { URL.revokeObjectURL(labImageUrl); labImageUrl = null; }
+  if (state.attachment) {
+    // 预览 URL 在这里释放。⚠️ 已经发出去的那条消息气泡里用的是**同一个** URL
+    // （见 sendUserText 的转移说明），所以发送时会把它从 state.attachment 摘走，
+    // 不会走到这里被撤销。
+    URL.revokeObjectURL(state.attachment.previewUrl);
+    state.attachment = null;
+  }
   $('attachThumb').removeAttribute('src');
   hide($('attachStrip'));
   setAttachStatus('—');
   $('labImageInput').value = '';
 }
 
-function labResultMarkdown(d) {
-  const lines = [];
-  if (!d.item_count) {
-    lines.push('**未在图片中识别到检验项目。**');
-    lines.push('');
-    lines.push('请确认图片是完整的检验报告、清晰且方向正确，或直接手工输入「指标名 + 数值」。');
-  } else {
-    lines.push('**已识别 ' + d.item_count + ' 个检验项目，已回填到输入框，请核对后再发送：**');
-    lines.push('');
-    d.items.forEach((it) => {
-      const unit = it.unit ? ' ' + it.unit : '';
-      const tail = it.fillable
-        ? ''
-        : '（未回填：' + (LAB_NOTE_LABELS[it.note] || it.note || '取值不可靠') + '）';
-      lines.push('- ' + it.item_name + '：' + it.test_value + unit + tail);
-    });
-  }
-  if (d.warnings && d.warnings.length) {
-    lines.push('');
-    lines.push('**提示**');
-    d.warnings.forEach((w) => lines.push('- ' + w));
-  }
-  return lines.join('\n');
-}
-
-async function handleLabImageFile(file) {
+/* 选图 = 挂成**本地待发送附件**，不联网。
+ *
+ * 为什么不在选图时就把请求发出去（改造前的做法）：
+ *   1) 识别结果曾被直接写进输入框，等于**把系统的解析产物冒充成用户打的字** ——
+ *      输入框、以及随后的对话记录里都会记成是他说的，对话记录不再可信；
+ *   2) 图片和用户的问题被拆成两轮，用户想问"这张单子严重吗"只能先发一次识别文本；
+ *   3) 只是选错了文件或想先看一眼，付费的视觉识别已经跑完了。
+ * 现在：选图 → 挂在这里 → 想打字就打字 → 点发送，图片与文本一起进对话，
+ * 由后端识别并结合文本作答（`/api/v1/chat/completion` 的 image_base64 / image_mime）。
+ * 单独的 `/api/v1/lab/image-extract` 接口仍在（它被聊天路径复用），只是前端不再调它。
+ */
+async function attachLabImage(file) {
   if (!file || state.busy) return;
 
   if (!LAB_IMAGE_TYPES.includes(file.type)) {
-    showAttachStrip(file);
-    setAttachStatus('不支持的图片格式（' + (file.type || '未知') + '），请使用 JPG / PNG', 'error');
+    setAttachStatus(
+      '不支持的图片格式（' + (file.type || '未知') + '），请使用 JPG / PNG / WebP / AVIF', 'error');
     return;
   }
   if (file.size > LAB_IMAGE_MAX_MB * 1024 * 1024) {
-    showAttachStrip(file);
     setAttachStatus('图片超过 ' + LAB_IMAGE_MAX_MB + 'MB，请压缩后再试', 'error');
     return;
   }
 
-  showAttachStrip(file);
-  setAttachStatus('正在识别检验项目…（通常需要几秒）');
-  $('attachBtn').classList.add('is-loading');
-  $('attachBtn').disabled = true;
+  if (state.attachment) URL.revokeObjectURL(state.attachment.previewUrl);
+  state.attachment = { file: file, mime: file.type, name: file.name, size: file.size, previewUrl: null };
 
   try {
     // base64 直接经 JSON 发送：与本项目其余接口同一套约定，
     // 也省掉 multipart（后端未依赖 python-multipart）。格式真伪由后端解码判定。
-    const dataUrl = await readAsDataURL(file);
-    const headers = { 'Content-Type': 'application/json' };
-    if (state.token) headers.Authorization = 'Bearer ' + state.token;
-    const res = await fetch(API_BASE + '/api/v1/lab/image-extract', {
-      method: 'POST',
-      headers,
-      body: JSON.stringify({ image_base64: dataUrl, mime: file.type }),
-    });
-    const body = await res.json().catch(() => ({}));
-
-    if (res.status === 401) { leaveApp(); showAuthError('登录已过期，请重新登录'); return; }
-    if (!res.ok || !body.data) {
-      setAttachStatus(body.detail || ('识别失败 (' + res.status + ')'), 'error');
-      return;
-    }
-
-    const d = body.data;
-    addMessage('assistant', labResultMarkdown(d));
-
-    if (d.fill_text) {
-      const ta = $('userInput');
-      // 输入框已有内容时不覆盖：追加在末尾，用户看得到全部内容再决定发不发
-      ta.value = ta.value.trim() ? ta.value.replace(/\s+$/, '') + '\n' + d.fill_text : d.fill_text;
-      autogrow();
-      ta.focus();
-      setAttachStatus('已识别 ' + d.item_count + ' 项并填入输入框，请核对后发送', 'ok');
-    } else {
-      setAttachStatus('未识别到检验项目，详见对话中的提示', 'error');
-    }
+    state.attachment.dataUrl = await readAsDataURL(file);
   } catch (err) {
-    console.error('化验单识别失败:', err);
-    setAttachStatus('识别失败：网络异常或服务不可用，请稍后重试', 'error');
-  } finally {
-    $('attachBtn').classList.remove('is-loading');
-    $('attachBtn').disabled = state.busy;
+    console.error('读取图片失败:', err);
+    state.attachment = null;
+    clearAttachStrip();
+    setAttachStatus('读取图片失败，请重试', 'error');
+    return;
   }
+
+  state.attachment.previewUrl = URL.createObjectURL(file);
+  showAttachStrip(state.attachment);
+  // 打不打字都可以：只发图也能发（sendMessage 的判断是"有文本或有附件"）
+  setAttachStatus('将随消息一起发送，也可以再说一句话', 'ok');
 }
+
 
 /* ---------- 侧边栏（移动端） ---------- */
 function openSidebar() {
@@ -668,7 +755,7 @@ function setupEvents() {
   $('labImageInput').addEventListener('change', (e) => {
     const f = e.target.files && e.target.files[0];
     e.target.value = ''; // 清空以便连续选同一张图仍能触发 change
-    if (f) handleLabImageFile(f);
+    if (f) attachLabImage(f);
   });
 
   const ta = $('userInput');
@@ -686,6 +773,14 @@ function setupEvents() {
     $('userInput').value = card.dataset.example;
     autogrow();
     $('userInput').focus();
+  });
+
+  // 确认卡按钮用事件委托：卡片是流式渲染中动态插进消息列表的，逐个绑定会漏。
+  $('messageList').addEventListener('click', (e) => {
+    const btn = e.target.closest('.reply-chip');
+    if (!btn || btn.disabled) return;
+    const reply = btn.dataset.reply;
+    if (reply) sendUserText(reply);
   });
 }
 

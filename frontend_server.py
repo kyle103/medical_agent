@@ -6,7 +6,7 @@
 
 import os
 import sys
-from http.server import HTTPServer, SimpleHTTPRequestHandler
+from http.server import ThreadingHTTPServer, SimpleHTTPRequestHandler
 
 # Windows 控制台默认 GBK，emoji/中文 print 会 UnicodeEncodeError
 try:
@@ -17,18 +17,44 @@ except Exception:
 
 class FrontendHandler(SimpleHTTPRequestHandler):
     """自定义HTTP处理器，支持SPA路由"""
-    
+
+    # 单个连接的空闲超时（秒）。浏览器会为同一来源开"预连接"空 socket（Edge/Chrome
+    # 都会），这种连接只完成 TCP 握手、不发任何请求字节。没有超时的话，处理线程会
+    # 永久阻塞在 rfile.readline() 上——配合单线程 HTTPServer 就是整站假死：
+    # 页面卡在加载中，而 :8000 后端日志一片正常（请求根本没发出去）。
+    # 超时后被 handle_one_request 捕获 → 关掉这个连接，线程立刻回收。
+    timeout = 15
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, directory=os.path.join(os.path.dirname(__file__), 'frontend'), **kwargs)
-    
+
+    def end_headers(self):
+        """给所有静态响应加 `Cache-Control: no-cache`。
+
+        `SimpleHTTPRequestHandler` 只发 `Last-Modified`，**不发 `Cache-Control`/`ETag`**，
+        浏览器于是走"启发式缓存"（新鲜期约为文档年龄的 10%）—— 改完静态文件后，已经打开的
+        标签页可能长时间不重新拉，看起来就是"改了代码页面没变"。
+
+        `no-cache` = 允许缓存，但每次使用前必须带 `If-Modified-Since` 回源校验（不是
+        `no-store`）。文件没变则 304 零传输，变了立刻拿到新的 —— 开发期就该这样。
+        """
+        self.send_header('Cache-Control', 'no-cache')
+        super().end_headers()
+
     def do_GET(self):
         # 处理前端路由，所有路径都返回index.html
-        if self.path.startswith('/api/'):
+        #
+        # ⚠️ 判断"文件是否存在"前**必须先剥掉 query string**：`?v=123` 这种缓存击穿参数会让
+        # `os.path.exists('frontend/app.css?v=123')` 为假 → 回落到 index.html → 浏览器拿到
+        # 一份 HTML 当样式表用，**整份 CSS 静默失效**（不报错、不加载、页面裸奔）。
+        # 基类 `translate_path` 自己会剥 query，这里只需把"存不存在"的判断对齐即可。
+        path_only = self.path.split('?', 1)[0].split('#', 1)[0]
+        if path_only.startswith('/api/'):
             # API请求直接返回404，让前端直接请求后端
             self.send_error(404, "API endpoint not found")
         else:
             # 静态文件服务
-            if self.path == '/' or not os.path.exists(os.path.join(self.directory, self.path[1:])):
+            if path_only == '/' or not os.path.exists(os.path.join(self.directory, path_only[1:])):
                 self.path = '/index.html'
             super().do_GET()
     
@@ -112,8 +138,13 @@ class FrontendHandler(SimpleHTTPRequestHandler):
 
 def start_frontend_server(port=3000):
     """启动前端服务器（浏览器由一键启动脚本负责打开，这里不做）"""
-    # 绑定 0.0.0.0 避免 localhost 解析到 IPv6 ::1 导致 127.0.0.1 访问不到
-    server = HTTPServer(('0.0.0.0', port), FrontendHandler)
+    # 绑定 0.0.0.0 避免 localhost 解析到 IPv6 ::1 导致 127.0.0.1 访问不到。
+    # 必须是 ThreadingHTTPServer：单线程 HTTPServer 只要有一个连接不放手（浏览器的
+    # 预连接空 socket、或者一个没读完响应的标签页），唯一的处理线程就永久卡在
+    # rfile.readline() 上，之后所有静态请求全部挂起 → 页面加载不出来、后端却一条
+    # 请求都收不到（用户看到的就是"登录成功但前端完全没法用"）。
+    server = ThreadingHTTPServer(('0.0.0.0', port), FrontendHandler)
+    server.daemon_threads = True
 
     print(f"前端Demo服务器启动成功!")
     print(f"访问地址: http://localhost:{port}")
