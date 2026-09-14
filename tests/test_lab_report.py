@@ -199,3 +199,139 @@ async def test_import_upserts_existing_rows():
 
     await import_min_kb(get_engine())
     assert await _alias(), "重跑导入没有回填已有行 —— upsert 退回了 insert-if-absent"
+
+
+# --------------------------------------------------------------------------
+# 异常标记：识别形态与判定优先级（2026-09-14 新增）
+# --------------------------------------------------------------------------
+
+
+def test_flag_extraction_is_conservative_about_unit_l():
+    """`L` 只在**紧贴数值的固定位置**才算标记，否则 `1.2 g/L` 会被判成偏低。
+
+    单位里到处是 `L`（`g/L`、`mmol/L`、`10^9/L`），所以 H/L 的识别形态必须与
+    `lab_report_vision._strip_marks` 保持一致：只在数值**前面**或**空格之后**的末尾。
+    箭头没有这个歧义，认到就算。
+    """
+    from app.core.tools.lab_report_vision import _extract_flag, _normalize_flag
+
+    assert _extract_flag("6.5↑") == "H"
+    assert _extract_flag("↓6.5") == "L"
+    assert _extract_flag("6.5 H") == "H"
+    assert _extract_flag("L 6.5") == "L"
+    assert _extract_flag("6.5") == ""
+    assert _extract_flag("1.2 g/L") == "", "单位里的 L 不是异常标记"
+    assert _extract_flag("阴性") == ""
+
+    assert _normalize_flag("↑") == "H"
+    assert _normalize_flag("偏高") == "H"
+    assert _normalize_flag("LOW") == "L"
+    assert _normalize_flag("正常") == "", "不认识的词不做语义猜测"
+    assert _normalize_flag("", "6.5↓") == "L", "模型不填时从 test_value 兜底"
+    assert _normalize_flag("H", "6.5↓") == "H", "模型填了就以模型为准"
+
+
+@pytest.mark.asyncio
+async def test_image_flag_wins_over_general_range():
+    """图上标了 H，即使按库内区间算出来是正常，也以图为准。
+
+    理由：单子上的标记是这家医院**按该患者**给出的结论，口径比通用区间准。
+    """
+    await _prepare()
+    out = await LabReportTool().interpret(
+        user_id="u1",
+        lab_item_list=[{"item_name": "血糖", "test_value": "5.0"}],
+        sync_to_archive=False,
+        image_items={"血糖": {"flag": "H", "reference_range": "3.9-6.1"}},
+    )
+    item = out["item_list"][0]
+    assert item["abnormal_flag"] == "H"
+    assert item["judge_source"] == "image_flag"
+
+
+@pytest.mark.asyncio
+async def test_image_blank_means_normal():
+    """图上空白 = 正常 —— 即使按库内区间该值算偏高。
+
+    这是本次改动里**语义最强的一条**：空白不是"没读到"，是"医院没标"。
+    医院的报告规范是只给异常项打标记，所以空白本身就是信息。
+    """
+    await _prepare()
+    out = await LabReportTool().interpret(
+        user_id="u1",
+        lab_item_list=[{"item_name": "血糖", "test_value": "7.0"}],
+        sync_to_archive=False,
+        image_items={"血糖": {"flag": "", "reference_range": "3.9-6.1"}},
+    )
+    item = out["item_list"][0]
+    assert item["abnormal_flag"] == "N"
+    assert item["judge_source"] == "image_blank"
+
+
+@pytest.mark.asyncio
+async def test_text_path_still_compares_range():
+    """没有图的项（用户手打）只能比库内区间 —— 这条路不能因为改成图标注优先而断掉。
+
+    这一条是本次改动**唯一必须保住的既有能力**：没有它，用户手打
+    「血红蛋白 110 偏低吗」就再也得不到"偏低"这个结论。
+    """
+    await _prepare()
+    out = await LabReportTool().interpret(
+        user_id="u1",
+        lab_item_list=[{"item_name": "血糖", "test_value": "7.0"}],
+        sync_to_archive=False,
+    )
+    item = out["item_list"][0]
+    assert item["abnormal_flag"] == "H"
+    assert item["judge_source"] == "general_range"
+
+
+@pytest.mark.asyncio
+async def test_image_flag_judges_item_missing_from_reference_base():
+    """库内没有这一项 + 图上有标记 → 仍然给结论，只是没有解释文本。
+
+    旧实现遇到"不在参考库"一律回「无法提供解读服务」，但图上明明标着偏高 ——
+    说"无法解读"是错的，我们只是说不出原因和建议。
+    """
+    await _prepare()
+    out = await LabReportTool().interpret(
+        user_id="u1",
+        lab_item_list=[{"item_name": "某医院自建指标", "test_value": "1.2"}],
+        sync_to_archive=False,
+        image_items={"某医院自建指标": {"flag": "H", "reference_range": "0-1.0"}},
+    )
+    item = out["item_list"][0]
+    assert item["abnormal_flag"] == "H"
+    assert item["judge_source"] == "image_flag"
+    assert "未纳入参考库" in item["meaning"]
+
+
+@pytest.mark.asyncio
+async def test_advice_attached_for_abnormal_and_rendered_in_final_desc():
+    """偏高项要带上「可能原因 / 建议 / 何时就医」，并且必须出现在 `final_desc` 里。
+
+    为什么必须落在 `final_desc`：单步化验解读走 `final_response` **短路分支、不过 LLM**，
+    `final_desc` 就是用户直接看到的那段文本。建议只挂在结构化字段上等于没写。
+    """
+    await _prepare()
+    out = await LabReportTool().interpret(
+        user_id="u1",
+        lab_item_list=[
+            {"item_name": "血糖", "test_value": "7.0"},
+            {"item_name": "总胆固醇", "test_value": "4.0"},
+        ],
+        sync_to_archive=False,
+    )
+    by_name = {i["item_name"]: i for i in out["item_list"]}
+
+    adv = by_name["血糖"].get("advice") or {}
+    assert adv.get("causes"), "偏高必须有『可能原因』"
+    assert adv.get("advice"), "偏高必须有『建议』"
+    assert adv.get("when_to_see_doctor"), "偏高必须有『何时就医』"
+    assert "医生" in (adv.get("disclaimer") or ""), "免责说明必须提医生"
+
+    desc = out["final_desc"]
+    assert "可能原因" in desc and "建议" in desc and "何时就医" in desc
+
+    # 正常项不该硬凑建议
+    assert not by_name["总胆固醇"].get("advice")

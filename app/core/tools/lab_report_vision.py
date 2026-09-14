@@ -59,13 +59,18 @@ _DATA_URL_RE = re.compile(r"^data:(?P<mime>[a-z0-9.+-]+/[a-z0-9.+-]+)?\s*;?\s*ba
 _B64_RE = re.compile(r"^[A-Za-z0-9+/\s]*={0,2}$")
 
 
-#: 识别提示词。要点与坑（2026-09-13 实测）：
+#: 识别提示词。要点与坑（2026-09-13 实测，2026-09-14 增异常标记字段）：
 #:
 #: - `test_value` **只填数值**。图上 `11.2 10^9/L` 若整串填进来，回填后会被
 #:   文本链路当数值参与判定，而它根本不是数字；
-#: - 结果列的 `↑` / `↓` / `H` / `L` 是**异常提示**，不是数值的一部分；
-#: - 参考范围**照抄**，不要换算。库里有通用口径，图上有这家医院的口径，
-#:   两者不一致时以图为准（用户手上的单子才是事实），模型自作主张换算会破坏这个前提；
+#: - 结果列的 `↑` / `↓` / `H` / `L` 不是数值的一部分，但**不能丢** ——
+#:   它是这家医院按该患者给出的判定方向，口径比库内通用区间准。所以单独用
+#:   `abnormal_flag` 承载：合在 `test_value` 里会让这一条的数值整条进不了判定；
+#: - **空白项 = 正常**（医院只给异常项打标记），所以"该行没有标记"是有效信息。
+#:   但它**必须如实填空串**，由下游按"空白即正常"的规范处理 —— 不能让模型自己
+#:   去推断哪一项该判正常，那是把判定权交给识别环节；
+#: - `reference_range` **照抄**，不要换算。库里有通用口径、图上有这家医院的口径，
+#:   模型自作主张换算会破坏这个前提（判定侧不再拿它比大小，它用于展示与人工核对）；
 #: - 表头、患者信息、页码都不是检验项目，不能进 `items`；
 #: - 看不清留空，**不要猜**。猜错一位数字在医疗场景就是明确危害。
 VISION_PROMPT = (
@@ -74,12 +79,15 @@ VISION_PROMPT = (
     "1) `item_name` 用中文检验项目名（如「白细胞计数」）；\n"
     "2) `test_value` 只填**数值本身**：不要带单位、不要带 `↑`/`↓`/`H`/`L` 等异常标记、"
     "不要带 `<`/`>` 比较符、不要写「阴性/阳性」这类定性描述；\n"
-    "3) `unit` 填单位列的内容，`reference_range` 填参考范围列的内容，"
+    "3) `abnormal_flag` 专装结果列的异常标记：该行有 `↑` 或有 `H` 就填 `H`，"
+    "有 `↓` 或有 `L` 就填 `L`，**该行没有任何标记就填空字符串**"
+    "（化验单只给异常项打标记，没有标记即正常）；\n"
+    "4) `unit` 填单位列的内容，`reference_range` 填参考范围列的内容，"
     "**严格照抄图中文字**，不要换算单位、不要用你自己的知识改写；\n"
-    "4) 只输出检验项目行：表头、医院名、患者姓名/性别/年龄、采样时间、页码、"
+    "5) 只输出检验项目行：表头、医院名、患者姓名/性别/年龄、采样时间、页码、"
     "医生签名、备注说明这些**都不是**检验项目，不要放进 `items`；\n"
-    "5) 任何字段看不清或图中没有，就填**空字符串**，**绝对不要猜测或用常识补全**；\n"
-    "6) 如果图中没有任何检验项目，`items` 返回空数组。"
+    "6) 任何字段看不清或图中没有，就填**空字符串**，**绝对不要猜测或用常识补全**；\n"
+    "7) 如果图中没有任何检验项目，`items` 返回空数组。"
 )
 
 
@@ -139,6 +147,62 @@ def _strip_marks(raw: str) -> str:
     out = re.sub(r"(?i)\s+(?:H|L|HIGH|LOW)$", "", out)
     out = re.sub(r"[\s*#]+$", "", out)
     return out.strip()
+
+
+#: 方向标记字符 —— `_MARK_CHARS` 按方向拆开，供 `_extract_flag` 判断偏高/偏低。
+#: 箭头是**无歧义**的，认到就算，不存在把单位误判成标记的可能。
+_FLAG_UP_CHARS = "↑▲⇑⇧"
+_FLAG_DOWN_CHARS = "↓▼⇓⇩"
+
+#: `H` / `L`（含英文全写）的**保守**形态：要么在数值**前面**（`H 6.5`），
+#: 要么在**空格之后**的末尾（`6.5 H`）。**不许紧贴匹配** ——
+#: 单位里就有 `L`（`g/L`、`mmol/L`、`10^9/L`），宽松匹配会把 `1.2 g/L` 判成偏低。
+#: 与 `_strip_marks` 用的是同一组形态，两处必须一起改。
+_FLAG_UP_RE = re.compile(r"(?i)^(?:HIGH|H)\s*[::]?\s*(?=[-+]?\d)|\s(?:HIGH|H)$")
+_FLAG_DOWN_RE = re.compile(r"(?i)^(?:LOW|L)\s*[::]?\s*(?=[-+]?\d)|\s(?:LOW|L)$")
+
+#: 模型直接给出的标记词的**白名单**。不在表内的一律不做语义猜测，回到正则兜底。
+_FLAG_ALIAS = {
+    "h": "H", "high": "H", "↑": "H", "偏高": "H", "高": "H",
+    "l": "L", "low": "L", "↓": "L", "偏低": "L", "低": "L",
+}
+
+
+def _extract_flag(raw: str) -> str:
+    """从一段原始文本里判断异常方向，返回 `H` / `L` / 空串。"""
+    s = (raw or "").strip()
+    if not s:
+        return ""
+    if any(c in s for c in _FLAG_UP_CHARS):
+        return "H"
+    if any(c in s for c in _FLAG_DOWN_CHARS):
+        return "L"
+    if _FLAG_UP_RE.search(s):
+        return "H"
+    if _FLAG_DOWN_RE.search(s):
+        return "L"
+    return ""
+
+
+def _normalize_flag(model_flag: str, *fallbacks: str) -> str:
+    """把模型给的标记规整成 `H` / `L` / 空串。
+
+    模型这一栏的值**不可直接采信**：可能大小写不一、可能写「偏高」，也可能
+    箭头留在 `test_value` 里而把这一栏留空（改了 prompt 之后最可能出现的形态）。
+    所以顺序是：① 按白名单转换它给的值；② 转不出来再从 `test_value` 兜底提取。
+
+    这样做的实际意义是**向后兼容**：即使模型完全忽略新字段、仍按老习惯把
+    `6.5↑` 整串填进 `test_value`，标记也不会丢 —— 而 `_clean_value` 本来就会把
+    标记从 `test_value` 里剥掉，所以数值侧照样干净。
+    """
+    key = (model_flag or "").strip().casefold()
+    if key in _FLAG_ALIAS:
+        return _FLAG_ALIAS[key]
+    for fb in fallbacks:
+        got = _extract_flag(fb)
+        if got:
+            return got
+    return ""
 
 
 def _looks_like_unit(text: str) -> bool:
@@ -447,6 +511,10 @@ class LabReportVisionTool:
                 continue
 
             value, reason = _clean_value(raw.test_value)
+            #: 异常标记与数值清理**互相独立**：值不合法（比较符 / 定性描述）时，
+            #: 这一条进不了回填文本，但标记本身仍然是有效的识别结果，
+            #: 所以放在这里算、不放在 `reason` 的分支里。
+            image_flag = _normalize_flag(getattr(raw, "abnormal_flag", ""), raw.test_value)
             unit = (raw.unit or "").strip()
 
             # 候选按可信度排序，第一个在库里命中的就是它
@@ -471,9 +539,15 @@ class LabReportVisionTool:
                 note = reason
                 dropped.append({"raw_name": raw_name, "reason": reason, "test_value": raw.test_value})
             elif unit_status == "mismatch":
-                # 单位不一致 → 排除回填。判定侧只比数值不看单位，
-                # 放进回填文本就等于让它拿着 mg/dL 的数值去对 mmol/L 的区间。
-                fillable = False
+                # 单位不一致**不再排除回填**（2026-09-14 起）。
+                #
+                # 原先把"单位不同"当成硬门槛，是因为判定要拿数值去比库内区间 ——
+                # mg/dL 的值对 mmol/L 的区间会给出错误结论。现在判定改为
+                # **采信图上的异常标记**，不再比库内区间，这个风险不在路径上了；
+                # 继续排除反而是净损失：本来能判的一项会被整条丢掉。
+                #
+                # 仍然记录在案，因为"库内参考范围与这张单子不可比"这件事
+                # 影响**展示**：不能把库内区间和图上数值放在一起给用户看。
                 note = "unit_mismatch"
                 unit_mismatch.append(
                     {
@@ -492,6 +566,7 @@ class LabReportVisionTool:
                     "raw_name": raw_name,
                     "item_name": canonical,
                     "test_value": value,
+                    "image_flag": image_flag,
                     "unit": unit,
                     "reference_range": (raw.reference_range or "").strip(),
                     "in_reference_base": ref is not None,
@@ -509,13 +584,14 @@ class LabReportVisionTool:
         if uncovered:
             warnings.append(
                 f"有 {len(uncovered)} 项未纳入参考库（{'、'.join(uncovered[:5])}"
-                f"{'…' if len(uncovered) > 5 else ''}），回填后不会给出判定。"
+                f"{'…' if len(uncovered) > 5 else ''}），这些项没有可参考的解释文本。"
             )
         if unit_mismatch:
             detail = "、".join(f"{u['item_name']}（图上 {u['image_unit']}，库内 {u['lib_unit']}）" for u in unit_mismatch[:3])
             warnings.append(
-                f"有 {len(unit_mismatch)} 项单位与参考库不一致（{detail}），"
-                "已排除在回填文本之外 —— 单位不同直接比大小会给出错误判定。"
+                f"有 {len(unit_mismatch)} 项单位与参考库不一致（{detail}）。"
+                "判定依据是化验单上标注的异常标记，不受单位影响；"
+                "但库内参考范围与这张单子的单位不可比，请以单子上印的参考范围为准。"
             )
         if dropped:
             warnings.append(

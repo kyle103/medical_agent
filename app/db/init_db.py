@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from app.common.logger import get_logger
 from app.config.settings import settings
 from app.db.database import get_engine
-from app.db.models import Base, DrugKnowledgeBase, LabItemReferenceBase
+from app.db.models import Base, DrugKnowledgeBase, LabItemAdvice, LabItemReferenceBase
 
 logger = get_logger(__name__)
 
@@ -52,7 +52,7 @@ async def _migrate_missing_columns(engine: AsyncEngine) -> None:
 async def import_min_kb(engine: AsyncEngine) -> None:
     """把 CSV 种子数据导入知识库表。
 
-    **语义是 upsert，不是 insert-if-absent。** 这两张表是纯种子数据（运行时没有任何
+    **语义是 upsert，不是 insert-if-absent。** 这三张表是纯种子数据（运行时没有任何
     写入路径：`app/db/crud/` 下只有 archive/user），CSV 就是唯一事实源。
     早先的"已存在就跳过"会让**改 CSV 后重跑导入静默无效** —— 看着像更新了、
     库里其实没变，属于最难排查的一类故障；改列（如新增 `item_alias`）时
@@ -61,6 +61,7 @@ async def import_min_kb(engine: AsyncEngine) -> None:
     kb_dir = Path("data/knowledge_base")
     drug_csv = kb_dir / "drug_knowledge.csv"
     lab_csv = kb_dir / "lab_item_reference.csv"
+    lab_advice_csv = kb_dir / "lab_item_advice.csv"
 
     from sqlalchemy.ext.asyncio import async_sessionmaker
 
@@ -75,9 +76,18 @@ async def import_min_kb(engine: AsyncEngine) -> None:
             row.item_name: row
             for row in (await session.execute(select(LabItemReferenceBase))).scalars().all()
         }
+        #: 建议表的主键是 `(item_name, direction)` —— 一个项目两条独立文本，
+        #: 所以这里用二元组建索引，不能用单个 item_name。
+        existing_advices = {
+            (row.item_name, (row.direction or "").strip().upper()): row
+            for row in (await session.execute(select(LabItemAdvice))).scalars().all()
+        }
 
         if drug_csv.exists():
-            with drug_csv.open("r", encoding="utf-8") as f:
+            # 三处 CSV 读取统一用 `utf-8-sig`：BOM 会让 `DictReader` 的第一列名带上
+            # `\ufeff`，于是所有行都被"主键为空"挡掉 —— 静默导入零行。
+            # 详见下面 advice 分支的注释。
+            with drug_csv.open("r", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
                     drug_name = (row.get("drug_name", "") or "").strip()
                     if not drug_name:
@@ -100,7 +110,7 @@ async def import_min_kb(engine: AsyncEngine) -> None:
                             setattr(obj, k, v)
 
         if lab_csv.exists():
-            with lab_csv.open("r", encoding="utf-8") as f:
+            with lab_csv.open("r", encoding="utf-8-sig") as f:
                 for row in csv.DictReader(f):
                     item_name = (row.get("item_name", "") or "").strip()
                     if not item_name:
@@ -118,6 +128,34 @@ async def import_min_kb(engine: AsyncEngine) -> None:
                         obj = LabItemReferenceBase(item_name=item_name, **fields)
                         session.add(obj)
                         existing_items[item_name] = obj
+                    else:
+                        for k, v in fields.items():
+                            setattr(obj, k, v)
+
+        if lab_advice_csv.exists():
+            # 用 `utf-8-sig` 而不是 `utf-8`：这份 CSV 曾被编辑器加上 BOM，
+            # `DictReader` 的第一列名于是变成 `\ufeffitem_name`，
+            # 所有行都被"item_name 为空"挡掉 —— **零行导入、且不报任何错**，
+            # 表现是"表建好了、永远是空的"。`utf-8-sig` 严格更宽
+            # （没有 BOM 时行为与 utf-8 完全一致），所以用它没有代价。
+            with lab_advice_csv.open("r", encoding="utf-8-sig") as f:
+                for row in csv.DictReader(f):
+                    item_name = (row.get("item_name", "") or "").strip()
+                    direction = (row.get("direction", "") or "").strip().upper()
+                    if not item_name or direction not in ("H", "L"):
+                        # 方向不在 H/L 的行直接跳过：留着只会变成一条永远查不到的死数据
+                        continue
+                    fields = {
+                        "causes": row.get("causes") or None,
+                        "advice": row.get("advice") or None,
+                        "when_to_see_doctor": row.get("when_to_see_doctor") or None,
+                        "disclaimer": row.get("disclaimer") or None,
+                    }
+                    obj = existing_advices.get((item_name, direction))
+                    if obj is None:
+                        obj = LabItemAdvice(item_name=item_name, direction=direction, **fields)
+                        session.add(obj)
+                        existing_advices[(item_name, direction)] = obj
                     else:
                         for k, v in fields.items():
                             setattr(obj, k, v)
@@ -143,6 +181,17 @@ def ensure_min_csv() -> None:
             "血糖,GLU,空腹血糖/葡萄糖,3.9-6.1,mmol/L,"
             "通用科普信息：升高可能与饮食、应激等因素相关，建议结合复查与医生意见综合评估。,"
             "通用科普信息：降低可能与进食不足等因素相关，建议结合复查与医生意见综合评估。\n",
+            encoding="utf-8",
+        )
+
+    #: 建议表的最小种子：只为保证"表非空、查询路径可跑通"。
+    #: 真正的内容在仓库自带的 `data/knowledge_base/lab_item_advice.csv` 里。
+    advice_csv = Path("data/knowledge_base/lab_item_advice.csv")
+    if not advice_csv.exists():
+        advice_csv.write_text(
+            "item_name,direction,causes,advice,when_to_see_doctor,disclaimer\n"
+            "血糖,H,单次升高常见于检测前进食或应激。,建议空腹复查并记录数值。,"
+            "多次复查仍偏高请到内分泌科就诊。,以上为通用健康提示，不能替代医生诊断。\n",
             encoding="utf-8",
         )
 

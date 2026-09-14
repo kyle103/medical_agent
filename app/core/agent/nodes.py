@@ -178,29 +178,35 @@ _IMAGE_DROP_REASON_TEXT = {
 }
 
 
-def _image_facts(state: dict) -> tuple[str, str, list[tuple[str, str]]]:
-    """图片三个字段 → `(失败说明, 可判定指标文本, [(项名, 未纳入原因)])`。
+def _image_facts(state: dict) -> tuple[str, str, list[tuple[str, str]], int, int]:
+    """图片三个字段 → `(失败说明, 可判定指标文本, [(项名, 未纳入原因)], 带标记项数, 总项数)`。
 
     两个渲染器（给模型看的块 / 给用户看的提示）共用这一份**事实提取**，
     免得"哪些项没纳入"在一处算成 3 项、另一处算成 4 项。
+
+    最后两个数字用来交代**结论来源**：判定改为"图标注优先"之后，回答里的
+    "偏高/偏低"可能是**医院标的**（有标记的项），也可能是**系统按通用口径算的**
+    （无图时，或图上没标而按规范视为正常）。用户有权知道是哪一种。
+
+    ⚠️ `unit_mismatch` **不再出现在"未纳入"里**：单位不一致已从"排除回填"
+    降级为"仅提示"（判定不再拿数值比库内区间，单位不构成障碍），
+    所以那个分支已不可达，删掉而不是留着当死代码。
     """
     note = (state.get("image_note") or "").strip()
     text = (state.get("image_lab_text") or "").strip()
 
+    items = [it for it in (state.get("image_lab_items") or []) if isinstance(it, dict)]
+
     excluded: list[tuple[str, str]] = []
-    for it in state.get("image_lab_items") or []:
-        if not isinstance(it, dict) or it.get("fillable"):
+    for it in items:
+        if it.get("fillable"):
             continue
         name = (it.get("item_name") or it.get("raw_name") or "").strip() or "（未识别出名称）"
-        if (it.get("note") or "") == "unit_mismatch":
-            image_unit = (it.get("unit") or "").strip() or "空"
-            lib_unit = (it.get("lib_unit") or "").strip() or "空"
-            reason = f"单位与参考库不一致（图上 {image_unit}，库内 {lib_unit}）"
-        else:
-            reason = _IMAGE_DROP_REASON_TEXT.get((it.get("note") or ""), "不符合判定要求")
+        reason = _IMAGE_DROP_REASON_TEXT.get((it.get("note") or ""), "不符合判定要求")
         excluded.append((name, reason))
 
-    return note, text, excluded
+    flagged = sum(1 for it in items if (it.get("image_flag") or "").strip())
+    return note, text, excluded, flagged, len(items)
 
 
 def image_context_block(state: dict) -> str:
@@ -211,15 +217,19 @@ def image_context_block(state: dict) -> str:
     否则模型会把识别结果当成用户陈述复述回去，用户无从分辨哪些是自己说的、
     哪些是系统读图读出来的（读错时这一点尤其要紧）。
 
+    为什么必须交代「这项结论是谁给的」：判定改为**采信图上的异常标记**之后，
+    回答里的"偏高/偏低"可能来自医院标注，也可能是系统按通用口径算的。
+    不写清的话模型会拿通用参考范围去"纠正"化验单上印的方向 ——
+    那等于用口径更粗的一方否掉更准的一方。
+
     为什么必须包含「未纳入的项及原因」：`image_lab_text` 只含**可回填**的项，
-    单位不一致 / 带比较符 / 看不清的都被过滤掉了。只给回填文本的话，
-    模型根本不知道还有被丢掉的部分，也就永远说不出"你有 3 项因单位不一致未参与判定"
-    —— 用户会以为那张单子上被丢掉的项根本没出现过。
+    带比较符、看不清、定性描述都被过滤掉了。只给回填文本的话，模型根本不知道
+    还有被丢掉的部分 —— 用户会以为那张单子上被丢掉的项根本没出现过。
 
     列表条数封顶 `_MAX_IMAGE_EXCLUDED_SHOWN`：一张生化全项能丢十几项，
     全量塞进 prompt 会把真正重要的上下文挤掉，取前几条已足够说明"有几项没纳入"。
     """
-    note, text, excluded = _image_facts(state)
+    note, text, excluded, flagged, total = _image_facts(state)
     if not note and not text and not excluded:
         return ""
 
@@ -234,6 +244,21 @@ def image_context_block(state: dict) -> str:
 
     if text:
         parts.append("已纳入判定的指标（已交给检验解读工具）：\n" + text)
+
+    if total:
+        if flagged:
+            parts.append(
+                f"这张单子上有 {flagged} 项带异常标记（`↑`/`↓`/`H`/`L`）："
+                "**这些项的偏高/偏低以化验单标注为准**（医院按该患者给出的口径），"
+                "不要用通用参考范围去改写它们；"
+                f"其余 {total - flagged} 项未标注标记（上面「未纳入判定」列出的除外），"
+                "按「只标异常项」的报告规范视为正常。"
+            )
+        else:
+            parts.append(
+                "这张单子上没有任何异常标记，按「只标异常项」的报告规范视为全部在参考范围内；"
+                "结论依据是单子上的标注，不是系统的通用参考范围。"
+            )
 
     if excluded:
         shown = excluded[:_MAX_IMAGE_EXCLUDED_SHOWN]
@@ -254,19 +279,26 @@ def image_user_caveat(state: dict) -> str:
     为什么需要它、以及为什么不能直接复用 `image_context_block`：
     `build_generation_prompt` 的 `final_response` 短路分支（单步化验解读走的就是它）
     **完全不过 LLM**，上游文本原样吐出。所以喂给模型的那个块在这条路径上没人读 ——
-    "有 3 项因单位不一致未纳入"这句话就永远到不了用户眼前，而用户会默认
-    整张单子都被判过了。这是本轮改造要堵的最隐蔽的一个洞。
+    "有几项没纳入判定"这句话就永远到不了用户眼前，而用户会默认整张单子都被判过了。
+    这是上一轮改造堵的第一个洞；这一轮加的是"结论来源"。
 
     与模型块的区别不只是措辞：这里是**面向患者**的措辞（说清"未纳入≠正常"），
     那边是给模型的指令（"不要当作正常结果"）。
     """
-    note, _text, excluded = _image_facts(state)
-    if not note and not excluded:
+    note, _text, excluded, flagged, total = _image_facts(state)
+    if not note and not excluded and not total:
         return ""
 
     lines: list[str] = []
     if note:
         lines.append(f"⚠️ 你上传的这张化验单图片没能识别成功：{note}")
+    if total:
+        # 一行说清"这个结论谁给的"。少了它，用户没法分辨哪句是医院标的、
+        # 哪句是系统按通用口径推的 —— 两者的可信度不是一回事。
+        if flagged:
+            lines.append(f"ℹ️ 偏高/偏低以化验单上标注的异常标记为准（这张单子有 {flagged} 项带标记）。")
+        else:
+            lines.append("ℹ️ 这张单子未标注任何异常标记，按报告规范视为各项均在参考范围内。")
     if excluded:
         shown = excluded[:_MAX_IMAGE_EXCLUDED_SHOWN]
         detail = "；".join(f"{name}（{reason}）" for name, reason in shown)

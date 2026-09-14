@@ -28,6 +28,30 @@ _LAB_NO_DATA_HINT = (
 )
 
 
+def _image_flag_map(state: dict) -> dict[str, dict]:
+    """`state["image_lab_items"]` → `{项名: {"flag": …, "reference_range": …}}`。
+
+    为什么必须走这条独立通道：异常标记**故意不进回填文本** ——
+    `6.5↑` 整串填进 `test_value` 会让数值侧的形态校验失败，这一条的数值就没了。
+    所以标记只能从结构化条目里搬。
+
+    这里只做搬运，不判定。**"键存在即来自图上"**这个语义由
+    `LabReportTool.interpret` 使用：它决定该走"图标注优先"还是"区间比对"。
+    """
+    out: dict[str, dict] = {}
+    for it in state.get("image_lab_items") or []:
+        if not isinstance(it, dict):
+            continue
+        name = (it.get("item_name") or it.get("raw_name") or "").strip()
+        if not name:
+            continue
+        out[name] = {
+            "flag": (it.get("image_flag") or "").strip().upper(),
+            "reference_range": (it.get("reference_range") or "").strip(),
+        }
+    return out
+
+
 class ToolExecutor:
     """统一工具执行器：根据工具名称和状态调用对应工具。
 
@@ -133,7 +157,10 @@ class ToolExecutor:
         # 图路与文路在此汇入**同一个** `parse_lab_items` → `LabReportTool`：
         # 图片识别产出的文本就是按 `parse_lab_items` 的显式分隔符定制的
         # （见 lab_report_vision 模块说明），所以图路不新开第二条判定路径。
-        # 新增图片时这里只改"喂什么文本"，判定口径一行未动。
+        #
+        # ⚠️ 但异常标记**不走文本**：`6.5↑` 整串填进来会让数值侧校验失败，
+        # 所以标记走 `image_items` 这条独立通道（`_image_flag_map`）。
+        # 判定优先级（图标注优先 / 无图才比区间）统一在 `interpret` 里实现。
         lab_items = parse_lab_items(lab_route_text(state))
         if not lab_items:
             return {
@@ -154,6 +181,7 @@ class ToolExecutor:
             user_id=user_id,
             lab_item_list=lab_items,
             sync_to_archive=False,
+            image_items=_image_flag_map(state),
         )
         return {
             "tool_result": tool_result,

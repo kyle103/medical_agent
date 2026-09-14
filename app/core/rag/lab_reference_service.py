@@ -4,7 +4,7 @@ from sqlalchemy import select
 
 from app.core.rag.entity_dictionary import _split_aliases
 from app.db.database import get_sessionmaker
-from app.db.models import LabItemReferenceBase
+from app.db.models import LabItemAdvice, LabItemReferenceBase
 
 
 def _norm_key(v: str | None) -> str:
@@ -83,4 +83,43 @@ class LabReferenceService:
                     },
                 }
             )
+        return out
+
+    async def get_advices(self, pairs: list[tuple[str, str]]) -> dict[tuple[str, str], dict]:
+        """批量取「偏高 / 偏低之后怎么办」的建议文本。
+
+        入参 `pairs` 是 `(项目正式名, 方向)`，方向取 `H` / `L`；返回以同一二元组
+        为键的字典。**没有对应行的项不会出现在结果里** —— 调用方据此判断
+        "这一项没有建议可说"，而不是拿到一段空文本再去猜它是有意留白还是漏配。
+
+        与 `match_items` 同一取舍：建议表是种子数据（几十行、运行时无写入路径），
+        一次载入内存过滤，不逐项发 SQL。
+        """
+        if not pairs:
+            return {}
+
+        wanted = {(_norm_key(name), (direction or "").strip().upper()) for name, direction in pairs}
+
+        async_session = get_sessionmaker()
+        async with async_session() as session:
+            rows = (
+                (
+                    await session.execute(
+                        select(LabItemAdvice).where(LabItemAdvice.is_deleted == 0)
+                    )
+                )
+                .scalars()
+                .all()
+            )
+
+        out: dict[tuple[str, str], dict] = {}
+        for row in rows:
+            key = (_norm_key(row.item_name), (row.direction or "").strip().upper())
+            if key in wanted:
+                out[key] = {
+                    "causes": row.causes,
+                    "advice": row.advice,
+                    "when_to_see_doctor": row.when_to_see_doctor,
+                    "disclaimer": row.disclaimer,
+                }
         return out

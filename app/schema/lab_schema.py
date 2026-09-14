@@ -19,6 +19,13 @@ class LabItemOutput(BaseModel):
     test_value: str
     reference_range: str | None = None
     abnormal_flag: str | None = None
+    #: 这个状态是谁给的：`image_flag`（化验单上标注的）/ `image_blank`（图上没标，
+    #: 按"只标异常项"的规范视为正常）/ `general_range`（无图，按库内参考区间算的）。
+    #: 用户有权知道哪句话是医院给的结论、哪句是系统按通用口径推的。
+    judge_source: str | None = None
+    #: 「偏高/偏低之后怎么办」的结构化文本：可能原因 / 建议 / 何时就医 / 说明。
+    #: 只有库内有对应条目、且状态为 H / L 时才存在。
+    advice: dict | None = None
     meaning: str
 
 
@@ -51,6 +58,16 @@ class LabVisionItem(BaseModel):
     test_value: str = Field(default="", max_length=32)
     unit: str = Field(default="", max_length=32)
     reference_range: str = Field(default="", max_length=64)
+    #: 结果列上的异常标记：`H` / `L` / 空串。
+    #:
+    #: **与 `test_value` 分开存是为了不丢信息**：整串 `6.5↑` 填进 `test_value`
+    #: 会让数值侧的形态校验失败（`_VALUE_RE` 只认纯数字），这一条就整个进不了
+    #: 判定；拆成两个字段后，数值照样能参与比大小，标记也能单独承载。
+    #:
+    #: 采信这个标记 = 采信**这家医院按该患者**给出的判定方向，口径比通用参考区间
+    #: 更准（医院只给异常项打标记，所以空白即正常）。
+    #: 模型可能不照要求填或填了非法值，一律在 `_normalize_flag` 里校验后才采信。
+    abnormal_flag: str = Field(default="", max_length=8)
 
 
 class LabVisionReport(BaseModel):
@@ -91,6 +108,10 @@ class LabImageItemOut(BaseModel):
     test_value: str
     unit: str
     reference_range: str
+    #: 从图上读到的异常标记（`H` / `L` / 空串）。
+    #: 这是**识别结果**不是判定结论，所以放在这里；判定仍由
+    #: `LabReportTool.interpret` 统一做（图路与文路共用同一个判定实现）。
+    image_flag: str = ""
     in_reference_base: bool
     lib_unit: str | None = None
     unit_status: str = "unknown"
@@ -101,9 +122,11 @@ class LabImageItemOut(BaseModel):
 class LabImageExtractResponse(BaseModel):
     """图片识别响应：**只给回填材料，不给解读结论**。
 
-    刻意不含 `abnormal_flag` / `meaning` —— 解读由用户在文本框里确认后
+    刻意不含 `meaning` / `abnormal_flag`（判定结论）—— 解读由用户在文本框里确认后
     走原有的 `/lab/report-interpret`（或直接发消息），
     保证"图路"与"文路"最终经过**同一个**判定实现。
+    条目上的 `image_flag` 不违背这一点：它是**从图上读出来的原始标记**，
+    不是我们算出来的结论。
     """
 
     item_count: int

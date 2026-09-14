@@ -359,17 +359,24 @@ async def test_intent_llm_path_also_sees_the_image_text(monkeypatch):
 
 @pytest.mark.asyncio
 async def test_lab_tool_receives_image_items(monkeypatch):
-    """端到端一点点：`ToolExecutor._execute_lab_report` 真的拿到了图片里的指标。
+    """端到端一点点：`ToolExecutor._execute_lab_report` 真的拿到了图片里的指标**和异常标记**。
 
     打桩掉 `LabReportTool.interpret`（判定本身由 test_lab_report.py 覆盖），
     这里只断言"工具收到了什么输入" —— 也就是图片确实汇进了同一个判定实现。
+
+    ⚠️ 异常标记**不走回填文本**（`6.5↑` 整串填进 `test_value` 会让数值侧的形态校验
+    失败、这一条的数值就没了），所以它必须有独立通道（`_image_flag_map`）。
+    这条断言就是钉住那个通道别在重构里断掉。
     """
     await _prepare()
 
     captured: dict = {}
 
-    async def _fake_interpret(self, *, user_id, lab_item_list, sync_to_archive=False):  # noqa: ANN001
+    async def _fake_interpret(  # noqa: ANN001
+        self, *, user_id, lab_item_list, sync_to_archive=False, image_items=None
+    ):
         captured["items"] = lab_item_list
+        captured["image_items"] = image_items
         return {"item_list": [], "final_desc": "（打桩）", "no_data": False}
 
     from app.core.agent.tool_executor import ToolExecutor
@@ -379,11 +386,29 @@ async def test_lab_tool_receives_image_items(monkeypatch):
 
     out = await ToolExecutor().execute(
         "lab_report",
-        {"user_id": "u1", "user_input": "", "image_lab_text": "白细胞计数：11.2 10^9/L"},
+        {
+            "user_id": "u1",
+            "user_input": "",
+            "image_lab_text": "白细胞计数：11.2 10^9/L",
+            "image_lab_items": [
+                {
+                    "item_name": "白细胞计数",
+                    "raw_name": "白细胞计数",
+                    "fillable": True,
+                    "note": "",
+                    "image_flag": "H",
+                    "reference_range": "3.5-9.5",
+                }
+            ],
+        },
     )
 
     assert "tool_result" in out
     assert captured.get("items"), "化验工具没收到图片里的指标"
+
+    flags = captured.get("image_items") or {}
+    assert flags.get("白细胞计数", {}).get("flag") == "H", "图上的异常标记没送到判定侧"
+    assert flags["白细胞计数"]["reference_range"] == "3.5-9.5", "图上的参考范围也没送到"
 
 
 # --------------------------------------------------------------------------
@@ -452,25 +477,34 @@ async def test_entry_node_preserves_router_supplied_image_fields():
 
 
 def test_image_context_block_flags_unjudged_items():
-    """给模型的上下文块必须说清"哪些项没纳入判定"。
+    """给模型的上下文块必须说清三件事：来源、「哪些项没纳入判定」、「结论依据是什么」。
 
     只给回填文本的话，模型不知道还有被丢掉的项，也就永远说不出
-    "你有 3 项因单位不一致未参与判定" —— 用户会以为整张单子都被判过了。
+    "有 1 项因带比较符未参与判定" —— 用户会以为整张单子都被判过了。
+
+    第三件是"图标注优先"之后新增的：必须交代这些偏高/偏低是**医院标的**，
+    否则模型会拿通用参考范围去"纠正"化验单上印的方向 ——
+    那等于用口径更粗的一方否掉更准的一方。
+
+    ⚠️ 夹具里不再放 `unit_mismatch`：单位不一致已从"排除回填"降级为"仅提示"
+    （判定不再比库内区间），那个分支已不可达，拿它当夹具等于在测一条死路径。
     """
     block = nodes.image_context_block({
-        "image_lab_text": "血红蛋白：128 g/L",
+        "image_lab_text": "血红蛋白：128 g/L ↓",
         "image_lab_items": [
-            {"item_name": "血红蛋白", "fillable": True, "note": ""},
+            {"item_name": "血红蛋白", "fillable": True, "note": "", "image_flag": "L"},
             {
-                "item_name": "血糖", "raw_name": "血糖", "fillable": False,
-                "note": "unit_mismatch", "unit": "mg/dL", "lib_unit": "mmol/L",
+                "item_name": "C反应蛋白", "raw_name": "C反应蛋白", "fillable": False,
+                "note": "comparator_value", "test_value": "<0.05",
             },
         ],
     })
     assert "【用户上传的化验单图片】" in block
     assert "不是用户打的字" in block
-    assert "血糖" in block and "mg/dL" in block
-    assert "血红蛋白：128 g/L" in block
+    assert "C反应蛋白" in block and "带比较符" in block
+    assert "血红蛋白：128 g/L ↓" in block
+    assert "以化验单标注为准" in block, "必须交代'这些结论是医院标的'"
+    assert "只标异常项" in block, "必须交代'空白即正常'的规范依据"
 
     # 没有图片时整块为空 —— 不能凭空往 prompt 里塞一段"用户上传了图片"
     assert nodes.image_context_block({"user_input": "你好"}) == ""
@@ -487,14 +521,24 @@ def test_image_user_caveat_reaches_user_on_shortcut_path():
         "image_lab_text": "血红蛋白：128 g/L",
         "image_lab_items": [
             {
-                "item_name": "血糖", "raw_name": "血糖", "fillable": False,
-                "note": "unit_mismatch", "unit": "mg/dL", "lib_unit": "mmol/L",
+                "item_name": "C反应蛋白", "raw_name": "C反应蛋白", "fillable": False,
+                "note": "comparator_value", "test_value": "<0.05",
             },
         ],
     }
     caveat = nodes.image_user_caveat(state)
-    assert "血糖" in caveat
+    assert "C反应蛋白" in caveat
     assert "未纳入不等于正常" in caveat
 
     # 无异常项、无失败说明 → 不加任何前缀（不能给每一轮都挂一段噪音）
     assert nodes.image_user_caveat({"image_lab_text": "血红蛋白：128 g/L"}) == ""
+
+    # 有图片、且图上带了标记 → 必须告诉用户"结论是化验单标的"（结论来源可追溯）
+    marked = {
+        "image_lab_text": "血红蛋白：128 g/L ↓",
+        "image_lab_items": [
+            {"item_name": "血红蛋白", "fillable": True, "note": "", "image_flag": "L"},
+        ],
+    }
+    caveat2 = nodes.image_user_caveat(marked)
+    assert "以化验单上标注的异常标记为准" in caveat2

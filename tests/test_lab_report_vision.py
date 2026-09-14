@@ -171,17 +171,26 @@ async def test_fill_text_round_trip_through_parser():
 
 
 @pytest.mark.asyncio
-async def test_normalize_reports_unit_mismatch_and_excludes_from_fill_text():
-    """单位与参考库不一致的条目：**进不了回填文本**，但要在 `items` 里如实展示。
+async def test_normalize_keeps_unit_mismatch_in_fill_text():
+    """单位与参考库不一致的条目**仍然进回填文本**（2026-09-14 改，旧断言已翻转）。
 
-    为什么必须排除：`LabReportTool` 只比数值、不看单位。`血糖 117 mg/dL`
-    放进去就会和库里的 `3.9-6.1 mmol/L` 比大小并判出 H —— 数值方向或许凑巧对，
-    但那是巧合，不是结论。
+    改动理由：判定已改为**采信图上的异常标记**，不再拿数值去比库内区间 ——
+    "`mg/dL` 的值对 `mmol/L` 的区间"这个风险已经不在这条路径上了。
+    继续排除反而是净损失：本来能判的一项会被整条丢掉。
+
+    单位不一致仍然**如实报告**：库内参考范围与这张单子不可比，
+    展示时不能把两者混在一起给用户看。
     """
     await _prepare()
     report = LabVisionReport(
         items=[
-            LabVisionItem(item_name="血糖", test_value="117", unit="mg/dL", reference_range="70-110"),
+            LabVisionItem(
+                item_name="血糖",
+                test_value="117 ↑",
+                unit="mg/dL",
+                reference_range="70-110",
+                abnormal_flag="H",
+            ),
             LabVisionItem(item_name="血红蛋白", test_value="128", unit="g/L", reference_range="130-175"),
         ]
     )
@@ -189,14 +198,38 @@ async def test_normalize_reports_unit_mismatch_and_excludes_from_fill_text():
 
     by_name = {i["item_name"]: i for i in out["items"]}
     assert by_name["血糖"]["unit_status"] == "mismatch"
-    assert by_name["血糖"]["fillable"] is False
-    assert by_name["血红蛋白"]["unit_status"] == "ok"
-    assert by_name["血红蛋白"]["fillable"] is True
+    assert by_name["血糖"]["fillable"] is True, "单位不一致不再排除回填（判定不再比库内区间）"
+    assert by_name["血糖"]["test_value"] == "117", "数值与标记必须分开，标记不能留在 test_value 里"
+    assert by_name["血糖"]["image_flag"] == "H"
+    assert by_name["血红蛋白"]["image_flag"] == "", "图上没标记就是空串"
 
     assert [u["item_name"] for u in out["unit_mismatch"]] == ["血糖"]
-    assert "血糖" not in out["fill_text"]
-    assert "血红蛋白" in out["fill_text"]
+    assert "血糖" in out["fill_text"]
+    assert "↑" not in out["fill_text"], "回填文本必须保持纯数值形态"
     assert any("单位" in w for w in out["warnings"]), "单位冲突必须在 warnings 里说出来"
+
+
+@pytest.mark.asyncio
+async def test_normalize_flag_falls_back_to_test_value():
+    """模型忽略 `abnormal_flag`、把 `6.5↑` 整串填进 `test_value` 时，标记也不能丢。
+
+    这是改了 prompt 之后最可能出现的退化形态：字段加了、模型不填。
+    兜底提取保证信息不因模型不配合而丢失，而 `_clean_value` 照旧把标记从
+    `test_value` 里剥掉，数值侧保持干净。
+    """
+    await _prepare()
+    report = LabVisionReport(
+        items=[
+            LabVisionItem(item_name="白细胞计数", test_value="11.2↑", unit="10^9/L"),
+            LabVisionItem(item_name="血红蛋白", test_value="↓ 128", unit="g/L"),
+            LabVisionItem(item_name="血小板计数", test_value="150", unit="10^9/L"),
+        ]
+    )
+    out = await LabReportVisionTool()._normalize(report)
+    got = {i["item_name"]: (i["test_value"], i["image_flag"]) for i in out["items"]}
+    assert got["白细胞计数"] == ("11.2", "H")
+    assert got["血红蛋白"] == ("128", "L")
+    assert got["血小板计数"] == ("150", "")
 
 
 @pytest.mark.asyncio

@@ -144,6 +144,46 @@ class LabItemReferenceBase(Base):
     is_deleted: Mapped[int] = mapped_column(Integer, default=0)
 
 
+class LabItemAdvice(Base):
+    """指标"偏高/偏低之后怎么办"的建议文本（`lab_item_advice.csv` 种子数据）。
+
+    为什么单独一张表、而不是给 `LabItemReferenceBase` 继续加列
+    ------------------------------------------------------------
+    1. **方向是行维度，不是列维度。** 一个项目有偏高、偏低两条独立文本，
+       若做成 `high_causes/high_advice/…/low_causes/low_advice/…` 就要 8 列，
+       主表从 7 列变 15 列，且加"严重度分层""人群分层"时列数再翻倍。
+       按 `(item_name, direction)` 一行一条，后续加维度只加列、不加组。
+    2. **缺失即不写行**（而不是写空串）。有些项目只有一个方向有话说，
+       空串行会让"有没有内容"变成"字符串是否为空"的判断，容易写错。
+
+    为什么用 `item_name` 关联而不是 `item_id`
+    -----------------------------------------
+    与 CSV 种子数据的导入口径一致（`init_db` 按 `item_name` upsert），
+    也与 `LabReferenceService.match_items` 返回的键一致 —— 用 `item_id` 就要在
+    导入时先查主表拿 id，多一层脆弱耦合，而这张表只有几十行。
+
+    内容边界（**合规**）：`advice` 只写生活方式、复查节奏与"何时必须就医"，
+    **不写用药与剂量** —— 那是医药建议，超出本系统的资质范围。
+    """
+
+    __tablename__ = "lab_item_advice"
+
+    advice_id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    #: 与 `lab_item_reference.item_name` 对应的正式项目名
+    item_name: Mapped[str] = mapped_column(String(64), index=True)
+    #: `H` = 偏高，`L` = 偏低
+    direction: Mapped[str] = mapped_column(String(2))
+    causes: Mapped[str | None] = mapped_column(Text, nullable=True)
+    advice: Mapped[str | None] = mapped_column(Text, nullable=True)
+    when_to_see_doctor: Mapped[str | None] = mapped_column(Text, nullable=True)
+    disclaimer: Mapped[str | None] = mapped_column(Text, nullable=True)
+    create_time: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    update_time: Mapped[datetime] = mapped_column(
+        DateTime, server_default=func.now(), onupdate=func.now()
+    )
+    is_deleted: Mapped[int] = mapped_column(Integer, default=0)
+
+
 # 业务档案表（MVP：保留字段但不做诊断推断；仅存储用户录入内容）
 class UserDrugRecord(Base):
     __tablename__ = "user_drug_records"
